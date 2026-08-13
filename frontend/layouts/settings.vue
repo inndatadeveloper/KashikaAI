@@ -47,10 +47,7 @@ const allTabs = [
     { name: 'pii', label: 'settings.piiTab', requiredPermission: "manage_settings", requiredFeature: "pii_protection" },
     { name: 'general', label: 'settings.general', requiredPermission: "manage_settings" },
     { name: "integrations", label: "settings.integrations.title", requiredPermission: "manage_settings" },
-    { name: 'audit', label: 'settings.auditLogs', requiredPermission: "view_audit_logs" },
-    { name: 'identity-provider', label: 'settings.identityProviderTab', requiredPermission: "manage_identity_providers" },
     { name: 'smtp', label: 'settings.smtpTab', requiredPermission: "manage_settings" },
-    { name: 'license', label: 'settings.license', requiredPermission: "manage_settings" },
 ]
 
 // Filter tabs based on user permissions + enterprise feature availability

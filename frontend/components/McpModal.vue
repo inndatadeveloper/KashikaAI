@@ -204,7 +204,7 @@ const mcpConfig = computed(() => {
     const token = currentToken.value || "<YOUR_API_KEY>"
     return JSON.stringify({
         "mcpServers": {
-            "bagofwords": {
+            "kashikaai": {
                 "url": mcpServerUrl.value,
                 "headers": {
                     "Authorization": `Bearer ${token}`

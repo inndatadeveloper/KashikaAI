@@ -1908,7 +1908,7 @@
       "excelAddinDescription": "Sideload the Bag of Words add-in directly from this instance",
       "mcpName": "BOW MCP Server",
       "mcpDescription": "Enable MCP endpoint for integration with AI assistants like Cursor, Claude, or others",
-      "emptyTitle": "Make Bag of Words work with your tools",
+      "emptyTitle": "Make KashikaAI work with your tools",
       "emptySubtitle": "Connect Slack, Teams, email and more so your team can reach the AI analyst where they already work. Pick an integration to get started.",
       "selectHint": "Select an integration",
       "slackDescription": "Let your team chat with the AI analyst from Slack channels and DMs.",

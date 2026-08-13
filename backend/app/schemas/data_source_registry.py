@@ -7,6 +7,21 @@ from pydantic import BaseModel
 
 # Import provider Config/Credentials from the provider module
 from app.schemas.data_sources.configs import (
+    # Tally
+    TallyConfig,
+    TallyCredentials,
+    # SAP S/4HANA
+    SapS4hanaConfig,
+    SapS4hanaCredentials,
+    # Zoho Books
+    ZohoBooksConfig,
+    ZohoBooksCredentials,
+    # SAP S/4HANA
+    SapS4hanaConfig,
+    SapS4hanaCredentials,
+    # Zoho Books
+    ZohoBooksConfig,
+    ZohoBooksCredentials,
     # Configs
     PostgreSQLConfig,
     SQLiteConfig,
@@ -1036,7 +1051,7 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         type="powerbi_report_server",
         category="bi",
         title="Power BI Report Server",
-        description="On-prem Power BI Report Server. Discovers reports, paginated reports, shared datasets, KPIs, and upstream data-source lineage via NTLM-authenticated REST. PBIX semantic models are queryable via DuckDB over a cached Parquet snapshot (data reflects the last PBIX refresh, not live upstream — connect the upstream source directly for live data).",
+        description="On-prem Power BI Report Server. Discovers reports, paginated reports, shared datasets, KPIs, and upstream data-source lineage via NTLM-authenticated REST. PBIX semantic models are queryable via DuckDB over a cached Parquet snapshot (data reflects the last PBIX refresh, not live upstream â€” connect the upstream source directly for live data).",
         config_schema=PowerBIReportServerConfig,
         credentials_auth=AuthOptions(
             default="userpass",
@@ -1685,6 +1700,42 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         data_shape="tools",
         catalog_ownership="none",
         ui_form="custom_api",
+    ),
+    "tally": DataSourceRegistryEntry(
+        type="tally",
+        title="Tally",
+        description="Tally ERP - popular accounting and business management software.",
+        config_schema=TallyConfig,
+        credentials_auth=AuthOptions(default="basic", by_auth={
+            "basic": AuthVariant(title="Host and Port", schema=TallyCredentials, scopes=["system"])
+        }),
+        client_path=None,
+        status="active",
+        version="1.0.0",
+    ),
+    "sap_s4hana": DataSourceRegistryEntry(
+        type="sap_s4hana",
+        title="SAP S/4HANA",
+        description="SAP S/4HANA ERP platform via OData REST APIs.",
+        config_schema=SapS4hanaConfig,
+        credentials_auth=AuthOptions(default="basic", by_auth={
+            "basic": AuthVariant(title="Username and Password", schema=SapS4hanaCredentials, scopes=["system"])
+        }),
+        client_path=None,
+        status="active",
+        version="1.0.0",
+    ),
+    "zoho_books": DataSourceRegistryEntry(
+        type="zoho_books",
+        title="Zoho Books",
+        description="Zoho Books - online accounting software via REST API.",
+        config_schema=ZohoBooksConfig,
+        credentials_auth=AuthOptions(default="token", by_auth={
+            "token": AuthVariant(title="Access Token", schema=ZohoBooksCredentials, scopes=["system"])
+        }),
+        client_path=None,
+        status="active",
+        version="1.0.0",
     ),
 }
 

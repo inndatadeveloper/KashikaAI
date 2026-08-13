@@ -3139,6 +3139,27 @@ class CustomAPIOAuthAppCredentials(MCPOAuthAppCredentials):
     pass
 
 
+# Tally
+class TallyConfig(BaseModel):
+    host: str = Field("localhost", title="Host", description="Tally server hostname or IP", json_schema_extra={"ui:type": "string"})
+    port: int = Field(9000, title="Port", description="Tally gateway port (default: 9000)", json_schema_extra={"ui:type": "number"})
+class TallyCredentials(BaseModel):
+    pass  # Tally uses host/port only, no credentials needed by default
+# SAP S/4HANA
+class SapS4hanaConfig(BaseModel):
+    host: str = Field(..., title="Host", description="SAP S/4HANA hostname or IP", json_schema_extra={"ui:type": "string"})
+    port: int = Field(443, title="Port", description="Port (default: 443 for HTTPS)", json_schema_extra={"ui:type": "number"})
+    client_id: str = Field(..., title="SAP Client", description="SAP client number (e.g. 100)", json_schema_extra={"ui:type": "string"})
+    use_ssl: bool = Field(True, title="Use SSL", description="Use HTTPS connection", json_schema_extra={"ui:type": "toggle"})
+class SapS4hanaCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="SAP username", json_schema_extra={"ui:type": "string"})
+    password: str = Field(..., title="Password", description="SAP password", json_schema_extra={"ui:type": "password"})
+# Zoho Books
+class ZohoBooksConfig(BaseModel):
+    organization_id: str = Field(..., title="Organization ID", description="Zoho Books Organization ID", json_schema_extra={"ui:type": "string"})
+    region: str = Field("com", title="Region", description="Zoho region: com, eu, in, com.au, jp", json_schema_extra={"ui:type": "string"})
+class ZohoBooksCredentials(BaseModel):
+    access_token: str = Field(..., title="Access Token", description="Zoho OAuth2 access token", json_schema_extra={"ui:type": "password"})
 __all__ = [
     # Configs
     "PostgreSQLConfig",
@@ -3175,6 +3196,12 @@ __all__ = [
     "SnowflakeKeypairCredentials",
     "BigQueryCredentials",
     "NetSuiteCredentials",
+    "TallyConfig",
+    "TallyCredentials",
+    "SapS4hanaConfig",
+    "SapS4hanaCredentials",
+    "ZohoBooksConfig",
+    "ZohoBooksCredentials",
     "SQLCredentials",
     "PrestoCredentials",
     "TrinoCredentials",

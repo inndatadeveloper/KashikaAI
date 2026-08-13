@@ -90,7 +90,7 @@ COPY ./locales /app/locales
 WORKDIR /app/frontend
 
 # Install frontend dependencies and build the project
-RUN yarn install --frozen-lockfile
+RUN yarn config set network-timeout 600000 -g && yarn install --frozen-lockfile
 
 # Download vendored JS libraries for airgapped artifact rendering
 COPY ./scripts/download-vendor-libs.sh /app/scripts/download-vendor-libs.sh
@@ -99,7 +99,7 @@ RUN bash /app/scripts/download-vendor-libs.sh /app/frontend/public/libs
 # `nuxt generate` produces a fully static SPA under .output/public, which
 # FastAPI serves directly in production (see backend/app/core/spa.py).
 # This replaces the previous `yarn build` + Node runtime pattern.
-RUN yarn generate
+RUN NODE_OPTIONS="--max-old-space-size=3072" yarn generate
 
 FROM ubuntu:24.04
 

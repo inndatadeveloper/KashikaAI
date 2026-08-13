@@ -1,0 +1,20 @@
+{
+  "realm": "kashika-ai",
+  "enabled": true,
+  "sslRequired": "NONE",
+
+  "clients": [
+    {
+      "clientId": "kashika-ai",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "kashika-secret",
+      "redirectUris": [
+        "http://localhost:3000/*",
+        "http://0.0.0.0:3000/*"
+      ],
+      "webOrigins": ["*"]
+    }
+  ]
+}

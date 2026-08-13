@@ -1,0 +1,16 @@
+services:
+  postgres-retail:
+    image: postgres:16-alpine
+    container_name: kashika-ai-postgres-retail
+    environment:
+      POSTGRES_DB: retaildb
+      POSTGRES_USER: kashika
+      POSTGRES_PASSWORD: uxAH6JoeOrzk8XcE
+    volumes:
+      - postgres_retail_data:/var/lib/postgresql/data
+    ports:
+      - "5478:5432"
+    restart: unless-stopped
+
+volumes:
+  postgres_retail_data:

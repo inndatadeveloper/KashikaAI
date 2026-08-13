@@ -311,7 +311,6 @@ const menuItems = computed(() => {
   const bottom: any[] = [
     { label: t('nav.dataAgents'), icon: 'i-heroicons-circle-stack', to: '/agents' },
     { label: t('nav.settings'), icon: 'i-heroicons-cog-6-tooth', to: '/settings' },
-    { label: t('nav.documentation'), icon: 'i-heroicons-book-open', click: () => window.open('https://docs.bagofwords.com', '_blank') },
   ]
   if (isMcpEnabled.value && useCan('manage_settings')) {
     bottom.push({ label: t('nav.mcpServer'), slot: 'mcp', click: () => { showMcpModal.value = true } })
@@ -459,3 +458,4 @@ await signOut({
   }
 }
 </style>
+

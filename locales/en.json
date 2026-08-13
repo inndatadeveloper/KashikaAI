@@ -1789,7 +1789,7 @@
       "scimTitle": "SCIM Provisioning",
       "scimSubtitle": "Automatically provision and deprovision users from your identity provider",
       "enterpriseScim": "SCIM provisioning requires an enterprise license. Automatically sync users from Okta, Azure AD, OneLogin, and other identity providers.",
-      "learnMore": "Learn more →",
+      "learnMore": " ",
       "scimBaseUrl": "SCIM Base URL",
       "copied": "Copied",
       "copy": "Copy",
@@ -2308,7 +2308,7 @@
       "title": "Audit Logs",
       "subtitle": "Track user activity across your workspace",
       "enterpriseRequired": "Activity logging requires an enterprise license. Track all user actions, changes, and access events for compliance and security monitoring.",
-      "learnMore": "Learn more →",
+      "learnMore": "Learn more ",
       "search": "Search...",
       "allActions": "All actions",
       "nSelected": "{n} selected",
@@ -3286,7 +3286,7 @@
   "onboarding": {
     "loading": "Loading...",
     "skip": "Skip onboarding",
-    "welcome": "Welcome to Bag of words! 🎉",
+    "welcome": "Welcome to KashikaAI! ??",
     "welcomeSubtitle": "Chat with your data, run deep analysis and create dashboards in seconds",
     "next": "Next",
     "fallbackTitle": "Get Started",
@@ -3296,7 +3296,7 @@
     "intro1": "Getting started is quick: just connect your model and your data source, and you'll be ready to ask your first question.",
     "intro2": "👉 Let's set things up!",
     "steps": {
-      "onboardingTitle": "Welcome to Bag of words! 🎉",
+      "onboardingTitle": "Welcome to KashikaAI! ??",
       "onboardingDescription": "Chat with your data, run deep analysis and create dashboards in seconds",
       "onboardingButton": "Welcome",
       "llmTitle": "Configure LLM",
@@ -3865,8 +3865,8 @@
     }
   },
   "mcpServerModal": {
-    "title": "Bag of words MCP Server",
-    "subtitle": "Connect Claude, Cursor, or any MCP client to query your data via the Bag of words MCP Server.",
+    "title": "Kashika-AI MCP Server",
+    "subtitle": "Connect Claude, Cursor, or any MCP client to query your data via the  MCP Server.",
     "loading": "Loading...",
     "tabMcpClients": "MCP Clients",
     "tabOauth": "OAuth",
@@ -4421,3 +4421,4 @@
     "connectFirstDataSource": "Connect your first data source"
   }
 }
+

@@ -1,0 +1,150 @@
+services:
+  openldap:
+    image: osixia/openldap:latest
+    container_name: kashika-ai-openldap
+    environment:
+      LDAP_ORGANISATION: "Kashika AI"
+      LDAP_DOMAIN: "kashika-ai.local"
+      LDAP_ADMIN_PASSWORD: "uxAH6JoeOrzk8XcE"
+      LDAP_CONFIG_PASSWORD: "uxAH6JoeOrzk8XcE"
+      LDAP_READONLY_USER: "false"
+      LDAP_TLS: "false"
+    volumes:
+      - ldap_data:/var/lib/ldap
+      - ldap_config:/etc/ldap/slapd.d
+    ports:
+      - "389:389"
+    networks:
+      - kashika-network
+    restart: unless-stopped
+
+  phpldapadmin:
+    image: osixia/phpldapadmin:0.9.0
+    container_name: kashika-ai-phpldapadmin
+    environment:
+      PHPLDAPADMIN_LDAP_HOSTS: "openldap"
+      PHPLDAPADMIN_HTTPS: "false"
+    ports:
+      - "8081:80"
+    networks:
+      - kashika-network
+    depends_on:
+      - openldap
+    restart: unless-stopped
+
+  postgres-keycloak:
+    image: postgres:16-alpine
+    container_name: kashika-ai-postgres-keycloak
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    volumes:
+      - postgres_keycloak_data:/var/lib/postgresql/data
+    networks:
+      - kashika-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: kashika-ai-keycloak
+
+    # ✅ IMPORTANT: import realm automatically
+    command: start-dev --import-realm
+
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres-keycloak:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+
+      KEYCLOAK_ADMIN: "admin"
+      KEYCLOAK_ADMIN_PASSWORD: "36i5gKbBwfHf3zWZ"
+
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY: "edge"
+      KC_HOSTNAME_STRICT: "false"
+
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+
+      JAVA_OPTS_APPEND: "-Dkeycloak.profile.feature.upload_scripts=enabled"
+
+    ports:
+      - "8090:8080"
+
+    volumes:
+      # ✅ persistent realm config
+      - ./keycloak-config:/opt/keycloak/data/import
+
+    depends_on:
+      postgres-keycloak:
+        condition: service_healthy
+      openldap:
+        condition: service_started
+
+    networks:
+      - kashika-network
+
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: kashika-ai-postgres
+    environment:
+      POSTGRES_DB: kashika
+      POSTGRES_USER: kashika
+      POSTGRES_PASSWORD: kashika
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - kashika-network
+    restart: unless-stopped
+
+  kashika:
+    image: kashika-ai:latest
+    container_name: kashika-ai-app
+    extra_hosts:
+      - "localhost:host-gateway"
+    environment:
+      BOW_DATABASE_URL: "postgresql://kashika:kashika@postgres:5432/kashika"
+      BOW_HOST: "0.0.0.0"
+      BOW_PORT: "3000"
+
+      BOW_AUTH_PROVIDER: "keycloak"
+      BOW_KEYCLOAK_URL: "http://keycloak:8080/realms/kashika-ai"
+      BOW_CLIENT_ID: "kashika-ai"
+      BOW_CLIENT_SECRET: "dnbm8NwQQXvpfciXHnepXzeMbL0VVduW"
+
+      SESSION_SECRET: "eD!mXug29tWy5QqSLrCmPK3lxRvVbFAq"
+      BOW_ENCRYPTION_KEY: "-An3F65pIc9MieG6LMNZiIPNNPmzalR2zzDrtqxD0S4="
+
+    volumes:
+      - ./bow-config.yaml:/app/bow-config.yaml:ro
+
+    ports:
+      - "3000:3000"
+
+    depends_on:
+      - postgres
+      - keycloak
+
+    networks:
+      - kashika-network
+
+    restart: unless-stopped
+
+volumes:
+  ldap_data:
+  ldap_config:
+  postgres_data:
+  postgres_keycloak_data:
+
+networks:
+  kashika-network:
+    driver: bridge

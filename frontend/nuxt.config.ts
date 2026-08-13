@@ -10,7 +10,7 @@ export default defineNuxtConfig({
     'nuxt-tiptap-editor',
     '@nuxtjs/mdc',
     '@nuxt-alt/proxy',
-    'nuxt-3-intercom',
+    ////'nuxt-3-intercom',
     'nuxt-echarts',
     'nuxt-monaco-editor'
   ],
@@ -51,11 +51,6 @@ export default defineNuxtConfig({
       'ParallelComponent',
       'RadarComponent'
     ]
-  },
-
-  intercom: {
-    appId: 'ocwih86k',
-    autoBoot: false
   },
 
   tiptap: {
@@ -267,3 +262,4 @@ export default defineNuxtConfig({
 
   compatibilityDate: '2025-08-03',
 })
+

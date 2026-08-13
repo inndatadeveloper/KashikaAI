@@ -1277,16 +1277,8 @@
       click: () => { showProfileModal.value = true }
     }])
 
-    // Documentation + MCP Server + GitHub moved out of the main sidebar into this menu.
-    const resources: any[] = [{
-      label: t('changelog.menuItem'),
-      icon: 'heroicons-document-text',
-      click: () => { showChangelogModal.value = true }
-    }, {
-      label: t('nav.documentation'),
-      icon: 'heroicons-book-open',
-      click: () => { window.open('https://docs.bagofwords.com', '_blank', 'noopener') }
-    }]
+    // Documentation + Changelog + GitHub hidden from this menu. MCP Server kept.
+    const resources: any[] = []
     if (isMcpEnabled.value && useCan('manage_settings')) {
       resources.push({
         label: t('nav.mcpServer'),
@@ -1294,12 +1286,7 @@
         click: () => { showMcpModal.value = true }
       })
     }
-    resources.push({
-      label: t('nav.starOnGithub'),
-      iconComponent: markRaw(GithubIcon),
-      click: () => { window.open('https://github.com/bagofwords1/bagofwords', '_blank', 'noopener') }
-    })
-    groups.push(resources)
+    if (resources.length) groups.push(resources)
 
     // The org switcher lives in the workspace header now — keeping a copy here
     // would give multi-org users two of them.
@@ -1313,7 +1300,7 @@
 
   const isAdmin = computed<boolean>(() => useCan('full_admin_access'))
  
-  if (environment === 'production' && intercom) {
+  if (environment === 'production' && intercom?.enabled) {
     const hideLauncher = computed<boolean>(() => isExcel.value || isMobile.value)
     $intercom.boot({
       hide_default_launcher: hideLauncher.value,

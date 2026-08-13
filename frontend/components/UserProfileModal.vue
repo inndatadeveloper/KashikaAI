@@ -924,7 +924,7 @@ const mcpServerUrl = computed(() => {
 const mcpConfig = computed(() => {
   const token = mcpCurrentToken.value || '<YOUR_API_KEY>'
   return JSON.stringify({
-    mcpServers: { bagofwords: { url: mcpServerUrl.value, headers: { Authorization: `Bearer ${token}` } } },
+    mcpServers: { kashikaai: { url: mcpServerUrl.value, headers: { Authorization: `Bearer ${token}` } } },
   }, null, 2)
 })
 function mcpFormatDate(dateStr: string) {

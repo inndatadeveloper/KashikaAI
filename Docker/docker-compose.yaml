@@ -107,7 +107,7 @@ services:
     restart: unless-stopped
 
   kashika:
-    image: kashika-ai:latest
+    image: kashika-ai:v.0.538
     container_name: kashika-ai-app
     extra_hosts:
       - "localhost:host-gateway"
@@ -117,9 +117,9 @@ services:
       BOW_PORT: "3000"
 
       BOW_AUTH_PROVIDER: "keycloak"
-      BOW_KEYCLOAK_URL: "http://keycloak:8080/realms/kashika-ai"
+      BOW_KEYCLOAK_URL: "http://192.168.10.125:8090/realms/kashika-ai"
       BOW_CLIENT_ID: "kashika-ai"
-      BOW_CLIENT_SECRET: "dnbm8NwQQXvpfciXHnepXzeMbL0VVduW"
+      BOW_CLIENT_SECRET: "TSqqIF9kUNyGLj67YWDzZGUuejDNd2MF"
 
       SESSION_SECRET: "eD!mXug29tWy5QqSLrCmPK3lxRvVbFAq"
       BOW_ENCRYPTION_KEY: "-An3F65pIc9MieG6LMNZiIPNNPmzalR2zzDrtqxD0S4="

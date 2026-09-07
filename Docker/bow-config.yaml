@@ -1,5 +1,5 @@
 # Deployment Configuration
-base_url: http://localhost:3000
+base_url: http://192.168.10.125:3000
 
 
 # Feature Flags
@@ -20,14 +20,14 @@ oidc_providers:
     enabled: true
     # IMPORTANT: Use localhost:8090 for issuer URL so browser redirects work correctly
     # Keycloak will handle the internal container-to-container communication
-    issuer: http://keycloak:8080/realms/kashika-ai
+    issuer: http://192.168.10.125:8090/realms/kashika-ai
     client_id: kashika-ai
-    client_secret: dnbm8NwQQXvpfciXHnepXzeMbL0VVduW
+    client_secret: TSqqIF9kUNyGLj67YWDzZGUuejDNd2MF
     scopes: ["openid", "profile", "email"]
     discovery: true
     uid_claim: sub
-    end_session_endpoint: http://keycloak:8080/realms/kashika-ai/protocol/openid-connect/logout
-    post_logout_redirect_uri: http://localhost:3000/users/sign-in?redirect=/catalog
+    end_session_endpoint: http://192.168.10.125:8090/realms/kashika-ai/protocol/openid-connect/logout
+    post_logout_redirect_uri: http://192.168.10.125:3000/users/sign-in?redirect=/catalog
 
 encryption_key: ${BOW_ENCRYPTION_KEY}
 

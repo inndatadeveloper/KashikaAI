@@ -1,6 +1,6 @@
 from pydantic import BaseModel, field_validator
 from typing import List, Optional, Literal
-from .widget_schema import WidgetSchema, WidgetCreate
+from .widget_schema import WidgetSchema
 from app.schemas.user_schema import UserSchema
 from datetime import datetime
 from app.schemas.data_source_schema import DataSourceReportSchema
@@ -12,7 +12,6 @@ class ReportBase(BaseModel):
     title: Optional[str] = None
 
 class ReportCreate(ReportBase):
-    widget: Optional[WidgetCreate] = None
     files: Optional[List[str]] = []
     data_sources: Optional[List[str]] = []
     external_platform_id: Optional[str] = None
@@ -48,7 +47,7 @@ class ReportSchema(ReportBase):
     id: str
     status: Literal["draft", "published", "archived"]
     slug: str
-    report_type: Literal["regular", "test"]
+    report_type: Literal["regular", "test", "artifact_chat"]
     widgets: List[WidgetSchema] = []
     dashboard_layout_versions: List[DashboardLayoutVersionSchema] = []
     data_sources: List[DataSourceReportSchema] = []
@@ -61,7 +60,8 @@ class ReportSchema(ReportBase):
     cron_schedule: Optional[str] = None
     # Rerun this report's queries when a viewer opens /r/{id}. This schema also
     # serves the public GET /r/{id}, so the shared page reads the flag directly.
-    refresh_on_view: bool = False
+    # Default ON — artifacts open on fresh data unless the owner opts out.
+    refresh_on_view: bool = True
     app_version: Optional[str] = None  # Version for routing decisions
     general: Optional[PublicGeneralSettings] = None
     theme_name: Optional[str] = None
@@ -93,6 +93,15 @@ class ReportSchema(ReportBase):
     conversation_visibility: Literal["none", "shared", "internal", "public"] = "none"
     # Whose credentials a shared-artifact viewer's "Run" uses ('viewer' | 'creator')
     shared_run_identity: Literal["viewer", "creator"] = "viewer"
+    # Show the Data tab (the queries behind the report) to viewers of the
+    # shared artifact page. Artifact sharing only.
+    include_data_tab: bool = True
+    # Chat on the shared artifact page /r/{id}. This schema also serves the
+    # public GET /r/{id}, so the shared page reads the flag directly.
+    artifact_chat_enabled: bool = False
+    # Owner's agent allowlist for artifact-page chat: null = inherit the
+    # report's attached roster, [] = dashboard data only, list = subset.
+    artifact_chat_data_source_ids: Optional[List[str]] = None
     # True when the report reads an RLS-enabled relation: viewers always run
     # under their own identity and 'run on my behalf' (creator mode) is blocked.
     has_rls: bool = False
@@ -185,6 +194,16 @@ class ReportVisibilityUpdate(BaseModel):
     # Artifact sharing only: whose credentials viewer-triggered runs use.
     # Omitted = leave unchanged.
     run_identity: Optional[Literal["viewer", "creator"]] = None
+    # Artifact sharing only: show viewers the Data tab on /r/{id}.
+    # Omitted = leave unchanged (same semantics as run_identity).
+    include_data_tab: Optional[bool] = None
+    # Artifact sharing only: allow viewers of /r/{id} to chat with the report.
+    # Omitted = leave unchanged.
+    artifact_chat_enabled: Optional[bool] = None
+    # Artifact sharing only: which agents chat may query. Sentinel-aware:
+    # omitted = leave unchanged; [] = dashboard data only; ["*"] = reset to
+    # inherit the report's attached roster (null); a list = explicit subset.
+    artifact_chat_data_source_ids: Optional[List[str]] = None
 
 
 class ViewerRunResultSchema(BaseModel):

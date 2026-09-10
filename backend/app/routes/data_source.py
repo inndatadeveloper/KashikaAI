@@ -12,6 +12,7 @@ from app.dependencies import get_current_organization
 from app.services.custom_query_service import is_accelerable_type
 from app.services.data_source_service import DataSourceService
 from app.schemas.data_source_schema import DataSourceCreate, DataSourceBase, DataSourceSchema, DataSourceUpdate, DataSourceMembershipCreate, DataSourceListItemSchema
+from app.schemas.table_prompt_schema import TablePromptsResponse
 from app.schemas.metadata_indexing_job_schema import MetadataIndexingJobSchema
 from app.schemas.data_source_schema import DataSourceMembershipSchema
 from app.schemas.datasource_table_schema import (
@@ -503,6 +504,18 @@ async def remove_data_source_member(
 
 # ==================== Domain-Connection Routes ====================
 
+@router.get("/data_sources/{data_source_id}/file-connections")
+@requires_resource_permission('data_source', 'view')
+async def get_domain_file_connections(
+    data_source_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """Member-safe file scope metadata; not the admin connection configuration."""
+    return await data_source_service.get_domain_file_connections(db, data_source_id, organization)
+
+
 @router.get("/data_sources/{data_source_id}/connections")
 @requires_resource_permission('data_source', 'manage')
 async def get_domain_connections(
@@ -696,3 +709,84 @@ async def remove_connection_from_domain(
     except Exception:
         pass
     return result
+
+
+# One bundle build per agent at a time, same pattern as the report PDF export
+# (_pdf_export_locks in report.py): concurrent clicks on the same agent would
+# run the full instruction/evals serialization side by side for an identical
+# result. The outer timeout bounds a request queued behind a wedged build so
+# the client gets a clear 504 instead of sitting at a spinner forever.
+import asyncio as _asyncio
+from collections import defaultdict as _defaultdict
+_bundle_export_locks: dict[str, "_asyncio.Lock"] = _defaultdict(_asyncio.Lock)
+_BUNDLE_EXPORT_TIMEOUT_SECONDS = 60
+
+
+@router.get("/data_sources/{data_source_id}/instructions/export")
+@requires_resource_permission('data_source', 'manage')
+async def export_agent_instructions(
+    data_source_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """Download this agent as a portable zip bundle: instructions (markdown),
+    agent.yaml (the manifest), and evals/*.yaml (test suites scoped to the agent).
+
+    Gated on per-agent ``manage`` (full admins pass via the wildcard). ``manage``
+    implies ``manage_instructions`` and ``manage_evals``, so it authorizes every
+    section of the bundle. Per-agent only — global/agent-less instructions are
+    excluded.
+    """
+    import re as _re
+    from urllib.parse import quote as _quote
+    from fastapi.responses import StreamingResponse
+    from app.services.instruction_service import InstructionService
+
+    async def _build_locked() -> tuple[bytes, str]:
+        async with _bundle_export_locks[str(data_source_id)]:
+            return await InstructionService().export_agent_bundle_zip(
+                db, organization, current_user, data_source_id
+            )
+
+    try:
+        zip_bytes, agent_name = await _asyncio.wait_for(
+            _build_locked(), timeout=_BUNDLE_EXPORT_TIMEOUT_SECONDS
+        )
+    except _asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Agent export timed out. Please try again.",
+        )
+    # Response headers must be latin-1 (Starlette encodes them as such), but an
+    # agent name can be any script (Hebrew, Arabic, ...). RFC 5987: send an
+    # ASCII-only filename= fallback plus a percent-encoded UTF-8 filename*= —
+    # browsers prefer the latter, so the download keeps the real name.
+    ascii_stem = _re.sub(r"[^A-Za-z0-9.-]+", "-", agent_name).strip("-") or "agent"
+    utf8_stem = _re.sub(r"[^\w.-]+", "-", agent_name, flags=_re.UNICODE).strip("-") or "agent"
+    utf8_filename = _quote(f"{utf8_stem}-agent-export.zip", safe="")
+    return StreamingResponse(
+        iter([zip_bytes]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_stem}-agent-export.zip"; '
+                f"filename*=UTF-8''{utf8_filename}"
+            )
+        },
+    )
+
+
+@router.get('/data_sources/{data_source_id}/tables/{table_id}/recent-prompts', response_model=TablePromptsResponse)
+@requires_resource_permission('data_source', 'manage')
+async def get_table_recent_prompts(
+    data_source_id: str,
+    table_id: str,
+    offset: int = Query(0, ge=0, le=10000),
+    limit: int = Query(5, ge=1, le=20),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    from app.services.table_prompt_service import get_table_prompts
+    return await get_table_prompts(db, str(organization.id), data_source_id, table_id, offset, limit)

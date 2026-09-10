@@ -113,15 +113,31 @@ def _render_powerbi_cloud_metadata_xml(t: PromptTable) -> str:
 #     NAME inside execute_query, so their ids are redundant
 #   - infor_olap / sap_bw `cubeUniqueName` is literally f"[{cube}]" and `cube` is
 #     the second segment of `name`, so it's derivable
-#   - splunk writes index/sourcetype into `description`; oracle_bi and
+#   - splunk EVENT tables write index/sourcetype into `description` (flat
+#     metadata, no namespace — nothing rendered); oracle_bi and
 #     sap_datasphere put their qualifier in `name`
 _TABLE_META_KEYS: dict[str, tuple[str, ...]] = {
     # TableauClient.execute_query(datasource_luid, ...) — LUID is a REQUIRED
     # positional the agent must supply; `name` is "{project}/{datasource}".
     "tableau": ("datasourceLuid",),
+    # Splunk KNOWLEDGE objects (dashboard:: / saved_search:: tables): `kind`
+    # tells the planner this is a curated investigation artifact, not an event
+    # stream, and app/view_id address the execute_query envelope. The bulky
+    # `panels`/`spl` blobs stay out — panel SPL already renders as column
+    # descriptions, and saved-search SPL is in the table description.
+    "splunk": ("kind", "app", "view_id", "dashboard_type", "panel_count",
+               "saved_search_name", "cron", "alert"),
+    # Kibana knowledge objects on an Elasticsearch connection (dashboard:: /
+    # saved_search:: tables) — same rationale as `splunk`: kind + address for
+    # the execute_query envelope; the bulky `panels` blob stays out (panel
+    # queries already render as column descriptions).
+    "kibana": ("kind", "space", "dashboard_id", "panel_count", "index"),
     # AnalysisServicesClient's system prompt instructs the agent to pick MDX vs
     # DAX from modelType — it can't do that if modelType isn't in context.
-    "analysis_services": ("modelType", "supportsDax"),
+    "analysis_services": (
+        "modelType", "supportsDax", "preferredDialect",
+        "entity_contents", "data_category",
+    ),
 }
 
 # Flat (non-namespaced) table metadata worth surfacing, keyed by connector.
@@ -155,7 +171,54 @@ _FLAT_META_KEYS: tuple[str, ...] = (
 #
 # This allowlist is the LAST gate before the prompt: a key absent here never
 # reaches the model no matter what discovery captured or persistence stored.
-_COLUMN_META_KEYS: tuple[str, ...] = ("unique_name", "returns", "hidden", "relationship_key")
+_COLUMN_META_KEYS: tuple[str, ...] = (
+    "unique_name", "returns", "hidden", "relationship_key",
+    "format_string", "data_category", "display_folder", "sort_by_column",
+    "summarize_by", "contents",
+)
+
+
+def _render_analysis_services_semantics_xml(t: PromptTable) -> str:
+    """Render Tabular semantics that cannot be represented as PK/FK tags."""
+    try:
+        meta = t.metadata_json if isinstance(t.metadata_json, dict) else None
+        model = (meta or {}).get("analysis_services")
+        if not isinstance(model, dict):
+            return ""
+        parts: List[str] = []
+        for hierarchy in model.get("hierarchies") or []:
+            attrs = {"name": str(hierarchy.get("name") or "")}
+            if hierarchy.get("description"):
+                attrs["description"] = str(hierarchy["description"])
+            if hierarchy.get("displayFolder"):
+                attrs["display_folder"] = str(hierarchy["displayFolder"])
+            if hierarchy.get("hidden"):
+                attrs["hidden"] = "true"
+            levels = []
+            for level in hierarchy.get("levels") or []:
+                level_attrs = {"name": str(level.get("name") or "")}
+                if level.get("column"):
+                    level_attrs["column"] = str(level["column"])
+                if level.get("ordinal") is not None:
+                    level_attrs["ordinal"] = str(level["ordinal"])
+                levels.append(xml_tag("level", "", level_attrs))
+            parts.append(xml_tag("hierarchy", "\n".join(levels), attrs))
+        for relationship in model.get("relationships") or []:
+            if str(relationship.get("state") or "active").lower() != "inactive":
+                continue
+            attrs = {
+                "name": str(relationship.get("name") or ""),
+                "from_column": str(relationship.get("fromColumn") or ""),
+                "to_table": str(relationship.get("toTable") or ""),
+                "to_column": str(relationship.get("toColumn") or ""),
+                "state": "inactive",
+            }
+            if relationship.get("crossFilteringBehavior"):
+                attrs["cross_filtering"] = str(relationship["crossFilteringBehavior"])
+            parts.append(xml_tag("relationship", "", attrs))
+        return xml_tag("tabular_semantics", "\n".join(parts)) if parts else ""
+    except Exception:
+        return ""
 
 
 def _render_semantic_model_xml(t: PromptTable) -> str:
@@ -437,6 +500,7 @@ class TablesSchemaContext(ContextSection):
                 xml_tag("pks", pks) if pks else "",
                 xml_tag("fks", fks) if fks else "",
                 _render_semantic_model_xml(t),
+                _render_analysis_services_semantics_xml(t),
                 metadata_xml, pbi_xml, pbi_cloud_xml, metrics_xml,
             ]))
             table_attrs = {"name": t.name}
@@ -877,7 +941,7 @@ class TablesSchemaContext(ContextSection):
                 # Connector-specific identifiers the query path needs (Tableau
                 # datasourceLuid, SSAS modelType, Prometheus metric_type/unit).
                 src_meta_xml = _render_source_metadata_xml(t)
-                inner = "\n".join(filter(None, [note_xml, xml_tag("columns", cols), xml_tag("pks", pks) if pks else "", xml_tag("fks", fks) if fks else "", _render_semantic_model_xml(t), pbi_xml, pbi_cloud_xml, src_meta_xml]))
+                inner = "\n".join(filter(None, [note_xml, xml_tag("columns", cols), xml_tag("pks", pks) if pks else "", xml_tag("fks", fks) if fks else "", _render_semantic_model_xml(t), _render_analysis_services_semantics_xml(t), pbi_xml, pbi_cloud_xml, src_meta_xml]))
                 if getattr(t, 'is_cached', False):
                     attrs["cached"] = "true"
                     if getattr(t, 'cached_as_of', None):
@@ -1077,5 +1141,3 @@ class TablesSchemaContext(ContextSection):
             ))
         
         return SchemaUsageSnapshot(data_sources=ds_usages)
-
-

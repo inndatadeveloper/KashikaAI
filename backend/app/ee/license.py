@@ -1,6 +1,6 @@
 # Enterprise License Validation
-# Licensed under the Business Source License 1.1
-# See ENTERPRISE_LICENSE for details
+# Licensed under the BOW Enterprise License
+# See backend/app/ee/LICENSE for details
 
 import jwt
 import logging
@@ -36,11 +36,12 @@ TIER_FEATURES = {
         "llm_fallback",
         "pii_protection",
         "rls",
+        "data_encryption",
     ],
 }
 
 # Data sources that require an enterprise license
-ENTERPRISE_DATASOURCES = ["powerbi", "qvd", "sybase", "tableau", "zabbix", "splunk"]
+ENTERPRISE_DATASOURCES = ["powerbi", "qvd", "sybase", "tableau", "zabbix", "splunk", "aria_operations", "kubernetes"]
 
 # Public key for license verification (RS256).
 #

@@ -1,5 +1,107 @@
 # Release Notes
 
+## Version 0.0.556 (September 8, 2026)
+- Added a read-only Kubernetes connector (infra, enterprise): workloads, nodes, events, networking, storage, discovered CRDs, metrics-server usage and pod logs are cataloged as tables, authenticated with a service-account bearer token and a cluster-wide read-only RBAC manifest. The connect form can now render a numbered setup guide with copy buttons above the fields, and hides the "Require user authentication" toggle for connectors without a per-user auth variant (#1087)
+- Postgres data sources gain an `sslmode` setting, so providers that reject unencrypted logins (such as AWS RDS with IAM auth) can be connected with `require` or stricter; the default `prefer` leaves existing connections unchanged (#1089)
+- Dashboards can be renamed from the dashboard pane by the report owner, and the toolbar is decluttered: Data, Schedule, Export, Full screen, Open in new tab and Rename move into a `⋯` menu while Refresh, Download, View as and Share stay visible (#1085)
+- Fixed the single-provider SSO auto-start firing on every sign-in visit, which made sign-out on an `sso_only` instance land straight back in the app. It now runs only for the embedded `/authorize` flow or when a `login_hint` is present (#1091)
+
+## Version 0.0.555 (September 5, 2026)
+- Document artifacts can now be exported as PDF, rendered through the real document viewer in headless Chromium instead of the browser print dialog (#1060)
+- Queries moved from their own page into the agents knowledge tree: each agent has a Queries row that opens its saved queries in the side panel, and unpublished queries are no longer served to members who don't own or manage them (#1061)
+- Hardened SQL Server Kerberos delegation: connection handshakes serialize around the process-global credential cache and each worker gets a private ccache, so concurrent service-account and per-user connections can no longer pick up the wrong identity (#1062)
+- Session tokens are now revocable: logging out, changing or resetting a password, and the new admin force-signout all invalidate every session token already issued to that user. **Upgrading signs every user out once** (#1063)
+- SSO sign-in no longer returns the session token in the redirect URL; the callback redirects with a single-use 60s code the app trades for the token over POST (#1063)
+- Sign-in auto-starts the SSO round trip when there is exactly one provider in `sso_only` mode, and `login_hint` is carried through to the provider so an embedding app opens BOW without a chooser (#1064)
+- Prometheus connector is out of `dev_only` and ships as beta, with histogram/summary metrics typed from their base metric, schema discovery bounded to a recent window, and a configurable request timeout and discovery lookback (#1065)
+- Added an AWS CloudWatch connector, shipping as beta: log groups (via Logs Insights) and metrics are cataloged as tables on one connection, with static keys, assume-role, or the default credential chain (instance profile / EKS IRSA) (#1066)
+- OpenAI catalog adds GPT-6 Astra as a selectable model: GPT-6 requests omit temperature and route tool calls through the Responses API, including on gateways with a custom base URL. GPT-5.6 Terra remains the default and Luna the small-model default, so no organization changes model or cost on upgrade (#1068)
+- SQL data sources now introspect foreign keys (Postgres, SQL Server, MySQL/MariaDB, Oracle, Snowflake), so the agent sees table relationships without manual configuration; relationships pointing outside the selected tables are pruned from context, and the table picker shows a related-tables badge (#1069)
+- Added a catalog of 12 pre-built skills (train an agent, audit the instruction set, migrate a BI dashboard, create eval cases, complex parameterized dashboards, Mermaid ERD, company dashboard and deck themes, scikit-learn modeling, infrastructure RCA, evidence research, usage review), browsable from Skills in the knowledge explorer and enabled per organization by an admin. Skills no longer appear under Global instructions and an enabled skill opens in the normal instruction editor; skills scoped to specific agent modes are no longer advertised outside them, and instruction lists now carry a skill's one-line description instead of a prefix of its body. The read_instruction tool card reads "Read skill" when the instruction is a skill (#1070)
+- Added a SharePoint Server (on-premises) file connector for self-hosted farms, reading document libraries over SharePoint's own REST API rather than the Graph API — no Entra app registration needed. Authenticates with Windows credentials (NTLM, per-connection or per-user) or a Kerberos service account (#1071)
+- Table selection gains a Visual view beside the List view: an ERD canvas laying out relationships across a connection's tables, with selection, focus/expand and custom-query selection shared between the two, table metadata and metrics on the cards, agent-scoped recent prompts in a table's details, and a column browser that scrolls into view with its search focused (#1072)
+- The onboarding connector step now leads with the connectors new workspaces most often start with, browsable by category chip (defaulting to Popular), plus a search box that always queries the full catalogue — matching title, type, description, category and common aliases like "postgres" or "excel" (#1073)
+- Removing a member now deactivates their account when it was their last organization, so they can no longer sign in and their personal API keys stop working immediately — their reports, queries and history are kept, and re-inviting them restores access. Applies to single-organization installs (`allow_multiple_organizations` off). Signing in to a disabled account now says so, disclosed only after the password is verified, and a mistyped password reports "Invalid credentials" instead of the raw `LOGIN_BAD_CREDENTIALS` code (#1074)
+- The sign-in and sign-up pages share one provider-button component and a cleaner monochrome layout: each identity provider is shown by its real name and logo (Microsoft, Google, or a generic mark for a custom OIDC issuer), derived from the issuer URL rather than the provider's config key (#1075)
+- LDAP / Active Directory sign-in now fails closed: TLS is verified before either bind and certificate checking cannot be disabled (point `config.ldap.caCertsFile` at a private CA bundle), a service-account `bindDn` is required, and sign-in is admitted only for members of an explicit `admissionGroupDn` inside one `organizationId`. An LDAP login can no longer take over an existing local account that happens to share its email, and there is no local-password fallback while the directory is unreachable — `allowLocalSuperuserLogin` is the one explicit recovery path. **Upgrading breaks any deployment that relied on anonymous bind, or on local-password fallback during a directory outage** (#1067)
+- Directory group sync is scoped to a single organization and can no longer touch memberships it does not own: an empty or partial directory result no longer deletes invited members, and a failed reconciliation rolls back instead of applying halfway (#1067)
+- Kerberos delegation to SQL Server now takes the impersonated principal only from a verified directory identity — provider, SID and subject must all match — instead of falling back to the signed-in user's email address or a saved form value, and `kerberosRealm` sets the AD realm independently of users' email/UPN suffixes. **Members whose delegated identity was previously inferred from their email need a linked directory identity, or their per-user connections will stop authenticating** (#1067)
+
+## Version 0.0.554 (September 3, 2026)
+- Added a side panel view for query results with a full-width preview (#1054)
+- Added scikit-learn support with ML training constraints (#1055)
+- Added VMware Aria Operations connector for infrastructure RCA (#1056)
+- ServiceNow connector can now fetch record attachments as files (#1057)
+- Dashboard queries can now be managed from the artifact panel's Data modal (#1052)
+- Files are now found by their containing folder, and the read_file PDF card is calmer and more compact (#1059)
+
+## Version 0.0.553 (September 2, 2026)
+- Saved queries can be loaded with parameter values without LLM code generation: run API, entity page, and the agent's describe_entity
+- Entity save/edit form now says "Agents" instead of "Data Sources"
+- Fixed the planner never seeing saved queries or @mentions on the default prompt path; saved queries are now discovered on the agents a chat runs against, including new chats
+
+## Version 0.0.552 (September 2, 2026)
+- Files produced by tools (MCP responses, write_csv output) no longer appear as pending attachment chips in the report prompt box
+
+## Version 0.0.551 (September 1, 2026)
+- MCP tool results now reach the agent whole when they fit the inline budget, instead of being reduced to the first detected record list; deep envelopes are also detected (#1041)
+
+## Version 0.0.550 (August 28, 2026)
+- Viewers can now chat with a shared dashboard on /r/{id}, with owner-controlled scope and per-viewer isolated threads (#1034)
+- Made the artifact sandbox and AgGrid tables dark-mode friendly (#1033)
+- Splunk and Elasticsearch/Kibana connectors now catalog dashboards and saved searches, and can run them for RCA workflows (#1032)
+- Added a per-platform toggle to disable the new-conversation-report announcement on Slack, Teams, Google Chat, and email (#1031)
+- Overhauled artifact iteration: planner-authored artifacts with mechanical edit tools, id-keyed viz bindings, edit-first routing, and dashboard filters with parameters by default (#1030)
+- Query results are now encrypted at rest (enterprise data_encryption): Step/Entity data, tool results, and context summaries stored as Fernet envelopes under BOW_ENCRYPTION_KEY, with plaintext rows still readable (#1019)
+
+## Version 0.0.549 (August 25, 2026)
+- Added native Azure AI Foundry endpoint support to the Azure connector, with editable model ids and fast-failing model-not-found errors (#1020)
+- Rejecting all hunks of a suggested new instruction now retires its orphaned draft, so it no longer resurfaces in search or counts (#1021)
+- Renamed the 'intelligent' instruction load mode to 'Smart' across the UI, with localized labels (#1022)
+- Fixed unreadable instruction body and mention chips in dark mode (#1023)
+- LLM providers can now attach custom HTTP headers and forward user identity to gateways, and Azure gains Entra ID auth (#1025)
+
+## Version 0.0.548 (August 24, 2026)
+- Custom LLM models (Azure deployments, Bedrock, OpenAI-compatible endpoints, fine-tuned ids) can now be given an editable display name, distinct from the model id (#1018)
+- Localized the reports UI and AI settings across all supported languages, with right-to-left layout fixes (#1018)
+
+## Version 0.0.547 (August 24, 2026)
+- Fixed agent follow-ups losing tool results across completions, compaction, and process interruptions (#1016)
+
+## Version 0.0.546 (August 23, 2026)
+- Added HTML export to artifacts — download a dashboard as one standalone, fully offline HTML file (no login, no network)
+
+## Version 0.0.545 (August 22, 2026)
+- Introduced parameterized queries and personalized artifacts — dashboards take typed viewer inputs and identity-scoped parameters, with per-viewer results and refresh on open
+
+## Version 0.0.544 (August 20, 2026)
+- Report owners can hide the Data tab from viewers of a shared report — an "Include Data Tab" checkbox in the share dialog controls whether /r/{id} shows the queries behind the report
+
+## Version 0.0.543 (August 17, 2026)
+- Added AppDynamics (Cisco / Splunk AppDynamics) APM connector — topology, service map, business transactions, metrics, events, health-rule violations and snapshots via the Controller REST API (beta)
+
+## Version 0.0.542 (August 17, 2026)
+- Added physical tables and semantic metadata for SQL Server Analysis Services Tabular models
+
+## Version 0.0.541 (August 16, 2026)
+- Added per-agent export — download an agent's instructions, config, and evals as a zip bundle
+- Fixed entity creation permissions so agent managers and owners can save queries
+
+## Version 0.0.540 (August 15, 2026)
+- Added OAuth access to the full BOW API for custom data apps
+
+## Version 0.0.539 (August 14, 2026)
+- Context budget now trims geometrically with conservative token estimates instead of overrunning the model's window
+- Fixed python-pptx slide previews rendering as raw text when a preview image is missing
+- Added file-based Power BI (.pbix) connector
+- Added monday.com as a queryable data source (GraphQL API)
+- Added SharePoint Lists connector
+- Added DataTable component for artifacts with sorting, pagination, and CSV export
+- Dashboard filters now match against exactly what the grid shows, via one shared evaluator
+- Idle SQL source sessions are closed instead of being held open indefinitely
+- Fixed hunk key collisions when accepting repeated identical instruction edits
+- Fixed terminal agent outcomes being skipped in concurrent tool dispatch
+
 ## Version 0.0.538 (August 12, 2026)
 - Fixed reading a file whose name is stored in a legacy codepage (Hebrew shares, Windows-written directories) — the read failed and ended the rest of the agent's turn with it
 - Fixed garbled filenames in file listings when a folder and the file inside it use different legacy codepages

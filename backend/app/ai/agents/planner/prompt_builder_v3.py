@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from app.ai.llm.types import Message, ToolSpec
 from app.ai.context.parts import TextPart as _TextPart
+from app.ai.prompt_language import language_directive_body
 from app.schemas.ai.planner import PlannerInput, PlannerInputV3, ToolDescriptor
 
 from . import transcript_bridge
@@ -122,6 +123,9 @@ class PromptBuilderV3:
         if sc:
             preamble = preamble.split("<original_user_prompt>")[0].split("<user_prompt>")[0]
         ask = f"{preamble}<user_prompt>{planner_input.user_message}</user_prompt>"
+        hint = PromptBuilderV3._reuse_hint(planner_input)
+        if hint:
+            ask = f"{ask}\n{hint}"
         head = PromptBuilderV3._build_turn_head(planner_input)
 
         t = transcript_bridge.build_transcript(planner_input, static_context, ask)
@@ -251,6 +255,19 @@ class PromptBuilderV3:
         # the connected data should answer — that's the main failure mode for a
         # data tool, and each search incurs cost + sends the query outside the
         # provider's data boundary.
+        # Model training follows the org `enable_ml_training` switch. When off
+        # the sandbox rejects sklearn/scipy, so the planner must neither promise
+        # a model nor let the coder fake one; when on, say what the coder can do
+        # so the plan asks for tidy ML outputs and a model-switching param.
+        if getattr(planner_input, "ml_training_enabled", True):
+            ml_directives_text = (
+                "- **Model training (scikit-learn is enabled for this org):** `create_data` code may train scikit-learn models — classification, regression, clustering, feature importance, metrics, predictions. Ask the coder for tidy outputs (`feature`/`importance`, `metric`/`value`, `actual`/`predicted`, confusion `actual`/`predicted`/`count`) and declare a `model_type`-style parameter when the user wants to switch models from a dashboard. Every rerun retrains, so keep models small and deterministic (random_state).\n"
+            )
+        else:
+            ml_directives_text = (
+                "- **Model training is DISABLED for this org (AI Settings → Machine learning):** scikit-learn and scipy are unavailable and the sandbox rejects their imports. Never promise, describe, or claim a trained model, and never ask the coder to hand-roll one with numpy. When the user asks for a model, say plainly that machine-learning training is turned off in AI Settings and offer the pandas/numpy alternative instead (target rate by feature bucket, correlations, a fitted trend line).\n"
+            )
+
         web_search_directives_text = ""
         if getattr(planner_input, "web_search_enabled", False):
             web_search_directives_text = (
@@ -290,6 +307,13 @@ class PromptBuilderV3:
         )
         rca_notes_bit = ", recording verdicts in notes as they land" if _notes_on else ""
 
+        # Mirror-the-user's-language rule (same body as the legacy planner /
+        # reporter / answer agents). The org locale only serves as the fallback
+        # for messages too short to detect a language from — it is org-level
+        # config, stable for the session, so it keeps the system prompt
+        # cache-friendly.
+        language_text = language_directive_body(getattr(planner_input, "locale", None))
+
         # NOTE: do NOT embed wall-clock time in the system prompt — it would
         # invalidate Anthropic's prompt cache on every call. The current date
         # is rendered into the per-turn user message instead (see
@@ -326,7 +350,7 @@ ROUTING (classify the ask first; the tool follows)
 - **Root-cause asks** ("why did X drop", "what caused the spike"): iterate, don't jump to a conclusion — (1) confirm and quantify the symptom first; (2) decompose across dimensions (time, segment, geography, product, funnel) to localize where it concentrates; (3) enumerate candidate causes and test each with targeted queries (batch the independent ones){rca_notes_bit}; (4) conclude with the causal chain, your confidence, and named confounders. Heavy investigations deliver via create_doc; a quick "why" answers in chat with cited evidence. A "how many" never triggers this loop; a "why" never resolves in one query.
 - The user attached an image/screenshot → describe it in your text; never inspect_data an image.
 {mcp_directives_text}{web_fetch_directives_text}
-{web_search_directives_text}
+{web_search_directives_text}{ml_directives_text}
 
 {platform_directives_text}CLARIFY (default posture: act, don't ask)
 Sources are **published** unless marked otherwise — resolve ordinary ambiguity (scope, time window, granularity, a term with one sensible schema mapping) yourself: state the interpretation in one line and proceed. When you DO need to ask, ask through the `clarify` tool — never as plain text — so the user gets clickable options. The relevant `<agent>`'s `<status>` sets the bar:
@@ -349,13 +373,17 @@ ERROR HANDLING
 
 DASHBOARDS
 - **Cold start** (no relevant viz in past_observations): build ONE wide master table covering the metrics and dimensions the dashboard needs — not several narrow pre-aggregated queries. The artifact derives KPI cards, charts, and tables CLIENT-SIDE from it (reduce/groupBy in JSX).
+- **Filters = server-side parameters (DEFAULT).** When the dashboard has a viewer-adjustable filter (a dimension or time window), declare it as an input parameter on EVERY query the filter must drive (the filter-space pattern: a small dimension query first, then options_source on the consuming queries). Client-side useFilters is only for cheap within-snapshot interactions — never the primary filter mechanism, and never for a filter that some viz cannot honor from its projected columns. To add a filter to an EXISTING query, use `add_parameter(query_id, parameter, column)` — in-place, keeps the query id and its visualizations — instead of recreating via create_data; then wire the control in the artifact.
 - **Warm start**: demonstratives bind to past_observations — "this data", "the above", "what we have", "great/nice + make a dashboard" mean USE the existing visualizations. Scan past_observations for viz_ids FIRST; if they cover the ask, call `create_artifact` directly with them. Call create_data first ONLY when a column the user needs exists in no prior viz. Do not spin up "supporting" KPI/trend/top-N queries the artifact can derive client-side.
 - Generic dashboard ask with multiple candidate vizs, open-ended intent ("something interesting"), or data covering only part of the ask → clarify with 2-3 concrete options. Unambiguous coverage (one wide table + "build a dashboard from this") → skip the clarify.
-- `create_artifact` = new build or rebuild; `edit_artifact` = focused change to an existing artifact (call `create_data` first only if the edit needs new data); `read_artifact` first when the change depends on the artifact's current content.
+- YOU author all artifact source (see ARTIFACT AUTHORING REFERENCE). `create_artifact` = brand-new artifact or an explicit from-scratch rebuild: pass the COMPLETE source in `code` (JSX for page, python-pptx for slides) plus `prompt` as the build spec and the viz ids. `edit_artifact` = the ONLY edit path: author exact find/replace ops against `<current_artifact>.<code>` — mechanical, atomic, no second model; a failed op returns the closest match to correct, and an edit may carry many ops (size is never a reason to rebuild; call `create_data` first only if the edit needs new data). `read_artifact` when the current code was omitted from context for size. The tools gate and render-validate; on failure fix your code/ops and call again — nothing was persisted.
 - Once create_artifact succeeds, deliver the findings summary — the actual numbers, leaders, and trends the data showed, not a tour of the dashboard's features — and do NOT issue further queries to "validate" or double-check the dashboard; its views derive from the data client-side, and the queries that built it are the validation.
 
 DOCUMENTS
 - "report", "analysis", "write-up", "memo", "root cause", "summarize in a doc" → `create_doc`: YOU author polished markdown with citations for every number, embedding live charts via `{{viz:<uuid>}}` — create the data FIRST, then the doc (structure and mermaid rules are in the tool's description). "dashboard", "monitor", "track" → `create_artifact`. Genuinely ambiguous → dashboard, with the written summary in your final message. Write docs in the user's language. Edit docs with `edit_doc` (read_artifact first unless the current markdown is in context).
+
+LANGUAGE
+{language_text}
 
 COMMUNICATION
 - Final text (no tool call) is the complete answer: plain language, markdown OK, summarize findings — don't dump raw widget data.
@@ -373,6 +401,8 @@ EXAMPLES (sources are published by default → most asks proceed with a stated a
 - "Hi" → text only: "Hi! What would you like to look into today?"
 - (past_observations holds a wide master-table viz) "great create a dashboard" → create_artifact with the existing viz_id — DO NOT call create_data first.
 """
+        from app.ai.agents.planner.artifact_authoring import build_artifact_authoring_reference
+        system += "\n\n" + build_artifact_authoring_reference()
         return system
 
     @staticmethod
@@ -642,14 +672,83 @@ EXAMPLES (sources are published by default → most asks proceed with a stated a
         for attr in (
             "project_context", "instructions", "agents_roster", "schemas_combined",
             "files_context", "resources_combined", "tools_context",
-            "available_steps_context", "scheduled_tasks_context",
         ):
             val = getattr(planner_input, attr, None)
             if val:
                 parts.append(f"  {val}")
+        # Mentions, saved entities and prior steps (with their guidance) are
+        # derived from THIS turn's ask and do not change between iterations,
+        # so they belong in the cacheable prefix — and they must be here at
+        # all: the planner cannot volunteer a saved query it was never shown.
+        # Shared with the legacy path so the two never drift apart again.
+        parts.extend(PromptBuilderV3._reuse_blocks(planner_input))
+        if getattr(planner_input, "scheduled_tasks_context", None):
+            parts.append(f"  {planner_input.scheduled_tasks_context}")
         parts.append(f"  {PromptBuilder._render_current_artifact(planner_input.active_artifact)}")
         parts.append("</context>")
         return "\n".join(parts)
+
+    @staticmethod
+    def _reuse_hint(planner_input: PlannerInput) -> str:
+        """A one-line pointer placed right next to the ask when saved entities
+        matched this turn: their titles and parameter names. The full
+        <entities> block lives deep in the static prefix, after schemas and
+        tools, where a small model reliably reads it only when reminded; the
+        hint is the reminder, and it names the param keys the model must use."""
+        import re as _re
+        ctx = getattr(planner_input, "entities_context", None) or ""
+        if "<entity " not in ctx:
+            return ""
+        items: List[str] = []
+        for m in _re.finditer(r'<entity\b[^>]*\btitle="([^"]*)"[^>]*>(.*?)</entity>', ctx, _re.S):
+            title, body = m.group(1), m.group(2)
+            params = _re.findall(r'<param\b[^>]*\bname="([^"]*)"', body)
+            items.append(f'"{title}"' + (f" (params: {', '.join(params)})" if params else ""))
+            if len(items) >= 5:
+                break
+        if not items:
+            return ""
+        return (
+            "<saved_queries_hint>Saved queries on these agents that may already answer this "
+            f"ask: {'; '.join(items)}. If one does — as-is or with the user's values for its "
+            "params — call describe_entity(should_create=True, params={...}) with those exact "
+            "param names instead of create_data.</saved_queries_hint>"
+        )
+
+    @staticmethod
+    def _reuse_blocks(planner_input: PlannerInput) -> List[str]:
+        """The reuse surface: this turn's @mentions, the saved entities that
+        matched it, and the report's prior steps — each with the guidance that
+        tells the planner to reuse instead of rebuild. Rendered identically on
+        the transcript and legacy paths."""
+        parts: List[str] = []
+        parts.append(
+            f"  {planner_input.mentions_context if planner_input.mentions_context else '<mentions>No mentions for this turn</mentions>'}"
+        )
+        parts.append(
+            f"  {planner_input.entities_context if planner_input.entities_context else '<entities>No entities matched</entities>'}"
+        )
+        if planner_input.entities_context and "<entity " in planner_input.entities_context:
+            parts.append(
+                "  <entities_guidance>Entities are saved, reviewed queries — the preferred way to "
+                "answer an ask they cover. Match on the QUESTION, not the wording: an ask that is "
+                "the entity's question narrowed to a specific value of one of its <parameters> "
+                "(a genre, a year, a region, a customer) IS a match. For a match call "
+                "describe_entity with should_create=True, passing the user's values as "
+                "params={name: value} where name is the param's name= attribute exactly (not a "
+                "column name); omitted parameters keep their defaults. Do not write new code for "
+                "data an entity already provides; reach for create_data only when no entity fits "
+                "or its rows must be transformed or combined with other data.</entities_guidance>"
+            )
+        if getattr(planner_input, "available_steps_context", None):
+            parts.append(f"  {planner_input.available_steps_context}")
+            parts.append(
+                "  <reuse_guidance>When a prior step in <available_steps> already holds the data the "
+                "user wants (especially when they refer to it by name, or ask to extend/modify a "
+                "previous result), prefer create_data — it can load that step via load_step instead of "
+                "re-querying from scratch. Do not rebuild existing data with new SQL.</reuse_guidance>"
+            )
+        return parts
 
     @staticmethod
     def _build_turn_head(planner_input: PlannerInput) -> str:
@@ -716,6 +815,9 @@ EXAMPLES (sources are published by default → most asks proceed with a stated a
         if user_memory_block:
             parts.append(user_memory_block)
         parts.append(PromptBuilder._format_user_prompt(planner_input))
+        hint = PromptBuilderV3._reuse_hint(planner_input)
+        if hint:
+            parts.append(hint)
         if images_context:
             parts.append(images_context)
         parts.append("<context>")
@@ -766,20 +868,7 @@ EXAMPLES (sources are published by default → most asks proceed with a stated a
             parts.append(f"  {planner_input.resources_combined}")
         if getattr(planner_input, "tools_context", None):
             parts.append(f"  {planner_input.tools_context}")
-        parts.append(
-            f"  {planner_input.mentions_context if planner_input.mentions_context else '<mentions>No mentions for this turn</mentions>'}"
-        )
-        parts.append(
-            f"  {planner_input.entities_context if planner_input.entities_context else '<entities>No entities matched</entities>'}"
-        )
-        if getattr(planner_input, "available_steps_context", None):
-            parts.append(f"  {planner_input.available_steps_context}")
-            parts.append(
-                "  <reuse_guidance>When a prior step in <available_steps> already holds the data the "
-                "user wants (especially when they refer to it by name, or ask to extend/modify a "
-                "previous result), prefer create_data — it can load that step via load_step instead of "
-                "re-querying from scratch. Do not rebuild existing data with new SQL.</reuse_guidance>"
-            )
+        parts.extend(PromptBuilderV3._reuse_blocks(planner_input))
         if getattr(planner_input, "scheduled_tasks_context", None):
             parts.append(f"  {planner_input.scheduled_tasks_context}")
         parts.append(
@@ -801,14 +890,16 @@ EXAMPLES (sources are published by default → most asks proceed with a stated a
                 "  <notes_guidance>You keep a per-report scratchpad via create_note / edit_note — "
                 "your own working memory (may be stale or wrong, verify against data; NOT user "
                 "instructions). GATE: notes are for MULTI-STEP analyses only — a single "
-                "query/create_data gets NO note, even if you searched for the source first. Three jobs: (1) a PLAN — open a note early with a `- [ ]` checklist and "
+                "query/create_data gets NO note, even if you searched for the source first. Three jobs: (1) a PLAN — open a note titled exactly `Plan` early with a `- [ ]` checklist and "
                 "keep it ticked off; (2) a CROSS-STEP ACCUMULATOR — when you page through a large input "
                 "(windowed read_file, a long history) whose earlier parts scroll out of context, write a "
                 "running mid-summary of findings so they survive across steps; (3) a DISCOVERY "
                 "INVENTORY — when a discovery pass completes (sources found, files enumerated), record "
                 "the inventory in the note and consult it instead of re-running discovery — rephrasing "
                 "the same search is still re-running it. edit_note (by note id) "
-                "keeps them current. UPDATE TIMING: notes are updated AS YOU GO, never batched for the "
+                "keeps them current. COMPLETION GATE: once a `Plan` checklist exists for this run, the "
+                "harness rejects completion while any `- [ ]` item remains; check an item only after "
+                "the work is supported by evidence. UPDATE TIMING: notes are updated AS YOU GO, never batched for the "
                 "end — the moment a step completes a checklist item or yields a finding worth keeping, "
                 f"{cadence}. A note that goes stale mid-run has failed its purpose. "
                 f"{have_notes}</notes_guidance>"

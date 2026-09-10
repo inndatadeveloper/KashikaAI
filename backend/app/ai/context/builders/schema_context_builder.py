@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 import re
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, or_
 from app.ai.context.sections.tables_schema_section import TablesSchemaContext, MCPToolItem
 from app.schemas.data_source_schema import DataSourceSummarySchema
 from app.ai.prompt_formatters import Table as PromptTable, TableColumn as PromptTableColumn, ForeignKey as PromptForeignKey
@@ -34,6 +34,38 @@ FAST_CLIENT_SUFFIX = "::fast"
 # per-user catalog: the owner's address is personal data the agent never needs,
 # and the report inventory can name reports the user has no access to.
 _REDACTED_SOURCE_METADATA_KEYS = ("configuredBy", "reports")
+
+
+def _prune_unresolvable_fks(normalized):
+    """Drop edges pointing outside the tables this context actually emits.
+
+    A foreign key is rendered as DDL — `foreign key (region_code) references
+    ref.regions(code)` — which the agent reads as a fact about what it can
+    join. If the referenced table was deselected by the agent's owner, filtered
+    out, or hidden from this user by an access overlay, that line invites a
+    join no query can satisfy: the agent writes it, execution fails, and
+    nothing in the context explains why.
+
+    Reachable only since SQL sources began reporting foreign keys. Previously
+    just semantic sources carried edges, and their tables tend to be selected
+    as a unit; now any partial selection of a relational schema produces
+    dangling ones, which is the normal case rather than the exotic one.
+
+    Applied to the finished list so the invariant holds for both population
+    paths from one place — the per-user overlay branch filters against its own
+    visible set as well, and this is a no-op there. Mutates in place; only ever
+    removes edges leaving the emitted set.
+    """
+    emitted_names = {item.get("name") for item in normalized}
+    for item in normalized:
+        item_fks = item.get("fks") or []
+        if not item_fks:
+            continue
+        item["fks"] = [
+            fk for fk in item_fks
+            if (fk.get("references_name") if isinstance(fk, dict)
+                else getattr(fk, "references_name", None)) in emitted_names
+        ]
 
 
 def _redact_source_metadata(metadata_json):
@@ -275,6 +307,23 @@ class SchemaContextBuilder:
                     )
                 )
                 overlay_tables = overlays_q.scalars().all()
+                if not overlay_tables:
+                    from app.services.connection_identity import supports_user_kerberos_sso
+                    if any(supports_user_kerberos_sso(c) for c in (ds.connections or [])):
+                        # Kerberos has no OAuth callback to initialize a user's
+                        # catalog. Discover on first prompt under the verified
+                        # caller identity; never substitute the service catalog.
+                        from app.services.data_source_service import DataSourceService
+                        await DataSourceService().get_user_data_source_schema(
+                            db=self.db, data_source=ds, user=self.user,
+                        )
+                        overlay_tables = (await self.db.execute(
+                            select(UserDataSourceTable).where(
+                                UserDataSourceTable.data_source_id == str(ds.id),
+                                UserDataSourceTable.user_id == str(self.user.id),
+                                UserDataSourceTable.is_accessible == True,
+                            )
+                        )).scalars().all()
                 overlay_ids = [str(ot.id) for ot in overlay_tables]
                 # Every table this user can actually see. Relationships are read
                 # from the canonical row, which was indexed by a broader
@@ -294,10 +343,58 @@ class SchemaContextBuilder:
                 for c in cols:
                     cols_by_table.setdefault(str(c.user_data_source_table_id), []).append(c)
 
+                # Canonical enrichment lookup for the overlay tables, WITHOUT the
+                # active filter. For a user_required source the canonical catalog
+                # is built by the service principal, which by design has no access
+                # to a delegated dataset — so its canonical row is typically
+                # inactive or absent (see canonical_by_name, filtered to
+                # is_active==True). The overlay's is_accessible flag is the real
+                # per-user access authority here; the canonical row is used only
+                # to enrich column/relationship descriptors, so load it directly
+                # by name regardless of is_active rather than dropping the table.
+                overlay_names = [n for n in visible_table_names if n]
+                canonical_all_by_name: Dict[str, DataSourceTable] = dict(canonical_by_name)
+                missing_names = [n for n in overlay_names if n not in canonical_all_by_name]
+                if missing_names:
+                    enrich_query = (
+                        select(DataSourceTable)
+                        .options(
+                            selectinload(DataSourceTable.connection_table)
+                            .selectinload(ConnectionTable.connection)
+                        )
+                        .where(
+                            DataSourceTable.datasource_id == str(ds.id),
+                            DataSourceTable.name.in_(missing_names),
+                        )
+                    )
+                    # Honor the connection_ids contract the main query applies:
+                    # enrich only from rows on a target connection or unlinked
+                    # rows (a delegated dataset's canonical row is typically
+                    # unlinked). Never pull a row owned by another named
+                    # connection — that would mis-attribute the overlay table.
+                    if connection_ids:
+                        conn_id_set = set(str(x) for x in connection_ids)
+                        enrich_query = (
+                            enrich_query
+                            .outerjoin(
+                                ConnectionTable,
+                                DataSourceTable.connection_table_id == ConnectionTable.id,
+                            )
+                            .where(or_(
+                                ConnectionTable.connection_id.in_(conn_id_set),
+                                DataSourceTable.connection_table_id.is_(None),
+                            ))
+                        )
+                    enrich_q = await self.db.execute(enrich_query)
+                    # DataSourceTable.name is non-null; key directly (avoid an
+                    # empty-string bucket collapsing distinct rows).
+                    for t in enrich_q.scalars().all():
+                        canonical_all_by_name.setdefault(t.name, t)
+
                 for ot in overlay_tables:
                     name = getattr(ot, 'table_name', '') or ''
                     overlay_cols = cols_by_table.get(str(ot.id), [])
-                    base = canonical_by_name.get(name)
+                    base = canonical_all_by_name.get(name)
                     # The overlay decides WHICH columns this user may see; the
                     # canonical row describes WHAT they are. Column descriptors
                     # (measure role, hidden flag, return type) are model-level
@@ -329,7 +426,9 @@ class SchemaContextBuilder:
                             safe_meta = {
                                 k: canon_meta[k]
                                 for k in ("role", "kind", "hidden", "is_partition",
-                                          "relationship_key", "returns")
+                                          "relationship_key", "returns", "format_string",
+                                          "data_category", "display_folder", "sort_by_column",
+                                          "summarize_by", "contents")
                                 if k in canon_meta
                             } or None
                         columns.append({
@@ -341,11 +440,15 @@ class SchemaContextBuilder:
                             "description": None,
                             "metadata": safe_meta,
                         })
-                    # Respect canonical table's is_active status (default False if not found)
-                    canonical_is_active = bool(getattr(base, 'is_active', False)) if base is not None else False
-                    # Skip inactive tables when active_only is True
-                    if active_only and not canonical_is_active:
-                        continue
+                    # The overlay is the per-user access authority: this table
+                    # came from the is_accessible==True overlay query above, so
+                    # the user can provably query it right now. The canonical
+                    # is_active flag is unreliable for a user_required source
+                    # (service principal has no access → canonical stays
+                    # inactive), so do NOT gate the user's own accessible table
+                    # on it — that dropped every delegated-source table and left
+                    # the agent with an empty schema. Emit as active.
+                    canonical_is_active = True
                     pks = getattr(base, 'pks', []) if base is not None else []
                     fks = [
                         fk for fk in (getattr(base, 'fks', None) or [])
@@ -459,6 +562,8 @@ class SchemaContextBuilder:
                         "cached_next_refresh": cached_next_refresh,
                         "description": cached_description,
                     })
+
+            _prune_unresolvable_fks(normalized)
 
             # Batch-query instruction reference counts for all tables in this data source
             instruction_ref_counts: Dict[str, int] = {}
@@ -717,10 +822,12 @@ class SchemaContextBuilder:
 
     # File-source connectors and which of them have a native search API.
     _FILE_SOURCE_TYPES = {
+        "sharepoint_onprem",
         "network_dir", "s3", "sharepoint", "onedrive", "google_drive",
         "outlook_mail", "gmail_mail", "onenote",
     }
     _NATIVE_SEARCH_TYPES = {
+        "sharepoint_onprem",
         "sharepoint", "onedrive", "google_drive", "outlook_mail", "gmail_mail",
         # OneNote search is local (over the walked hierarchy), not a provider
         # call, but it is still a first-class search the agent should prefer
@@ -766,13 +873,15 @@ class SchemaContextBuilder:
             index_mode = cfg.get("index_mode") or ("content" if cfg.get("index_content", True) else "metadata")
             base = (f"s3://{cfg.get('bucket')}/{cfg.get('prefix') or ''}"
                     if cfg.get("bucket") else cfg.get("root_path"))
+            if c.type == "sharepoint_onprem":
+                base = " / ".join(str(cfg[k]) for k in ("site_url", "drive_name", "folder_path") if cfg.get(k))
             cid = str(c.id)
             ftabs = by_conn.get(cid, [])
             sample = [t.name for t in ftabs[:5] if getattr(t, 'name', None)]
             topics, seen = [], set()
             for t in ftabs:
                 mj = getattr(t, 'metadata_json', None) or {}
-                sub = (mj.get("network_dir") or mj.get("s3") or mj.get("graph")
+                sub = (mj.get("network_dir") or mj.get("s3") or mj.get("graph") or mj.get("sharepoint_onprem")
                        or mj.get("google_drive") or {}) if isinstance(mj, dict) else {}
                 for kw in (sub.get("keywords") or []):
                     k = str(kw).lower()

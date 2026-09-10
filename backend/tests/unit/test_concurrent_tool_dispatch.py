@@ -511,6 +511,23 @@ def test_batch_failure_rollup_any_success_resets():
     assert AgentV2._batch_failure_rollup([_cb_outcome("x", skipped=True)]) == {}
 
 
+def test_policy_skipped_terminal_outcome_still_stops_the_run():
+    """Execution policy may refuse a tool call while also terminating the turn.
+
+    ``skipped`` means the tool did not execute; it must not erase the policy's
+    terminal decision.  Otherwise the planner retries the refused action until
+    the global step limit.
+    """
+    outcome = _cb_outcome("edit_artifact", skipped=True)
+    outcome["observation"].update({
+        "analysis_complete": True,
+        "final_answer": "The operation limit was reached.",
+    })
+
+    assert AgentV2._outcome_ends_run(outcome) is True
+    assert AgentV2._outcome_ends_run(_cb_outcome("edit_artifact", skipped=True)) is False
+
+
 @pytest.mark.asyncio
 async def test_dispatch_uses_org_setting_concurrency(monkeypatch):
     """End-to-end through _dispatch_action_batch: the org setting alone
@@ -555,20 +572,22 @@ async def _noop_emit(ev):
 
 
 @pytest.mark.asyncio
-async def test_validation_failures_tracked_per_tool_not_globally():
+async def test_intervening_tool_call_breaks_validation_failure_streak():
     runner = ToolRunner(retry=RetryPolicy(max_attempts=1), timeout=TimeoutPolicy(5, 5, 5))
     a, b = _ValidatingTool(), _OtherTool()
 
     r1 = await runner.run(a, {}, {}, _noop_emit)  # invalid input for a
     assert r1["observation"]["error"]["type"] == "validation_error"
 
-    # A SUCCESS on tool b must not reset tool a's streak
+    # A different intervening call means these are not adjacent repetitions of
+    # the same approach.
     rb = await runner.run(b, {"required_field": "x"}, {}, _noop_emit)
     assert "error" not in rb.get("observation", {})
 
-    r2 = await runner.run(a, {}, {}, _noop_emit)  # second invalid input for a
-    assert r2["observation"]["error"]["type"] == "repeated_validation_error"
-    assert r2["observation"].get("analysis_complete") is True
+    r2 = await runner.run(a, {}, {}, _noop_emit)
+    assert r2["observation"]["error"]["type"] == "validation_error"
+    assert "retry_exhausted" not in r2["observation"]
+    assert "analysis_complete" not in r2["observation"]
 
     # And tool b's own streak is independent
     rb1 = await runner.run(b, {}, {}, _noop_emit)
@@ -576,7 +595,7 @@ async def test_validation_failures_tracked_per_tool_not_globally():
 
 
 @pytest.mark.asyncio
-async def test_success_resets_only_that_tools_streak():
+async def test_success_breaks_validation_failure_streak():
     runner = ToolRunner(retry=RetryPolicy(max_attempts=1), timeout=TimeoutPolicy(5, 5, 5))
     a = _ValidatingTool()
     await runner.run(a, {}, {}, _noop_emit)               # streak 1

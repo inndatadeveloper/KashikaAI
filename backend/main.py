@@ -43,6 +43,7 @@ from app.models.user import User
 from app.services.maintenance_service import purge_step_payloads_keep_latest_per_query
 from app.data_sources.clients.qvd_client import warm_all_qvd_caches
 from app.data_sources.clients.powerbi_report_server_client import warm_all_pbirs_caches
+from app.data_sources.clients.pbix_client import warm_all_pbix_file_caches
 from app.services.scheduled_reindex import sweep_due_reindexes
 from app.services.connection_status_sweep import sweep_stale_connection_status
 from app.core.otel import setup_telemetry, instrument_app
@@ -50,6 +51,7 @@ from app.ee.audit.tool_audit import start_tool_audit_worker, stop_tool_audit_wor
 
 from app.routes import (
     report,
+    artifact_chat,
     project,
     test,
     widget,
@@ -255,6 +257,7 @@ app.include_router(agent_reliability.router, prefix="/api")
 app.include_router(review.router, prefix="/api")
 app.include_router(notification.router, prefix="/api")
 app.include_router(report.router, prefix="/api")
+app.include_router(artifact_chat.router, prefix="/api")
 app.include_router(project.router, prefix="/api")
 app.include_router(scheduled_prompt.router, prefix="/api")
 app.include_router(prompt_routes.router, prefix="/api")
@@ -441,6 +444,18 @@ async def startup_event():
     if not is_scheduler_leader:
         logger.info("Scheduler leader lock not acquired — skipping job registration in this worker")
 
+    # Organizations created before a pre-built skill was flagged
+    # default_enabled get it installed once, here. Leader-only so multiple
+    # workers do not race the same check-then-install; a background task so a
+    # large multi-org deployment does not hold up the first request.
+    if is_scheduler_leader:
+        try:
+            import asyncio as _asyncio
+            from app.services.skill_catalog_service import run_default_skill_backfill
+            app.state.default_skill_backfill_task = _asyncio.create_task(run_default_skill_backfill())
+        except Exception as e:
+            logger.error(f"Failed to start default skill backfill: {e}")
+
     # Register daily maintenance jobs
     if is_scheduler_leader:
         try:
@@ -495,6 +510,24 @@ async def startup_event():
             logger.info("Scheduled job: pbirs_warmup every 1 hour")
         except Exception as e:
             logger.error(f"Failed to schedule PBIRS warmup job: {e}")
+
+    # Background warmup of file-based PBIX Parquet caches so a first query after
+    # a .pbix file edit doesn't pay the in-process pbixray decode.
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                warm_all_pbix_file_caches,
+                trigger="interval",
+                hours=1,
+                id="pbix_file_warmup",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+            logger.info("Scheduled job: pbix_file_warmup every 1 hour")
+        except Exception as e:
+            logger.error(f"Failed to schedule PBIX file warmup job: {e}")
 
     # Periodic schema auto-reload: re-index connection schemas whose tables are
     # stale past their per-connection interval (enterprise `scheduled_reindex`).

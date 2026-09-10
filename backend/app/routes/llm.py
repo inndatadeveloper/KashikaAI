@@ -140,7 +140,11 @@ async def create_model(
         pass
     return created
 
-@router.patch("/llm/models/{model_id}")
+# response_model matters here: without it FastAPI serializes the raw ORM row,
+# and LLMModel.provider -> LLMProvider.models -> LLMModel cycles until it hits
+# RecursionError. Nothing called this endpoint until the rename UI landed, so
+# the crash sat undiscovered — POST above always had the schema.
+@router.patch("/llm/models/{model_id}", response_model=LLMModelSchema)
 @requires_permission('manage_llm')
 async def update_model(
     model_id: str,
@@ -231,6 +235,18 @@ async def toggle_model_image_generation(
 ):
     """Manually mark/unmark a model as an image-generation model."""
     return await llm_service.toggle_image_generation(db, organization, current_user, model_id, enabled)
+
+@router.post("/llm/models/{model_id}/set_temperature")
+@requires_permission('manage_llm')
+async def set_model_temperature(
+    model_id: str,
+    temperature: float | None = None,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Set a model's explicit sampling temperature (0-2). Omit to reset — no temperature is sent and the endpoint's default applies."""
+    return await llm_service.set_temperature(db, organization, current_user, model_id, temperature)
 
 @router.post("/llm/models/{model_id}/set_context_window")
 @requires_permission('manage_llm')

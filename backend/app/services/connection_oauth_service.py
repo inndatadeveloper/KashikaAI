@@ -90,7 +90,7 @@ def get_oauth_params(connection: Connection) -> dict:
     creds = connection.decrypt_credentials() or {}
     conn_type = connection.type
 
-    if conn_type in ("powerbi", "ms_fabric", "sharepoint", "onedrive", "outlook_mail", "onenote"):
+    if conn_type in ("powerbi", "ms_fabric", "sharepoint", "sharepoint_lists", "onedrive", "outlook_mail", "onenote"):
         tenant_id = creds.get("tenant_id")
         if not tenant_id:
             raise ValueError(f"Connection {connection.id} missing tenant_id in credentials")
@@ -114,6 +114,9 @@ def get_oauth_params(connection: Connection) -> dict:
             # files shared with the user. `openid profile offline_access` give
             # us the user identity + refresh token.
             "sharepoint": "openid profile offline_access Files.Read.All Sites.Read.All User.Read",
+            # Lists connector reads list items over the same Graph resource;
+            # `Sites.Read.All` is the one delegated permission it needs.
+            "sharepoint_lists": "openid profile offline_access Sites.Read.All User.Read",
             "onedrive": "openid profile offline_access Files.Read.All User.Read",
             # Outlook mail is surfaced through the same Graph file-tool surface;
             # `Mail.Read` covers reading + $search over the signed-in user's
@@ -253,6 +256,35 @@ def get_oauth_params(connection: Connection) -> dict:
             # (default ~100-day lifetime); no offline_access-style scope exists.
             "scopes": "useraccount",
             "provider_name": "servicenow",
+        }
+
+    if conn_type == "monday":
+        # monday.com OAuth endpoints are global (auth.monday.com) for all
+        # regions — an EU account still authorizes against the global host.
+        # The admin registers an app in the Developer Center and saves its
+        # client id/secret on the connection (api_token credentials schema).
+        # monday access tokens DO NOT expire and no refresh token is issued,
+        # so there is no refresh path — a 401 later means re-connect.
+        client_id = creds.get("oauth_client_id")
+        client_secret = creds.get("oauth_client_secret")
+        if not client_id or not client_secret:
+            raise ValueError(
+                f"Connection {connection.id} missing oauth_client_id/oauth_client_secret for monday.com OAuth. "
+                "Create an app in monday.com's Developer Center (with this server's redirect URL) and save its "
+                "client ID and secret on the connection."
+            )
+
+        return {
+            "authorize_url": "https://auth.monday.com/oauth2/authorize",
+            "token_url": "https://auth.monday.com/oauth2/token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            # Read-only scopes: enough to index boards and run queries as the
+            # signed-in user. Write scopes are deliberately excluded. `me:read`
+            # covers the Query.me identity probe in test_connection — personal
+            # API tokens carry it implicitly, delegated tokens must request it.
+            "scopes": "me:read boards:read workspaces:read users:read account:read",
+            "provider_name": "monday",
         }
 
     if conn_type == "priority_erp":
@@ -553,7 +585,12 @@ async def refresh_access_token(
             oauth_params["token_url"],
             data=data,
             auth=auth,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                # GitHub's token endpoint returns form-encoded (or an HTML
+                # page) unless JSON is explicitly requested.
+                "Accept": "application/json",
+            },
             timeout=30,
         )
 
@@ -561,7 +598,30 @@ async def refresh_access_token(
         logger.error(f"OAuth token refresh failed: {resp.status_code} {resp.text}")
         raise ValueError(f"OAuth token refresh failed: {resp.text}")
 
-    token_data = resp.json()
+    # Parse defensively: JSON first, then form-encoded (GitHub's default),
+    # never a bare resp.json() — a non-JSON 200 used to surface as the
+    # meaningless "Expecting value: line 1 column 1 (char 0)".
+    try:
+        token_data = resp.json()
+    except Exception:
+        from urllib.parse import parse_qs
+
+        parsed = parse_qs(resp.text or "")
+        token_data = {k: v[0] for k, v in parsed.items() if v}
+        if not token_data.get("access_token") and not token_data.get("error"):
+            snippet = (resp.text or "")[:200]
+            raise ValueError(
+                f"OAuth token refresh returned an unrecognized body "
+                f"(content-type={resp.headers.get('content-type')}): {snippet}"
+            )
+
+    # Providers (GitHub included) report failures like bad_refresh_token as
+    # HTTP 200 with an error payload — treat that as a failure, not a token.
+    if token_data.get("error"):
+        desc = token_data.get("error_description") or token_data["error"]
+        logger.error(f"OAuth token refresh rejected: {desc}")
+        raise ValueError(f"OAuth token refresh rejected: {desc}")
+
     expires_in = token_data.get("expires_in", 3600)
     return {
         "access_token": token_data["access_token"],
@@ -578,7 +638,7 @@ async def refresh_access_token(
 # ---------------------------------------------------------------------------
 
 # Connection types that support OBO auto-provisioning from Entra ID login
-ENTRA_OBO_CONNECTION_TYPES = {"powerbi", "ms_fabric", "sharepoint", "onedrive", "outlook_mail", "onenote"}
+ENTRA_OBO_CONNECTION_TYPES = {"powerbi", "ms_fabric", "sharepoint", "sharepoint_lists", "onedrive", "outlook_mail", "onenote"}
 
 # Resource scopes used when requesting OBO tokens per connection type.
 # These must match the API permissions granted to the Entra app registration.
@@ -592,6 +652,7 @@ _OBO_SCOPES = {
     "ms_fabric": "https://database.windows.net/user_impersonation offline_access",
     # Microsoft Graph delegated scopes for file access.
     "sharepoint": "https://graph.microsoft.com/.default offline_access",
+    "sharepoint_lists": "https://graph.microsoft.com/.default offline_access",
     "onedrive": "https://graph.microsoft.com/.default offline_access",
     # Outlook mail reads over Graph use the same Graph resource; `.default`
     # yields whatever Graph delegated permissions (e.g. Mail.Read) the app

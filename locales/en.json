@@ -46,6 +46,9 @@
     "tools": "Tools",
     "files": "Files",
     "instructions": "Instructions",
+    "queries": "Queries",
+    "noQueries": "No queries yet",
+    "untitledQuery": "Untitled query",
     "evals": "Evals",
     "settings": "Settings",
     "noRulesAttached": "No rules attached.",
@@ -103,6 +106,7 @@
     "selfLearning": "Self Learning",
     "selfLearningTip": "Configure how this agent learns from new suggestions",
     "newReport": "New report",
+    "exportInstructions": "Export agent bundle — instructions, config & evals (.zip)",
     "connect": "Connect",
     "manageConnections": "Manage connections",
     "loadingFiles": "Loading files from the source…",
@@ -242,6 +246,8 @@
     "toastSaveDescFailed": "Failed to save description",
     "toastTablesReloaded": "Tables reloaded",
     "toastToolsReloaded": "Tools reloaded",
+    "connectionLinked": "Connection added to agent",
+    "connectionLinkFailed": "Failed to add connection to agent",
     "toastUploaded": "Uploaded {n} file(s)",
     "toastUploadFailed": "Upload failed",
     "uploadTooLarge": "File is too large for the server's upload limit",
@@ -349,7 +355,6 @@
     "data": "Data",
     "dataAgents": "Data Agents",
     "instructions": "Instructions",
-    "queries": "Queries",
     "settings": "Settings",
     "members": "Members",
     "monitoring": "Monitoring",
@@ -441,7 +446,7 @@
     }
   },
   "auth": {
-    "signIn": "Login",
+    "signIn": "Sign in",
     "signUp": "Sign up",
     "name": "Name",
     "email": "Email",
@@ -449,7 +454,7 @@
     "newPassword": "New Password",
     "confirmPassword": "Confirm New Password",
     "forgotPassword": "Forgot Password?",
-    "newToBow": "New to Bag of words?",
+    "newToBow": "New to BOW?",
     "alreadyHaveAccount": "Already have an account?",
     "rememberPassword": "Remember your password?",
     "resetPassword": "Reset Password",
@@ -473,11 +478,18 @@
     "signingUp": "Signing up…",
     "redirecting": "Redirecting…",
     "orContinueWith": "Or continue with",
+    "orContinueWithEmail": "Or continue with email",
+    "signInSubtitle": "Sign in to your account",
+    "welcomeTitle": "Welcome to BOW",
+    "signUpSubtitle": "Create your account to get started",
+    "setupSubtitle": "Create the first account to set up BOW",
+    "or": "or",
     "signInWithGoogle": "Sign in with Google",
     "signUpWithGoogle": "Sign up with Google",
     "signInWithProvider": "Sign in with {provider}",
     "continueWithProvider": "Continue with {provider}",
     "invalidCredentials": "Invalid credentials",
+    "signInFailed": "Sign-in failed. Please try again.",
     "registrationError": "An error occurred during registration.",
     "googleInitError": "Failed to initialize Google sign-in",
     "providerInitError": "Failed to initialize {provider} sign-in",
@@ -595,6 +607,15 @@
     "loadingDataSources": "Loading data sources…",
     "noDataSources": "No data sources found"
   },
+  "exports": {
+    "label": "Export",
+    "pdf": "PDF",
+    "pdfDone": "PDF downloaded.",
+    "pptx": "PowerPoint",
+    "html": "HTML",
+    "complete": "Export complete",
+    "failed": "Export failed"
+  },
   "reports": {
     "title": "Reports",
     "subtitle": "Browse and manage your reports",
@@ -690,6 +711,8 @@
     },
     "empty": "No reports found",
     "emptyHint": "Try adjusting your filters or search term",
+    "sharedEmpty": "No shared reports",
+    "sharedEmptyHint": "Reports other people share with you will appear here.",
     "allDashboards": "All dashboards",
     "allModes": "All modes",
     "allSchedules": "All schedules",
@@ -724,7 +747,8 @@
     "type": {
       "chat": "Chat",
       "dashboard": "Dashboard",
-      "slides": "Slides"
+      "slides": "Slides",
+      "training": "Training"
     },
     "untitled": "Untitled",
     "menu": {
@@ -745,7 +769,8 @@
       "running": "Running",
       "newActivity": "New activity",
       "errorNew": "Finished with an error"
-    }
+    },
+    "inProject": "In {name}"
   },
   "projects": {
     "title": "Projects",
@@ -826,7 +851,30 @@
       "noAutomations": "No automations in this project yet.",
       "fromProject": "From {name}"
     },
-    "rowActions": "Project actions"
+    "rowActions": "Project actions",
+    "myProjects": "My projects",
+    "sharedWithMe": "Shared with me",
+    "searchPlaceholder": "Search projects…",
+    "filtersButton": "Filters",
+    "emptyTitle": "No projects yet",
+    "noResults": "No projects found",
+    "noResultsHint": "Try a different search or clear the filters.",
+    "sharedEmpty": "Nothing shared with you yet",
+    "sharedEmptyHint": "Projects teammates share with you will show up here.",
+    "filters": {
+      "accessLabel": "Access",
+      "allAccess": "All Access",
+      "private": "Private",
+      "orgShared": "Shared with org",
+      "reportsLabel": "Reports",
+      "allReports": "All Projects",
+      "withReports": "With reports",
+      "emptyReports": "Empty",
+      "clear": "Clear all"
+    },
+    "pagination": {
+      "rowsPerPage": "Rows per page"
+    }
   },
   "traceModal": {
     "title": "Agent Execution",
@@ -844,7 +892,7 @@
     "userPrompt": "User Prompt",
     "instructionsCount": "{count} instructions",
     "alwaysCount": "{count} always",
-    "intelligentCount": "{count} intelligent",
+    "intelligentCount": "{count} smart",
     "noInstructions": "No instructions loaded.",
     "feedback": "Feedback",
     "positive": "Positive",
@@ -1213,8 +1261,9 @@
       "untitled": "Untitled"
     },
     "readInstruction": {
-      "reading": "Reading instruction…",
+      "reading": "Reading…",
       "read": "Read instruction",
+      "readSkill": "Read skill",
       "failed": "Could not read instruction"
     },
     "createEval": {
@@ -1325,7 +1374,11 @@
       "copyIdTooltip": "Copy query ID",
       "copied": "Copied",
       "copiedDesc": "Query ID copied to clipboard",
-      "copyFailed": "Failed to copy"
+      "copyFailed": "Failed to copy",
+      "openInPanel": "Open in side panel",
+      "closeDataPanel": "Close data view",
+      "dataTab": "Data",
+      "loadingRows": "Loading all rows…"
     },
     "generic": {
       "running": "Running...",
@@ -1489,6 +1542,17 @@
       "moreShown": "+{count} more shown to the agent",
       "filesSkippedSingular": "{count} file skipped ({reasons})",
       "filesSkippedPlural": "{count} files skipped ({reasons})"
+    },
+    "readFile": {
+      "reading": "Reading {name}…",
+      "read": "Read {name}",
+      "rowsCols": "{rows} rows × {cols} cols",
+      "truncated": "truncated",
+      "pages": "pages {shown}",
+      "pagesOfTotal": "pages {shown} / {total}",
+      "pathLabel": "Path:",
+      "attachedAsSessionFile": "Attached to this conversation as session file",
+      "showPagePreviews": "Show page previews ({n})"
     }
   },
   "entityCreate": {
@@ -1507,7 +1571,13 @@
     "saveEntity": "Save Entity",
     "suggestEntity": "Suggest Entity",
     "saveFailed": "Failed to save entity",
-    "stepRequired": "Step is required to save"
+    "stepRequired": "Step is required to save",
+    "publishedToast": "Query published to the catalog",
+    "suggestedToast": "Suggestion submitted for review",
+    "parametersHeading": "Parameters",
+    "parametersBody": "Saved with the query. Anyone loading this entity can pass their own values; identity parameters always bind to the viewer.",
+    "paramIdentity": "scoped to viewer",
+    "paramAll": "= All"
   },
   "mentionInput": {
     "placeholder": "Type {'@'} to mention...",
@@ -1598,6 +1668,13 @@
     },
     "connection": "Connection",
     "addAgent": "+ Add agent or connection...",
+    "advancedPermissions": "Advanced permissions",
+    "tiers": {
+      "query": "Can query",
+      "queryHint": "Ask this agent questions",
+      "manage": "Can manage",
+      "manageHint": "Edit instructions, entities, evals, settings and members"
+    },
     "modelAccess": "Model access",
     "modelAccessHint": "Restricted models",
     "noRestrictedModels": "No restricted models"
@@ -1916,8 +1993,8 @@
       "whatsappDescription": "Reach the AI analyst over WhatsApp Business.",
       "emailName": "AI Mailbox",
       "emailDescription": "A mailbox the AI analyst sends replies from and (optionally) receives questions at.",
-      "oauthName": "OAuth Clients",
-      "oauthDescription": "Register external apps that access this workspace via OAuth 2.1 (e.g. Claude Web).",
+      "oauthName": "OAuth Apps",
+      "oauthDescription": "Register apps for the BOW API, MCP tools, or both.",
       "manage": "Manage",
       "add": "Add",
       "channels": {
@@ -1943,7 +2020,12 @@
           "sessionStalenessTitle": "Conversation session",
           "hoursSuffix": "hours",
           "sessionStalenessSaved": "Conversation session window updated",
-          "sessionStalenessInvalid": "Enter a whole number between 1 and 720 hours"
+          "sessionStalenessInvalid": "Enter a whole number between 1 and 720 hours",
+          "announceNewReportTitle": "New conversation announcement",
+          "announceNewReportLabel": "Announce new conversation reports",
+          "announceNewReportDesc": "When a message starts a new conversation report, reply with an \"I've started a new conversation report\" message linking to it. Turn off to skip that message.",
+          "announceNewReportEnabled": "New report announcement enabled",
+          "announceNewReportDisabled": "New report announcement disabled"
         },
         "slack": {
           "title": "Slack Integration",
@@ -2141,9 +2223,9 @@
           "failedDisconnect": "Failed to disconnect email"
         },
         "oauth": {
-          "title": "OAuth Clients",
-          "subtitle": "Register external apps that connect to this workspace via OAuth 2.1 (e.g. Claude Web's MCP connector).",
-          "noneYet": "No OAuth clients registered yet",
+          "title": "OAuth apps",
+          "subtitle": "Let your own apps securely create reports, run the AI analyst, or connect through MCP on behalf of signed-in users.",
+          "noneYet": "No OAuth apps yet",
           "copyClientId": "Copy Client ID",
           "editRedirectUris": "Edit redirect URIs",
           "rotateSecret": "Rotate secret",
@@ -2158,7 +2240,7 @@
           "add": "Add",
           "customRedirectUris": "Custom redirect URIs (optional)",
           "customRedirectUrisHint": "One URI per line. Leave empty to use the defaults (Claude Web and local MCP inspector).",
-          "setupInstructions": "Claude Web setup instructions",
+          "setupInstructions": "Setup instructions",
           "setupStep1": "In Claude Web, go to Settings → Connectors → Add",
           "setupStep2": "Enter the MCP server URL above",
           "setupStep3": "Click Advanced Settings",
@@ -2173,7 +2255,61 @@
           "failedRotate": "Failed to rotate secret",
           "deletedToast": "OAuth client deleted",
           "failedDelete": "Failed to delete client",
-          "confirmDelete": "Delete OAuth client \"{name}\"?"
+          "confirmDelete": "Delete OAuth app \"{name}\"?",
+          "registerApp": "Register app",
+          "createTitle": "Register a new app",
+          "createHelp": "Use Authorization Code with PKCE. Add only exact callback URLs that your app controls.",
+          "appName": "App name",
+          "appNamePlaceholder": "e.g. Acme Insights",
+          "scopes": "Access surfaces",
+          "appScope": "BOW app",
+          "appScopeDesc": "Reports, completions, artifacts, and the rest of the BOW API.",
+          "mcpScope": "MCP tools",
+          "mcpScopeDesc": "The MCP endpoint for AI assistants and tool clients.",
+          "scopesRequired": "Select at least one access surface.",
+          "scopeChangeRevokes": "Changing access surfaces immediately revokes this app's existing tokens.",
+          "trusted": "Trusted",
+          "internalOnly": "Internal only",
+          "trustedHelp": "Trusted apps skip the consent screen after sign-in. Enable this only for apps operated by your organization.",
+          "searchPlaceholder": "Search apps, client IDs, or redirect URLs",
+          "endpointReference": "OAuth endpoint reference",
+          "copy": "Copy",
+          "clientIdLabel": "Client ID",
+          "authorizationEndpoint": "Authorize",
+          "tokenEndpoint": "Token",
+          "discoveryEndpoint": "Discovery",
+          "emptyHelp": "Register your first app, choose the surfaces it can reach, and add its exact callback URL.",
+          "noMatches": "No apps match this search.",
+          "totalApps": "Registered apps",
+          "activeTokens": "Active tokens",
+          "trustedApps": "Trusted apps",
+          "activeTokenCount": "1 active token | {count} active tokens",
+          "lastUsed": "Used {date}",
+          "issued": "Issued {date}",
+          "neverUsed": "Never used",
+          "editApp": "Edit app",
+          "actions": "Actions",
+          "secretHelp": "Store this secret now. It cannot be shown again.",
+          "updatedToast": "OAuth app updated",
+          "failedUpdate": "Failed to update OAuth app",
+          "deleteImpact": "Its authorization codes and tokens were revoked.",
+          "trustedConnecting": "Connecting to your trusted app…",
+          "authorizationLoading": "Checking the authorization request…",
+          "authorizationError": "Unable to authorize",
+          "goBack": "Go back to Bag of Words",
+          "authorizationTitle": "Authorize access",
+          "wantsAccess": "{name} wants to access your Bag of Words account.",
+          "permissionsRequested": "Permissions requested",
+          "appPermission": "Create and read reports, run completions, and use artifacts under your existing BOW permissions.",
+          "mcpPermission": "Use the MCP tool surface under your existing BOW permissions.",
+          "deny": "Deny",
+          "approve": "Approve",
+          "authorizing": "Authorizing…",
+          "redirectNotice": "You will return to {name} after approval.",
+          "invalidAuthorizationRequest": "This authorization request is missing required information.",
+          "unsupportedAuthorizationRequest": "This app must use Authorization Code with PKCE S256.",
+          "unknownAuthorizationClient": "The app or callback URL is not registered.",
+          "authorizationFailed": "Authorization failed. Try again or contact your workspace administrator."
         },
         "excel": {
           "title": "Excel Add-in",
@@ -2229,6 +2365,7 @@
       "verified": "Verified",
       "unverified": "Unverified",
       "confirmRemove": "Are you sure you want to remove {name} from this organization?",
+      "confirmRemoveAndDeactivate": "Are you sure you want to remove {name} from this organization? They will no longer be able to sign in. Their reports and history are kept, and re-inviting them restores access.",
       "failedToRemove": "Failed to remove member",
       "successRemoved": "Successfully removed {name}",
       "failedToInvite": "Failed to invite member",
@@ -2358,7 +2495,165 @@
       "toastConfirmRequiredTitle": "Confirmation Required",
       "toastConfirmRequiredBody": "Please type \"I AM SURE\" to confirm this change.",
       "fetchErrorGeneric": "An error occurred while fetching settings",
-      "updateErrorGeneric": "An error occurred while updating settings"
+      "updateErrorGeneric": "An error occurred while updating settings",
+      "features": {
+        "allow_llm_see_data": {
+          "name": "Allow LLM to see data",
+          "description": "Enable LLM to see data as part of the analysis and user queries"
+        },
+        "enable_training_mode": {
+          "name": "Training Mode",
+          "description": "Enable training mode for admins to work with the agent to build documentation, instructions, semantics and guidlines"
+        },
+        "enable_file_upload": {
+          "name": "Allow file upload",
+          "description": "Allow users to upload spreadsheets and documents (xls/pdf) and push their content to the LLM"
+        },
+        "enable_code_editing": {
+          "name": "Allow users to edit and execute the LLM generated code",
+          "description": "Allow users to edit and execute the LLM generated code"
+        },
+        "enable_llm_judgement": {
+          "name": "Enable LLM Judge",
+          "description": "Enable LLM to judge the quality of the analysis and user queries"
+        },
+        "suggest_instructions": {
+          "name": "Autogenerate instructions",
+          "description": "Automatically generate instructions following clarifications provided by the user"
+        },
+        "enable_follow_ups": {
+          "name": "Follow-up suggestions",
+          "description": "After each answer in the web app, suggest a few follow-up questions the user can ask next. Generated on the small/default model."
+        },
+        "auto_suggest_evals": {
+          "name": "Auto-suggest evals",
+          "description": "When a manage-evals user upvotes a response that produced data, the knowledge harness drafts an eval test case (judge + tool calls) into the org's drafts suite for review."
+        },
+        "limit_row_count": {
+          "name": "Limit row count",
+          "description": "Limit the number of rows that can be displayed in tables and data previews. Set to 0 for no limit."
+        },
+        "ai_tool_concurrency": {
+          "name": "Parallel tool calls",
+          "description": "How many tool calls from one AI plan step may run at the same time (e.g. create_data / inspect_data across different agents). Set to 1 to run them one after another; up to 8. Calls against the same agent always run one at a time."
+        },
+        "agent_max_steps": {
+          "name": "Max agent steps",
+          "description": "Maximum number of planner steps (decisions/tool calls) the agent may take in a single request before it stops. Applies to both regular and training mode. Clamped to 1-500."
+        },
+        "agent_loop_retries": {
+          "name": "Agent loop retries",
+          "description": "How many times the agent may recover from an unexpected error during a run and retry from its latest context, instead of failing the whole run. When retries are exhausted and LLM fallback is enabled, the run switches to the next model in the fallback order before giving up. Clamped to 0-10."
+        },
+        "limit_code_retries": {
+          "name": "Limit code retries",
+          "description": "How many attempts the LLM gets to generate working code for a data request (initial attempt plus retries on failure). Clamped to 1-10."
+        },
+        "query_timeout_seconds": {
+          "name": "Query timeout (seconds)",
+          "description": "Default per-query wall-clock timeout when the agent runs SQL via create_data / inspect_data. A connection's config can override this with its own 'query_timeout_seconds' value."
+        },
+        "max_concurrent_queries_per_connection": {
+          "name": "Concurrent queries per connection",
+          "description": "How many agent queries may run against one connection at the same time, per replica. A burst above this waits for a slot rather than failing. Lower it for fragile on-prem sources (Oracle, SQL Server) that cannot take parallel scans. A connection's config can override this with its own 'max_concurrent_queries' value."
+        },
+        "top_k_schema": {
+          "name": "Top K schema",
+          "description": "The number of schema to sample from the data source in the Agent"
+        },
+        "top_k_metadata_resources": {
+          "name": "Top K metadata resources",
+          "description": "The number of metadata resources to sample from the data source in the Agent"
+        },
+        "agent_roster_top_k": {
+          "name": "Agent roster top K",
+          "description": "When a report has many agents, how many appear as full roster lines in the AI context (ranked by the asker's recent usage; the rest are listed by name only in a more_agents tail). Clamped to 1-100."
+        },
+        "allow_forks": {
+          "name": "Allow Forks",
+          "description": "Allow users to fork published reports into their own workspace"
+        },
+        "mcp_enabled": {
+          "name": "MCP",
+          "description": "Enable Model Context Protocol (MCP) endpoint for integration with AI assistants like Cursor, Claude, or others"
+        },
+        "enable_mcp_tools": {
+          "name": "MCP & Custom API Tools",
+          "description": "Allow connecting external MCP servers and custom API endpoints to data sources as tool providers"
+        },
+        "enable_mcp_native_tools": {
+          "name": "Native MCP tool registration",
+          "description": "Register each external MCP / custom API tool as its own directly callable agent tool, instead of routing every call through the generic execute_mcp tool. Only takes effect once a report's tool catalog reaches the threshold below."
+        },
+        "mcp_native_tools_threshold": {
+          "name": "Native MCP tools threshold",
+          "description": "How many enabled MCP / custom API tools a report needs before native registration is used. Below this, native registration measures as a wash against the generic path, so the generic path is kept. Set to 0 to always register natively."
+        },
+        "mcp_native_tools_max": {
+          "name": "Max native MCP tools",
+          "description": "Upper bound on how many tools are registered natively for one report. Tools past the cap stay on the generic execute_mcp path, so a very large catalog cannot fill every request with permanent tool definitions."
+        },
+        "mcp_result_inline_chars": {
+          "name": "MCP result inline size",
+          "description": "How much of an MCP / custom API tool result the agent sees directly in its context, in characters. The complete response is always saved to a file whatever this is set to; this only decides how much the model can read without opening that file. Raise it so the agent can answer from a whole result set instead of a sample; lower it to spend fewer tokens per call. Set to 0 for a 3-record sample. Clamped to 0-500000."
+        },
+        "enable_web_fetch": {
+          "name": "Web Fetch",
+          "description": "Allow the agent to fetch the contents of public HTTP and HTTPS URLs. Only text-like responses are returned and large bodies are truncated."
+        },
+        "enable_load_step": {
+          "name": "Reuse prior steps (load_step)",
+          "description": "Let generated code reuse a prior step's results in this report via load_step instead of re-querying. When off, load_step is neither advertised to the agent nor available at runtime."
+        },
+        "enable_ml_training": {
+          "name": "Machine learning (scikit-learn)",
+          "description": "Let generated code train scikit-learn models (classification, regression, clustering, feature importance) on query results and uploaded files. Training runs in-process on the server; turn off to keep generated code to pandas/numpy analysis only."
+        },
+        "ml_training_row_limit": {
+          "name": "ML training row limit",
+          "description": "Maximum number of rows generated code should train a model on. Larger sources are sampled down to this size before fitting. Minimum 1000."
+        },
+        "enable_custom_queries": {
+          "name": "Custom queries (beta)",
+          "description": "Let connection admins define SQL that BOW materializes to an encrypted local copy on a schedule, so agents answer from the cached result instead of querying the source on every turn. Beta: off by default."
+        },
+        "enable_agent_notes": {
+          "name": "Agent Notes",
+          "description": "Let the agent keep per-report working notes (a scratchpad) it writes and reads while answering — plans, findings, and todos. Notes are shown in the report but are not shared knowledge. When off, the note tools are hidden and notes are not injected into context."
+        },
+        "max_instructions_in_context": {
+          "name": "Max instructions in context",
+          "description": "Maximum number of instructions to include in AI context. 'Always' instructions are loaded first, then 'smart' instructions fill remaining slots."
+        },
+        "allow_report_webhooks": {
+          "name": "Report Webhooks",
+          "description": "Allow external systems (GitHub, Jira, generic services) to send events to reports via inbound webhooks. Master switch for the whole feature."
+        },
+        "max_webhooks": {
+          "name": "Max webhooks",
+          "description": "Maximum number of active inbound webhooks per organization."
+        },
+        "webhook_rate_limit_per_min": {
+          "name": "Webhook rate limit (per minute)",
+          "description": "Maximum inbound webhook deliveries accepted per minute per organization. Excess deliveries are rejected with 429."
+        },
+        "step_retention_days": {
+          "name": "Widget Data Retention Days",
+          "description": "Number of days to retain widgets data before purging."
+        },
+        "enable_excel_addin": {
+          "name": "Excel Add-in",
+          "description": "Enable the built-in Excel Add-in so users can sideload the manifest directly from this instance"
+        },
+        "model_routing": {
+          "name": "Auto model router",
+          "description": "Enterprise. When a user doesn't pick a specific model, start each request on the small model and let the agent escalate to a stronger one only when the task needs it. Add per-model routing guidance on the LLM page to steer the choice. Off by default; requires an enterprise license to enable."
+        },
+        "llm_fallback": {
+          "name": "LLM fallback",
+          "description": "Enterprise. When the active model fails with a rate limit, provider overload, or network error, automatically retry the request on the next model in the fallback order (configured on the LLM page) for the rest of the run. The substitution is always disclosed in the chat. Off by default; requires an enterprise license to enable."
+        }
+      }
     },
     "llms": {
       "searchPlaceholder": "Search LLMs...",
@@ -2384,7 +2679,23 @@
       "contextTooltip": "Maximum tokens (prompt + output) the app budgets for this model. Lower it to match provider limits — for example Bedrock deployments capped at 100k.",
       "contextPlaceholder": "e.g. 100000",
       "contextResetTooltip": "Reset to the catalog default",
+      "colTemperature": "Temperature",
+      "temperatureTooltip": "Explicit sampling temperature (0–2) sent with every request to this model. Leave empty to use the provider's default — recommended, since some models reject any non-default temperature.",
+      "temperaturePlaceholder": "Provider default",
+      "temperatureResetTooltip": "Reset to provider default (no temperature sent)",
       "modelIdLabel": "Model ID",
+      "modelIdEditTooltip": "The deployment or model identifier sent to the provider. Editable for custom models on Azure, AWS Bedrock and custom (OpenAI-compatible) providers, where the ID names something you created rather than a catalog entry.",
+      "displayNameLabel": "Display Name",
+      "displayNamePlaceholder": "Same as model ID",
+      "displayNameShort": "Name",
+      "displayNameTooltip": "The label shown in the model picker. Custom models only — preset names come from the model catalog. Leave empty to use the model ID.",
+      "displayNameHint": "Optional label shown in the model picker. Leave empty to use the model ID.",
+      "displayNameError": "Could not update the display name",
+      "modelIdError": "Could not update the model ID",
+      "azureEndpointPlaceholder": "e.g. https://[resource].openai.azure.com or https://[resource].services.ai.azure.com",
+      "azureFoundryHint": "Azure OpenAI and Azure AI Foundry are both supported. Model ID is your deployment name.",
+      "responsesApiHint": "Use the Responses API instead of Chat Completions. Required for web search, and only available in regions that support the Responses API.",
+      "responsesApiFoundryHint": "On Foundry it applies to OpenAI deployments only.",
       "colCost": "Cost ($/M)",
       "colRouting": "Routing",
       "autoRouter": "Auto router",
@@ -2870,7 +3181,29 @@
     "mcpModeAiTip": "AI may set it; server fills if empty",
     "mcpModeLockedTip": "Admin value always wins; hidden from the AI",
     "mcpAddMetaField": "+ Add metadata field",
-    "verify": "Verify"
+    "verify": "Verify",
+    "catPopular": "Popular",
+    "catCustom": "Custom",
+    "setupGuideTitle": "Setup steps",
+    "setupGuideCopy": "Copy",
+    "setupGuideCopied": "Copied",
+    "setupGuides": {
+      "kubernetes": [
+        {
+          "title": "Grant read access on the cluster",
+          "body": "Review the manifest, then run it with cluster-admin rights. It creates the bagofwords namespace, a service account, a cluster-wide read-only role, its binding and a long-lived token."
+        },
+        {
+          "title": "Print the access file",
+          "body": "Save this as print_access_file.sh and run it. It waits for the token, then prints one self-contained file (API server URL, cluster CA, token). Verify it with: kubectl --kubeconfig access.yaml get nodes. If the server URL is private to your network, edit it to the address this Bag of Words instance can reach."
+        },
+        {
+          "title": "Paste it below and test the connection",
+          "body": "Paste the whole output into the Cluster access file field, then click Test connection."
+        }
+      ]
+    },
+    "setupGuideCopyFailed": "Copy failed — select the text"
   },
   "share": {
     "shareDashboard": "Share Dashboard",
@@ -2900,7 +3233,17 @@
     "sharingDisabled": "Sharing disabled",
     "sharingFailed": "Failed to update sharing",
     "userNotFound": "User not found in organization",
-    "copyFailed": "Failed to copy"
+    "copyFailed": "Failed to copy",
+    "includeDataTab": "Include Data Tab",
+    "includeDataTabDesc": "Recipients will see the complete data history and process used to generate this report",
+    "allowChat": "Allow chat",
+    "allowChatDesc": "Signed-in workspace members can ask questions about this dashboard",
+    "chatScope": "Chat can use",
+    "chatScopeAgents": "Report agents",
+    "chatScopeAgentsDesc": "Chat may run live read-only queries against the selected agents",
+    "chatScopeDataOnly": "Dashboard data only",
+    "chatScopeDataOnlyDesc": "Chat answers only from the data already on this dashboard",
+    "chatNoAgents": "No agents are attached to this report — chat will answer from dashboard data only."
   },
   "publish": {
     "published": "Published",
@@ -2927,6 +3270,7 @@
     "validation": "Please check the form and try again.",
     "artifact.not_found": "Artifact not found",
     "access.denied": "Access denied",
+    "account.disabled": "Your account has been disabled. Contact your administrator.",
     "connection.not_found": "Connection not found",
     "data_source.not_found": "Data source not found",
     "file.not_found": "File not found",
@@ -2953,7 +3297,12 @@
     "resource.conflict": "Resource already exists or conflicts with existing state",
     "resource.duplicate": "Duplicate resource",
     "setting.update_failed": "Failed to update setting",
-    "query.failed_silently": "A query failed but the generated code returned an empty result instead of reporting it"
+    "query.failed_silently": "A query failed but the generated code returned an empty result instead of reporting it",
+    "llm": {
+      "model_id_required": "Model ID cannot be empty",
+      "model_id_not_editable": "Only custom models on Azure, AWS Bedrock or custom (OpenAI-compatible) providers can have their model ID edited",
+      "model_id_duplicate": "Model '{model_id}' already exists on this provider"
+    }
   },
   "email": {
     "dashboardShare": {
@@ -3034,7 +3383,16 @@
       "errApproveEntity": "Failed to approve entity",
       "rejectSuccessBody": "Entity rejected",
       "errRejectEntity": "Failed to reject entity",
-      "savedSuccessBody": "Entity saved successfully"
+      "savedSuccessBody": "Entity saved successfully",
+      "parameterizedBadge": "Parameterized",
+      "paramsRun": "Run",
+      "paramsRunning": "Running…",
+      "paramsRanWith": "ran with {values}",
+      "paramScopedToYou": "scoped to you",
+      "paramAll": "All",
+      "paramListPlaceholder": "a, b, … (empty = All)",
+      "errRunParams": "Run failed",
+      "paramsCached": "served from cache"
     }
   },
   "scheduled": {
@@ -3131,13 +3489,63 @@
     "polishDashboard": "Polish Dashboard"
   },
   "artifactFrame": {
+    "dataAddQuery": "Add query",
+    "dataNoQueriesToAdd": "No queries to add",
+    "dataAddFailed": "Failed to add query to the dashboard",
+    "dataUntitledQuery": "Untitled query",
+    "dataNeverRun": "Never ran",
+    "dataRemove": "Remove from dashboard",
+    "dataRemoveConfirm": "Remove this query from the dashboard? The query stays in the report and can be added back later.",
+    "dataRemoveFailed": "Failed to remove query",
+    "dataNoResult": "No results yet — run the query to see data",
+    "dataLastRun": "Last run {time}",
+    "dataInUse": "In use",
+    "dataNotUsed": "Not used",
+    "dataInUseHint": "Rendered by the dashboard code",
+    "dataNotUsedHint": "On the dashboard, but not rendered by its code",
+    "viewData": "View data",
+    "dataTitle": "Data",
+    "dataEmpty": "No data available",
     "loading": "Loading…",
     "loadingArtifact": "Loading artifact…",
     "refreshed": "Dashboard refreshed",
     "refreshPartial": "Dashboard partially refreshed",
     "refreshFailed": "Dashboard refresh failed",
     "refreshNothing": "Nothing to refresh",
-    "refreshSummary": "{succeeded} of {total} queries refreshed"
+    "refreshSummary": "{succeeded} of {total} queries refreshed",
+    "exportHtml": "Download as standalone HTML",
+    "exportComplete": "Export complete",
+    "exportHtmlDone": "Standalone HTML downloaded — it works offline.",
+    "exportFailed": "Export failed",
+    "exportHtmlFailed": "Could not export this dashboard as HTML.",
+    "backToChat": "Back to chat",
+    "selectArtifact": "Select artifact...",
+    "useThisVersion": "Use this version",
+    "refreshData": "Refresh data",
+    "refreshDisabledViewAs": "Exit view-as to refresh — a refresh runs as you, not as the previewed member.",
+    "fullScreen": "Full screen",
+    "openInNewTab": "Open in new tab",
+    "searchMembers": "Search members by name or email...",
+    "viewAsTooltip": "View-as previews identity parameters only. Sources that authenticate per user (e.g. Power BI) still run with your credentials.",
+    "apply": "Apply",
+    "copied": "Copied",
+    "artifactIdCopied": "Artifact ID copied to clipboard",
+    "copyFailed": "Failed to copy",
+    "error": "Error",
+    "refreshDashboardFailed": "Failed to refresh dashboard. {error}",
+    "exportPptxDone": "PowerPoint file downloaded successfully.",
+    "exportPptxFailed": "Failed to export PowerPoint file.",
+    "viewAs": "View as",
+    "anonymousUser": "Anonymous user",
+    "versionSetDefault": "Version set as default",
+    "versionSetDefaultFailed": "Failed to set version as default.",
+    "rename": "Rename dashboard",
+    "renamePlaceholder": "Dashboard name",
+    "renamed": "Dashboard renamed",
+    "renameFailed": "Could not rename the dashboard.",
+    "more": "More",
+    "schedule": "Schedule refresh",
+    "exportAs": "Export as {format}"
   },
   "filter": {
     "addFilters": "Add Filters",
@@ -3317,7 +3725,9 @@
       "enterprise": "Enterprise",
       "sample": "sample",
       "orTry": "Or try a sample database:",
-      "errorAvailable": "Could not fetch available data sources"
+      "errorAvailable": "Could not fetch available data sources",
+      "searchPlaceholder": "Search data sources...",
+      "noResults": "No data sources match “{query}”"
     },
     "schema": {
       "save": "Save & Continue"
@@ -3353,7 +3763,7 @@
       "awsSecretAccessKey": "AWS Secret Access Key",
       "awsSecretAccessKeyPlaceholder": "Enter secret access key",
       "endpointUrl": "Endpoint URL",
-      "endpointPlaceholder": "e.g. https://[resource].openai.azure.com",
+      "endpointPlaceholder": "e.g. https://[resource].openai.azure.com or https://[resource].services.ai.azure.com",
       "useDefaultBaseUrl": "Use default base URL",
       "setCustomBaseUrl": "Set custom base URL",
       "baseUrl": "Base URL (optional)",
@@ -4320,7 +4730,8 @@
     "cancel": "Cancel",
     "saved": "Document saved",
     "saveFailed": "Failed to save document",
-    "editDiagramSource": "Click to edit diagram source"
+    "editDiagramSource": "Click to edit diagram source",
+    "unsavedForExport": "Save the document before exporting it as PDF"
   },
   "notes": {
     "heading": "Notes",
@@ -4419,6 +4830,148 @@
     "continueOnboarding": "Continue onboarding",
     "configureLlm": "Configure your LLM",
     "connectFirstDataSource": "Connect your first data source"
+  },
+  "reportWebhooks": {
+    "title": "Webhooks",
+    "subtitle": "Send external events into this report.",
+    "active": "Active",
+    "rotate": "Rotate signing key",
+    "delete": "Delete",
+    "copyOnce": "Copy now — shown only once",
+    "secretKey": "Key",
+    "newWebhook": "New webhook",
+    "name": "Name",
+    "namePlaceholder": "PR triage",
+    "source": "Source",
+    "auth": "Auth",
+    "authToken": "Token header",
+    "authHmac": "HMAC (signed)",
+    "authUrlToken": "URL token",
+    "authTokenShort": "token",
+    "authHmacShort": "hmac",
+    "authUrlTokenShort": "url token",
+    "letAiDecide": "Let AI decide whether to respond",
+    "guidance": "Guidance (optional)",
+    "guidancePlaceholder": "Only respond to PRs touching billing; ignore dependabot.",
+    "createButton": "Create webhook",
+    "defaultName": "Webhook",
+    "sourceGeneric": "Generic"
+  },
+  "filePreview": {
+    "unavailable": "Preview unavailable",
+    "document": "Document",
+    "pageN": "Page {n}",
+    "ofTotalPages": "{n} of {total} pages",
+    "showingRows": "Showing {n} of {total} rows",
+    "openInPanel": "Open in side panel",
+    "closeFilePanel": "Close file"
+  },
+  "entityForm": {
+    "title": "Title",
+    "description": "Description",
+    "agents": "Agents",
+    "selectAgents": "Select agents",
+    "status": "Status"
+  },
+  "skillCatalog": {
+    "subtitle": "Curated playbooks the agent loads on demand. Enable the ones your team needs.",
+    "searchPlaceholder": "Search skills…",
+    "loading": "Loading skills…",
+    "loadFailed": "Could not load the skill catalog.",
+    "noResults": "No skills match your search.",
+    "enable": "Enable",
+    "disable": "Disable",
+    "update": "Update",
+    "updateAvailable": "Update available",
+    "customized": "Edited",
+    "customizedHint": "This skill was edited for your organization. Updating replaces it with the shipped version.",
+    "modeScoped": "{modes} only",
+    "modeScopedHint": "This skill is only offered to the agent in these modes.",
+    "adminOnly": "Only an administrator can enable a skill for the organization.",
+    "enabledToast": "Enabled “{name}”",
+    "disabledToast": "Disabled “{name}”",
+    "updatedToast": "Updated “{name}”",
+    "actionFailed": "That did not work. Please try again.",
+    "confirmOverwrite": "“{name}” was edited for your organization. Updating replaces your version with the shipped one. Continue?",
+    "reset": "Reset",
+    "custom": "Custom",
+    "browse": "Browse the catalog",
+    "enabledEmpty": "No skills enabled yet",
+    "tabCatalog": "Catalog",
+    "enabledSubtitle": "Skills this organization has turned on. Open one to read or edit it.",
+    "tabEnabled": "Enabled",
+    "default": "Default",
+    "defaultHint": "Enabled for every new organization. An administrator can turn it off."
+  },
+  "tableErd": {
+    "recentPrompts": "Recent prompts",
+    "thisAgentOnly": "Only this agent’s recorded table usage",
+    "promptUnavailable": "Prompt unavailable",
+    "promptsError": "Could not load prompts.",
+    "noPrompts": "No recorded prompts for this table.",
+    "morePrompts": "Show more",
+    "loadingPrompts": "Loading prompts…",
+    "selectedCount": "{count} selected",
+    "selectTables": "Select tables",
+    "customQuery": "Custom query",
+    "customQueriesOff": "Custom queries off",
+    "enableCustomQueries": "Enable in AI settings",
+    "reload": "Reload",
+    "editQuery": "Edit {name}",
+    "rowFiltered": "Row filtered",
+    "refreshFailed": "Refresh failed",
+    "successful": "Successful",
+    "failed": "Failed",
+    "lastRefreshed": "Last refreshed",
+    "cache": "Cache",
+    "cached": "Cached",
+    "notCached": "Not cached",
+    "searchTables": "Search tables…",
+    "suggested": "Suggested",
+    "suggestedHint": "Suggested from key names · unverified",
+    "view": "Table view",
+    "table": "List",
+    "erd": "Visual",
+    "unsaved": "Unsaved changes",
+    "selectTable": "Select {name}",
+    "add": "Add",
+    "selected": "Selected",
+    "notSelected": "Not selected",
+    "expand": "+{count} related",
+    "noKeys": "No known keys",
+    "addTables": "Add tables",
+    "clearFocus": "Clear focus",
+    "overlay": "Overlay",
+    "none": "No overlay",
+    "usage": "Usage",
+    "lastUsed": "Last used",
+    "feedback": "Answer feedback",
+    "searchHint": "Use the search and filters above to find tables.",
+    "noMatches": "No matching tables",
+    "showMore": "Show more",
+    "empty": "Add a table to explore its relationships.",
+    "outsideFilters": "Shown for context · outside current filters",
+    "noRelationships": "No known relationships",
+    "unresolved": "Some relationship targets are unavailable or ambiguous.",
+    "columns": "Columns ({count})",
+    "visibleCount": "{shown} of {total} shown",
+    "fit": "Fit view",
+    "zoomIn": "Zoom in",
+    "zoomOut": "Zoom out",
+    "arrange": "Arrange tables",
+    "reset": "Reset exploration",
+    "usageValue": "Uses: {count}",
+    "feedbackValue": "Answers: +{positive} / −{negative}",
+    "unknown": "No recorded use",
+    "loading": "Loading relationships…",
+    "loadError": "Could not load relationships.",
+    "retry": "Retry",
+    "saveError": "Could not save table selection.",
+    "fullscreen": "Full screen",
+    "exitFullscreen": "Exit full screen",
+    "searchColumns": "Search columns…",
+    "noColumns": "No matching columns",
+    "centrality": "Centrality"
   }
 }
 

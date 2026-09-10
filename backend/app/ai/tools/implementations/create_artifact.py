@@ -35,7 +35,12 @@ from app.services.thumbnail_service import ThumbnailService
 from app.services.artifact_libs import get_inline_scripts
 from app.ai.code_execution.pptx_executor import PptxCodeExecutor, PptxPreviewService
 from sqlalchemy import desc
-from app.ai.tools.implementations._sandbox_context import SANDBOX_RUNTIME_PROMPT
+from app.ai.tools.implementations._sandbox_context import (
+    SANDBOX_RUNTIME_PROMPT,
+    ANON_PREVIEW_NOTE,
+    STATIC_PREVIEW_NOTE,
+    build_identity_context,
+)
 from app.ai.tools.implementations._artifact_images import load_image_bytes
 from app.ai.prompt_language import build_language_directive
 
@@ -311,6 +316,32 @@ class CreateArtifactTool(Tool):
     window.__BOW_INFO = false;
   {SC}
 
+  <script>
+    // Params-runtime safety net for the headless validation render: the real
+    // useParams/useParamOptions live in artifact-globals.js and need no host
+    // to merely render, but if the loaded globals bundle predates them (stale
+    // build output) correct artifact code would phantom-fail with
+    // "useParams is not defined" and burn the repair loop. Stubs mirror the
+    // no-params shape; they are defined ONLY when the globals didn't.
+    if (typeof window.useParams !== 'function') {{
+      window.useParams = function() {{
+        return {{ declarations: [], values: {{}}, pending: {{}}, loading: false,
+                 error: null, setParam: function() {{}}, setParams: function() {{}},
+                 apply: function() {{}}, refresh: function() {{}},
+                 getOptions: function() {{ return null; }} }};
+      }};
+    }}
+    if (typeof window.useParamOptions !== 'function') {{
+      window.useParamOptions = function() {{ return null; }};
+    }}
+    if (typeof window.useCurrentUser !== 'function') {{
+      window.useCurrentUser = function() {{
+        var d = window.ARTIFACT_DATA || {{}};
+        return d.current_user || null;
+      }};
+    }}
+  {SC}
+
   {code}
 
   <script>
@@ -344,7 +375,7 @@ class CreateArtifactTool(Tool):
     # Maximum in-tool repair LLM calls per artifact operation. Bounded so a
     # stubborn defect can't consume the whole tool timeout — after this the
     # tool returns a structured failure and the planner decides.
-    MAX_RENDER_REPAIR_ATTEMPTS = 2
+    MAX_RENDER_REPAIR_ATTEMPTS = 5
 
     @staticmethod
     def fatal_render_errors(errors: List[str]) -> List[str]:
@@ -355,6 +386,47 @@ class CreateArtifactTool(Tool):
         never fail an otherwise working artifact.
         """
         return [e for e in (errors or []) if not e.startswith("[console.error]")]
+
+    @staticmethod
+    def params_wiring_errors(code: str, artifact_data: Dict[str, Any]) -> List[str]:
+        """Contract check: declared input params must be WIRED in the code.
+
+        A dashboard whose queries declare input parameters but whose code never
+        calls useParams()/setParam renders controls that only mutate local
+        state — selecting a value silently never re-runs the data. Returns
+        synthetic repair errors (empty when satisfied) that ride the same
+        repair loop as render errors. Identity params are exempt: they render
+        as a badge, not a control.
+        """
+        names: List[str] = []
+        seen: set = set()
+        for v in (artifact_data or {}).get("visualizations") or []:
+            for p in (v.get("parameters") or []) if isinstance(v, dict) else []:
+                name = p.get("name") if isinstance(p, dict) else None
+                if not name or name in seen or (p.get("source") or "input") == "identity":
+                    continue
+                seen.add(name)
+                names.append(name)
+        if not names:
+            return []
+        src = code or ""
+        if "useParams" not in src or "setParam" not in src:
+            return [
+                "[params contract] This dashboard's queries declare input parameter(s) "
+                f"{', '.join(names)}, but the code never calls useParams()/setParam — a "
+                "control that only sets local React state never re-runs the data. Wire "
+                "every param control to useParams().setParam('<name>', value) — bind "
+                "option.value (never the label), drive a loading state from "
+                "useParams().loading, and render useParams().error when set."
+            ]
+        missing = [n for n in names if n not in src]
+        if missing:
+            return [
+                "[params contract] Parameter(s) " + ", ".join(missing) + " are declared "
+                "by this dashboard's queries but never referenced in the code — each "
+                "needs a control wired to useParams().setParam('<name>', value)."
+            ]
+        return []
 
     async def _fix_code(
         self,
@@ -405,6 +477,185 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
             logger.exception("In-tool code repair failed")
             return None
 
+    async def _fix_pptx_code(
+        self,
+        code: str,
+        error: str,
+        runtime_ctx: Dict[str, Any],
+    ) -> Optional[str]:
+        """Compact in-tool repair for slides: current code + exact error → corrected code.
+
+        Slides twin of _fix_code: the model already produced this code; it
+        needs the executor's error, not the whole generation context.
+        Returns the corrected code, or None if repair was unavailable/failed.
+        """
+        sigkill_event = runtime_ctx.get("sigkill_event")
+        if sigkill_event and sigkill_event.is_set():
+            return None
+
+        fix_prompt = f"""You previously wrote the python-pptx code below. It runs in a sandboxed namespace that already provides: Presentation, Inches, Pt, Emu, RGBColor, PP_ALIGN, MSO_ANCHOR, MSO_SHAPE, XL_CHART_TYPE, XL_LEGEND_POSITION, CategoryChartData, ChartData, plus the data variables `visualizations` (list of dicts with 'title', 'columns', 'rows'), `report`, `image`/`image_ids`, and `_pptx_output_path` (the code must call prs.save(_pptx_output_path)). Note that each entry of viz['columns'] is a DICT like {{'field': 'Revenue', 'headerName': 'Revenue'}} — use col['field'] to get the row key, never pass the dict itself where a string is expected. When executed, it failed with this error:
+
+{error}
+
+Current code:
+```python
+{code}
+```
+
+Fix ONLY what the error requires — do not redesign, restyle, or restructure anything else. Common causes: passing a non-string (e.g. a column dict) to a text property, indexing a row with the wrong key, referencing an undefined name, wrong python-pptx API usage.
+
+Output the FULL corrected code in a ```python code block. No explanations, no diff markers."""
+
+        llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker)
+        try:
+            chunks: list[str] = []
+            async for evt in llm.inference_stream_v2(
+                messages=[Message(role="user", content=fix_prompt)],
+                usage_scope="create_artifact_fix",
+            ):
+                if sigkill_event and sigkill_event.is_set():
+                    return None
+                if isinstance(evt, TextDeltaEvent):
+                    chunks.append(evt.text)
+            fixed = self._extract_code("".join(chunks), mode="slides")
+            return fixed if fixed and fixed.strip() else None
+        except Exception:
+            logger.exception("In-tool PPTX code repair failed")
+            return None
+
+    @staticmethod
+    def _pptx_error_text(exc: Exception) -> str:
+        """Trimmed executor error for repair prompts and observations.
+
+        Keeps the frames inside the generated code (reported as <string>) and
+        the final exception line — the sandbox internals above them are noise
+        the repair model can't act on.
+        """
+        import traceback as _tb
+
+        lines = _tb.format_exception(type(exc), exc, exc.__traceback__)
+        flat = "".join(lines).splitlines()
+        kept = [l for l in flat if '<string>' in l]
+        # Final line always carries the exception type + message
+        if flat:
+            kept.append(flat[-1])
+        text = "\n".join(kept[-12:]) if kept else str(exc)
+        return text[:2000]
+
+    @staticmethod
+    def _first_preview_base64(preview_images: List[str]) -> Optional[str]:
+        """Base64 of the first slide preview PNG, or None if unavailable."""
+        if not preview_images:
+            return None
+        import base64
+
+        path = Path(__file__).parent.parent.parent.parent.parent / "uploads" / preview_images[0]
+        try:
+            return base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError:
+            return None
+
+    async def _execute_and_repair_pptx(
+        self,
+        code: str,
+        visualizations: List[Dict[str, Any]],
+        report_data: Dict[str, Any],
+        output_path: Path,
+        images: Dict[str, bytes],
+        runtime_ctx: Dict[str, Any],
+        deadline_monotonic: Optional[float] = None,
+        max_repairs: Optional[int] = None,
+    ) -> AsyncIterator[Any]:
+        """Execute slides code and repair it in-tool when it fails.
+
+        max_repairs caps the LLM repair rounds (None = MAX_RENDER_REPAIR_ATTEMPTS;
+        0 = execute-only, no repair LLM — the planner-authored path).
+
+        Slides twin of _validate_and_repair_stream. Async generator: yields
+        ToolProgressEvent items for the UI, then a final dict result:
+          {"code", "ok", "error", "repair_attempts"}
+
+        - Only executor exceptions gate; a successful run ends the loop.
+        - If repair can't produce a working deck, the ORIGINAL code and its
+          error are returned so what's persisted matches what was executed.
+        """
+        import time as _time
+
+        def _time_left() -> bool:
+            return deadline_monotonic is None or _time.monotonic() < deadline_monotonic
+
+        sigkill_event = runtime_ctx.get("sigkill_event")
+        executor = PptxCodeExecutor(logger=logger)
+
+        def _try(candidate_code: str) -> Optional[str]:
+            """Run once; returns None on success, trimmed error text on failure."""
+            try:
+                executor.execute_pptx_code(
+                    code=candidate_code,
+                    visualizations=visualizations,
+                    report=report_data,
+                    output_path=output_path,
+                    images=images,
+                )
+                return None
+            except Exception as e:
+                logger.error(f"PPTX execution failed: {e}")
+                return self._pptx_error_text(e)
+
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "executing_pptx_code"})
+        error = _try(code)
+
+        original_code = code
+        original_error = error
+        candidate = code
+        attempts = 0
+        _pptx_repair_budget = self.MAX_RENDER_REPAIR_ATTEMPTS if max_repairs is None else max_repairs
+
+        while (
+            error
+            and attempts < _pptx_repair_budget
+            and _time_left()
+            and not (sigkill_event and sigkill_event.is_set())
+        ):
+            attempts += 1
+            yield ToolProgressEvent(
+                type="tool.progress",
+                payload={"stage": "repairing_code", "attempt": attempts, "error_count": 1},
+            )
+            fixed = await self._fix_pptx_code(candidate, error, runtime_ctx)
+            if not fixed or fixed == candidate:
+                break
+
+            yield ToolProgressEvent(
+                type="tool.progress",
+                payload={"stage": "executing_pptx_code", "attempt": attempts},
+            )
+            error = _try(fixed)
+            candidate = fixed
+
+        if not error:
+            yield {
+                "code": candidate,
+                "ok": True,
+                "error": None,
+                "repair_attempts": attempts,
+            }
+        else:
+            # Repair didn't converge — return the original, verified-broken
+            # state rather than an unverified intermediate, and drop any deck
+            # a partial attempt may have left behind.
+            try:
+                if output_path.exists():
+                    output_path.unlink()
+            except OSError:
+                pass
+            yield {
+                "code": original_code,
+                "ok": False,
+                "error": original_error,
+                "repair_attempts": attempts,
+            }
+
     async def _validate_and_repair_stream(
         self,
         code: str,
@@ -412,8 +663,16 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
         mode: str,
         runtime_ctx: Dict[str, Any],
         deadline_monotonic: Optional[float] = None,
+        max_repairs: Optional[int] = None,
+        strict: bool = False,
     ) -> AsyncIterator[Any]:
         """Render-validate page code and repair it in-tool when it fails.
+
+        max_repairs caps the LLM repair rounds (None = MAX_RENDER_REPAIR_ATTEMPTS;
+        0 = pure validation, no repair LLM — the planner-authored path).
+        strict=True additionally fails the result when contract errors
+        (viz refs / params wiring) remain — they are merged into `errors`
+        instead of riding along as annotations.
 
         Async generator: yields ToolProgressEvent items for the UI, then a
         final dict result:
@@ -452,25 +711,37 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
             return
         screenshot, errors = await self._take_preview_screenshot(html)
         fatal = self.fatal_render_errors(errors)
+        # Params-wiring contract rides the same repair loop: an unwired param
+        # renders fine but silently never re-runs the data — as much a defect
+        # as a thrown error, and fixable by the same in-tool repair.
+        # The viz-reference contract rides along too: a reference to a viz that
+        # isn't in the payload (or a payload viz the code never renders) is a
+        # silent-wrong-data defect no screenshot can catch.
+        from app.ai.tools.implementations._artifact_refs import viz_reference_errors
+        wiring = self.params_wiring_errors(code, artifact_data) if mode == "page" else []
+        if mode == "page":
+            wiring = wiring + viz_reference_errors(code, artifact_data)
 
         original_code = code
         original_screenshot = screenshot
         original_errors = errors
+        original_wiring = list(wiring)
         candidate = code
         attempts = 0
+        _repair_budget = self.MAX_RENDER_REPAIR_ATTEMPTS if max_repairs is None else max_repairs
 
         while (
-            fatal
-            and attempts < self.MAX_RENDER_REPAIR_ATTEMPTS
+            (fatal or wiring)
+            and attempts < _repair_budget
             and _time_left()
             and not (sigkill_event and sigkill_event.is_set())
         ):
             attempts += 1
             yield ToolProgressEvent(
                 type="tool.progress",
-                payload={"stage": "repairing_code", "attempt": attempts, "error_count": len(fatal)},
+                payload={"stage": "repairing_code", "attempt": attempts, "error_count": len(fatal) + len(wiring)},
             )
-            fixed = await self._fix_code(candidate, errors, mode, runtime_ctx)
+            fixed = await self._fix_code(candidate, list(errors) + wiring, mode, runtime_ctx)
             if not fixed or fixed == candidate:
                 break
 
@@ -482,14 +753,33 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
             screenshot, errors = await self._take_preview_screenshot(html)
             candidate = fixed
             fatal = self.fatal_render_errors(errors)
+            wiring = self.params_wiring_errors(candidate, artifact_data) if mode == "page" else []
+            if mode == "page":
+                wiring = wiring + viz_reference_errors(candidate, artifact_data)
 
-        if not fatal:
+        if strict and not fatal and wiring:
+            # Strict (planner-authored) mode: contract errors are as fatal as
+            # render errors — return them as the failure so nothing persists
+            # and the planner gets the exact list to fix.
+            yield {
+                "code": original_code,
+                "clean": False,
+                "screenshot": screenshot,
+                "errors": list(errors) + list(wiring),
+                "repair_attempts": attempts,
+                "params_wiring_errors": wiring,
+            }
+        elif not fatal:
+            # Render fatality decides candidate vs original; unconverged wiring
+            # only ANNOTATES — a rendering dashboard with a dead control still
+            # beats no dashboard, but the caller must be able to say so.
             yield {
                 "code": candidate,
                 "clean": True,
                 "screenshot": screenshot,
                 "errors": errors,
                 "repair_attempts": attempts,
+                "params_wiring_errors": wiring,
             }
         else:
             # Repair didn't converge — return the original, verified-broken
@@ -500,6 +790,7 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
                 "screenshot": original_screenshot,
                 "errors": original_errors,
                 "repair_attempts": attempts,
+                "params_wiring_errors": original_wiring,
             }
 
     def _build_viz_profile(self, viz: Dict[str, Any], allow_llm_see_data: bool) -> Dict[str, Any]:
@@ -524,6 +815,7 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
         profile: Dict[str, Any] = {
             "id": viz.get("id"),
             "title": viz.get("title"),
+            "query_id": viz.get("query_id"),
             "chart_type": viz.get("data_model_type") or "table",
             # True dataset size; sample_row_count is how many rows are shown
             # to generation/preview (capped). At runtime the dashboard
@@ -573,6 +865,21 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
             palette = inner_view.get("palette") or {}
             if palette.get("colors"):
                 profile["colors"] = palette.get("colors")[:5]
+
+        # Declared server-side query parameters (useParams contract). Compact:
+        # the artifact needs name/type/source/label/default/options to build
+        # controls, nothing more.
+        params = viz.get("parameters") or []
+        if params:
+            profile["parameters"] = [
+                {
+                    k: p.get(k)
+                    for k in ("name", "type", "label", "source", "default", "required", "options")
+                    if p.get(k) is not None or k in ("name", "source")
+                }
+                for p in params
+                if isinstance(p, dict) and p.get("name")
+            ]
 
         # Include sample data if allowed
         if allow_llm_see_data:
@@ -802,6 +1109,10 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
                 # "chart data contains no categories".
                 "sample_rows": rows,
                 "dataModel": data_model or {},
+                # Declared query parameters (ParamSpec dicts): the dashboard
+                # should render a control per input param via useParams() and
+                # a "scoped to you" badge for identity params.
+                "parameters": list(getattr(viz.query, "parameters", None) or []) if viz.query else [],
             }
 
             # Debug logging
@@ -918,66 +1229,109 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
         # Build the prompt for generating React code
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "building_prompt"})
 
-        prompt = self._build_prompt(
-            user_prompt=data.prompt,
-            title=data.title,
-            mode=data.mode,
-            viz_profiles=viz_profiles,
-            instructions_context=instructions_context,
-            report_title=getattr(report, 'title', None) if report else None,
-            allow_llm_see_data=allow_llm_see_data,
-            messages_context=messages_context,
-            image_count=len(completion_images),
-            organization_settings=organization_settings,
-            files=included_files,
-        )
-        # Static reference goes in the system prompt so provider-side prompt
-        # caching reuses it across artifact calls (page mode only — slides
-        # keeps its single-prompt path).
-        system_prompt = self._build_page_system_prompt() if data.mode == "page" else None
+        # Identity vocabulary for page mode: the requester's current_user as an
+        # example + org group names, so identity intent ("show to Finance",
+        # "greet by department") resolves against real names instead of guesses.
+        identity_context = ""
+        if data.mode == "page":
+            identity_context = await build_identity_context(db, user, organization)
 
-        # Stream from LLM
-        yield ToolProgressEvent(type="tool.progress", payload={"stage": "llm_generating"})
-        llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker)
-        buffer = ""
-        slides_detected = 0  # Track number of slides detected during streaming
-
-        async for evt in llm.inference_stream_v2(
-            messages=[Message(role="user", content=prompt)],
-            system=system_prompt,
-            images=completion_images if completion_images else None,
-            usage_scope="create_artifact",
-            usage_scope_ref_id=str(report.id) if report else None,
-        ):
-            if sigkill_event and sigkill_event.is_set():
-                break
-            if isinstance(evt, TextDeltaEvent):
-                buffer += evt.text
-
-            # For slides mode, detect new slides as they're generated
-            if data.mode == "slides":
-                # Count slide sections in buffer
-                current_slides = buffer.count('<section class="slide"')
-                if current_slides > slides_detected:
-                    # New slide detected
-                    for i in range(slides_detected, current_slides):
-                        yield ToolProgressEvent(
-                            type="tool.progress",
-                            payload={
-                                "stage": "slide_generated",
-                                "slide_index": i,
-                                "total_slides": current_slides,
-                                "timing": False,
-                            }
-                        )
-                    slides_detected = current_slides
-
-            # Stream partial updates
-            if len(buffer) % 100 == 0:  # Throttle updates
-                yield ToolProgressEvent(
-                    type="tool.progress",
-                    payload={"stage": "generating", "chars": len(buffer), "timing": False}
+        # Rebuild-over-existing: when this report already has a completed artifact
+        # of the same mode, its code goes into the prompt as the preservation
+        # baseline — a rebuild must reproduce everything the request doesn't name.
+        prior_code = ""
+        if data.mode == "page" and report is not None:
+            try:
+                _prev_res = await db.execute(
+                    select(Artifact)
+                    .where(
+                        Artifact.report_id == str(report.id),
+                        Artifact.mode == "page",
+                        Artifact.status == "completed",
+                        Artifact.id != artifact.id,
+                    )
+                    .order_by(Artifact.created_at.desc())
+                    .limit(1)
                 )
+                _prev = _prev_res.scalar_one_or_none()
+                if _prev is not None and isinstance(_prev.content, dict):
+                    prior_code = _prev.content.get("code") or ""
+            except Exception:
+                logger.warning("Failed to load prior artifact code for rebuild reference", exc_info=True)
+                prior_code = ""
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Planner-authored path (primary): the planner supplies the complete
+        # source in `code` — NO in-tool generation LLM. Validation below is a
+        # single strict pass; failures return structured errors and persist
+        # nothing (the planner's own loop is the repair loop).
+        # ═══════════════════════════════════════════════════════════════════
+        planner_authored = bool((data.code or "").strip())
+        buffer = ""
+        slides_detected = 0
+        if not planner_authored:
+            prompt = self._build_prompt(
+                user_prompt=data.prompt,
+                title=data.title,
+                mode=data.mode,
+                viz_profiles=viz_profiles,
+                instructions_context=instructions_context,
+                identity_context=identity_context,
+                report_title=getattr(report, 'title', None) if report else None,
+                allow_llm_see_data=allow_llm_see_data,
+                messages_context=messages_context,
+                image_count=len(completion_images),
+                organization_settings=organization_settings,
+                files=included_files,
+                prior_code=prior_code,
+            )
+            # Static reference goes in the system prompt so provider-side prompt
+            # caching reuses it across artifact calls (page mode only — slides
+            # keeps its single-prompt path).
+            system_prompt = self._build_page_system_prompt() if data.mode == "page" else None
+
+            # Stream from LLM
+            yield ToolProgressEvent(type="tool.progress", payload={"stage": "llm_generating"})
+            llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker)
+            buffer = ""
+            slides_detected = 0  # Track number of slides detected during streaming
+
+            async for evt in llm.inference_stream_v2(
+                messages=[Message(role="user", content=prompt)],
+                system=system_prompt,
+                images=completion_images if completion_images else None,
+                usage_scope="create_artifact",
+                usage_scope_ref_id=str(report.id) if report else None,
+            ):
+                if sigkill_event and sigkill_event.is_set():
+                    break
+                if isinstance(evt, TextDeltaEvent):
+                    buffer += evt.text
+
+                # For slides mode, detect new slides as they're generated
+                if data.mode == "slides":
+                    # Count slide sections in buffer
+                    current_slides = buffer.count('<section class="slide"')
+                    if current_slides > slides_detected:
+                        # New slide detected
+                        for i in range(slides_detected, current_slides):
+                            yield ToolProgressEvent(
+                                type="tool.progress",
+                                payload={
+                                    "stage": "slide_generated",
+                                    "slide_index": i,
+                                    "total_slides": current_slides,
+                                    "timing": False,
+                                }
+                            )
+                        slides_detected = current_slides
+
+                # Stream partial updates
+                if len(buffer) % 100 == 0:  # Throttle updates
+                    yield ToolProgressEvent(
+                        type="tool.progress",
+                        payload={"stage": "generating", "chars": len(buffer), "timing": False}
+                    )
 
         # Check sigkill after LLM generation
         if sigkill_event and sigkill_event.is_set():
@@ -993,8 +1347,13 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
             )
             return
 
-        # Extract the code from the response
-        code = self._extract_code(buffer, mode=data.mode)
+        # Extract the code: from the planner-authored source (tolerating a
+        # bare script without fences) or from the generation buffer.
+        if planner_authored:
+            _raw = (data.code or "").strip()
+            code = self._extract_code(_raw, mode=data.mode) or _raw
+        else:
+            code = self._extract_code(buffer, mode=data.mode)
 
         # ═══════════════════════════════════════════════════════════════════════
         # Mode-specific processing: slides uses python-pptx, page skips to save
@@ -1002,45 +1361,48 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
 
         pptx_path: Optional[str] = None
         pptx_success: bool = True
+        pptx_error: Optional[str] = None
+        pptx_repair_attempts: int = 0
         preview_images: List[str] = []
 
         if data.mode == "slides":
             # ═══════════════════════════════════════════════════════════════════
-            # SLIDES MODE: Execute python-pptx code and generate previews
+            # SLIDES MODE: Execute python-pptx code (repairing in-tool on
+            # failure, mirroring page-mode render validation) and generate
+            # previews.
             # ═══════════════════════════════════════════════════════════════════
-            yield ToolProgressEvent(
-                type="tool.progress",
-                payload={"stage": "executing_pptx_code"}
-            )
+            report_data = {
+                "id": str(report.id) if report else None,
+                "title": getattr(report, "title", None) if report else None,
+                "theme": getattr(report, "theme", None) if report else None,
+            }
 
-            try:
-                # Prepare data for execution
-                report_data = {
-                    "id": str(report.id) if report else None,
-                    "title": getattr(report, "title", None) if report else None,
-                    "theme": getattr(report, "theme", None) if report else None,
-                }
+            uploads_dir = Path(__file__).parent.parent.parent.parent.parent / "uploads" / "pptx"
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            output_path = uploads_dir / f"{artifact.id}.pptx"
 
-                # Setup output path
-                uploads_dir = Path(__file__).parent.parent.parent.parent.parent / "uploads" / "pptx"
-                uploads_dir.mkdir(parents=True, exist_ok=True)
-                output_path = uploads_dir / f"{artifact.id}.pptx"
-
-                # Execute the python-pptx code
-                executor = PptxCodeExecutor(logger=logger)
-                result_path, output_log = executor.execute_pptx_code(
-                    code=code,
-                    visualizations=visualizations,
-                    report=report_data,
-                    output_path=output_path,
-                    images=await load_image_bytes(db, included_files),
-                )
-
-                pptx_path = str(result_path)
-
-            except Exception as e:
-                logger.error(f"PPTX execution failed: {e}")
-                pptx_success = False
+            _pptx_result: Optional[Dict[str, Any]] = None
+            async for _item in self._execute_and_repair_pptx(
+                code,
+                visualizations,
+                report_data,
+                output_path,
+                await load_image_bytes(db, included_files),
+                runtime_ctx,
+                deadline_monotonic=_repair_deadline,
+                max_repairs=(0 if planner_authored else None),
+            ):
+                if isinstance(_item, dict):
+                    _pptx_result = _item
+                else:
+                    yield _item
+            if _pptx_result is not None:
+                code = _pptx_result["code"]
+                pptx_success = bool(_pptx_result["ok"])
+                pptx_error = _pptx_result["error"]
+                pptx_repair_attempts = int(_pptx_result["repair_attempts"] or 0)
+            if pptx_success:
+                pptx_path = str(output_path)
 
             # Previews are rendered by LibreOffice, which is a separate concern
             # from building the deck: it can be missing an import filter or be
@@ -1076,6 +1438,7 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
         render_errors: list[str] = []
         render_clean = True
         repair_attempts = 0
+        params_wiring_errors: list[str] = []
         thumbnail_html: Optional[str] = None
         artifact_data: Optional[Dict[str, Any]] = None
 
@@ -1087,26 +1450,52 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
                     "theme": getattr(report, "theme", None) if report else None,
                 },
                 "visualizations": visualizations,
+                # Headless validation renders anonymously on purpose: identity
+                # is per-viewer, injected by the host at render time, and this
+                # exercises the null-guard path in every artifact before it is
+                # persisted.
+                "current_user": None,
             }
             # Inline embedded files as data URIs so the headless render
             # (which has no auth context) can show images/PDFs via <BowFile>.
             if included_files:
                 artifact_data["files"] = await self._build_file_datauris(db, included_files)
 
+            # Planner-authored code goes through a fast parse-only gate first:
+            # a syntax error should cost ~1-2s (babel-standalone transform in a
+            # bare page) and come back with a bracket-balance hint, not burn a
+            # full ~10s validation render to learn the same thing. Gate
+            # unavailable (no browser/libs) → None → full render decides.
+            parse_error: Optional[str] = None
+            if planner_authored:
+                try:
+                    from app.ai.tools.implementations._artifact_parse import parse_check_page_code
+                    parse_error = await parse_check_page_code(code)
+                except Exception as e:
+                    logger.warning(f"parse gate errored, deferring to render validation: {e}")
+                    parse_error = None
+
             _validate_result: Optional[Dict[str, Any]] = None
-            async for _item in self._validate_and_repair_stream(
-                code, artifact_data, data.mode, runtime_ctx, deadline_monotonic=_repair_deadline,
-            ):
-                if isinstance(_item, dict):
-                    _validate_result = _item
-                else:
-                    yield _item
+            if parse_error is not None:
+                render_clean = False
+                render_errors = [f"[parse] {parse_error}"]
+            else:
+                async for _item in self._validate_and_repair_stream(
+                    code, artifact_data, data.mode, runtime_ctx, deadline_monotonic=_repair_deadline,
+                    max_repairs=(0 if planner_authored else None),
+                    strict=planner_authored,
+                ):
+                    if isinstance(_item, dict):
+                        _validate_result = _item
+                    else:
+                        yield _item
             if _validate_result is not None:
                 code = _validate_result["code"]
                 render_clean = bool(_validate_result["clean"])
                 screenshot_base64 = _validate_result["screenshot"]
                 render_errors = list(_validate_result["errors"] or [])
                 repair_attempts = int(_validate_result["repair_attempts"] or 0)
+                params_wiring_errors = list(_validate_result.get("params_wiring_errors") or [])
             try:
                 thumbnail_html = self._build_thumbnail_html(artifact_data, code, mode=data.mode)
             except Exception as e:
@@ -1134,6 +1523,10 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
         artifact.content = content
         if data.mode == "slides":
             artifact.status = "completed" if pptx_success else "failed"
+            # Persist the executor error like page mode persists render errors,
+            # so read_artifact and later repairs can see WHY the deck failed.
+            if pptx_error:
+                artifact.render_errors = [pptx_error]
         else:
             artifact.status = "completed" if render_clean else "failed"
 
@@ -1165,28 +1558,84 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
                 artifact.thumbnail_path = preview_images[0]
                 await db.commit()
 
+        # Slides mode that failed pptx execution (after bounded in-tool
+        # repair): return a structured failure so the planner sees the real
+        # error — mirror of the page-mode branch below. The artifact row is
+        # persisted as status="failed" for debugging, but it is not presented
+        # as a working deck.
+        if data.mode == "slides" and not pptx_success:
+            _error_msg = pptx_error or "unknown pptx execution error"
+            slides_failure_observation: Dict[str, Any] = {
+                "summary": (
+                    f"Artifact '{data.title or 'Untitled'}' failed to build the presentation "
+                    f"after {pptx_repair_attempts} in-tool repair attempt(s). "
+                    f"Error: {_error_msg}"
+                ),
+                "error": {
+                    "type": "pptx_execution_failed",
+                    "message": _error_msg,
+                    "repair_attempts": pptx_repair_attempts,
+                    "remediation": (
+                        "The python-pptx script does not execute. Fix the script yourself against the "
+                        "exact error above and call create_artifact again with the corrected `code` "
+                        "(nothing was persisted); simplify the deck if the error persists."
+                    ),
+                },
+                "artifact_id": str(artifact.id),
+                "mode": data.mode,
+                "visualization_count": len(visualizations),
+                "visualization_ids": included_viz_ids,
+                "render_errors": [_error_msg],
+            }
+            if warnings:
+                slides_failure_observation["warnings"] = warnings
+            yield ToolEndEvent(
+                type="tool.end",
+                payload={
+                    "output": {
+                        "success": False,
+                        "artifact_id": str(artifact.id),
+                        "error": f"PPTX execution failed: {_error_msg}",
+                        "code_preview": {
+                            "language": "python",
+                            "code": code,
+                            "collapsed_default": True,
+                        },
+                    },
+                    "observation": slides_failure_observation,
+                },
+            )
+            return
+
         # Page mode that failed render validation (after bounded in-tool
         # repair): return a structured failure so the planner sees the real
         # errors. The artifact row is persisted as status="failed" for
         # debugging, but it is not presented as a working dashboard.
         if data.mode == "page" and not render_clean:
+            # A "[parse] ..." error came from the fast parse gate: the code
+            # never reached a render, so report it as a syntax failure with
+            # Babel's message (plus the bracket-balance hint when one applies).
+            is_parse_failure = bool(render_errors) and all(e.startswith("[parse]") for e in render_errors)
             fatal_errors = self.fatal_render_errors(render_errors)
             first_error = fatal_errors[0] if fatal_errors else (render_errors[0] if render_errors else "unknown render error")
             failure_observation: Dict[str, Any] = {
                 "summary": (
+                    f"Artifact '{data.title or 'Untitled'}' failed to parse (syntax error — "
+                    f"nothing was rendered or persisted as working). {first_error}"
+                    if is_parse_failure else
                     f"Artifact '{data.title or 'Untitled'}' failed render validation with "
                     f"{len(fatal_errors)} fatal error(s) after {repair_attempts} in-tool repair attempt(s). "
                     f"First error: {first_error}"
                 ),
                 "error": {
-                    "type": "render_validation_failed",
+                    "type": "parse_error" if is_parse_failure else "render_validation_failed",
                     "message": first_error,
                     "render_errors": render_errors,
                     "repair_attempts": repair_attempts,
                     "remediation": (
-                        "The generated code does not render. Call edit_artifact with an edit_prompt "
-                        "that quotes the exact error(s) above, or create_artifact to rebuild with a "
-                        "simpler layout if the errors persist."
+                        "The code does not render. Fix it yourself against the exact error(s) above "
+                        "and call create_artifact again with the corrected `code` (a failed create "
+                        "persists nothing); simplify the layout if the errors persist."
                     ),
                 },
                 "artifact_id": str(artifact.id),
@@ -1199,6 +1648,7 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
                 failure_observation["warnings"] = warnings
             _model = runtime_ctx.get("model")
             if screenshot_base64 and allow_llm_see_data and _model and getattr(_model, "supports_vision", False):
+                failure_observation["summary"] += ANON_PREVIEW_NOTE + STATIC_PREVIEW_NOTE
                 failure_observation["images"] = [{
                     "data": screenshot_base64,
                     "media_type": "image/png",
@@ -1253,8 +1703,16 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
 
         # Build observation message
         summary_msg = f"Created artifact '{data.title or 'Untitled'}' with {len(code)} characters of code"
-        if data.mode == "slides" and preview_images:
-            summary_msg += f". Generated {len(preview_images)} slide preview images."
+        if data.mode == "slides":
+            if pptx_repair_attempts:
+                summary_msg += f". PPTX execution passed after {pptx_repair_attempts} in-tool repair attempt(s)."
+            if preview_images:
+                summary_msg += f" Generated {len(preview_images)} slide preview images."
+            else:
+                summary_msg += (
+                    " The deck was built, but slide preview images could not be generated on this "
+                    "server — the PPTX file is still downloadable."
+                )
         elif data.mode == "page":
             if repair_attempts:
                 summary_msg += f". Render validation passed after {repair_attempts} in-tool repair attempt(s)."
@@ -1272,6 +1730,8 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
         )
         if _attach_screenshot:
             summary_msg += " Screenshot of the rendered dashboard is attached — review it for visual correctness."
+            summary_msg += ANON_PREVIEW_NOTE
+            summary_msg += STATIC_PREVIEW_NOTE
 
         observation: Dict[str, Any] = {
             "summary": summary_msg,
@@ -1284,6 +1744,18 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
             observation["render_errors"] = render_errors
         if repair_attempts:
             observation["repair_attempts"] = repair_attempts
+        # Wiring contract unmet after the repair budget: the dashboard renders
+        # but its param control(s) are dead — say so instead of shipping it
+        # silently, so the planner can follow up with edit_artifact.
+        if params_wiring_errors:
+            observation["params_wired"] = False
+            observation["params_wiring_errors"] = params_wiring_errors
+            observation["summary"] = (
+                summary_msg
+                + " WARNING: declared query parameters are NOT wired to controls — "
+                "selecting a value will not re-run the data. Fix with edit_artifact: "
+                + params_wiring_errors[0]
+            )
 
         # Add preview screenshot for planner reflection (page mode)
         if _attach_screenshot:
@@ -1300,6 +1772,19 @@ Output the FULL corrected code wrapped in <script type="text/babel"> ... </scrip
                 observation["slide_count"] = len(preview_images)
             if pptx_path:
                 observation["pptx_path"] = pptx_path
+            if pptx_repair_attempts:
+                observation["repair_attempts"] = pptx_repair_attempts
+            # Attach the first slide preview for planner reflection — same
+            # privacy + vision gate as the page-mode screenshot (the preview
+            # shows the data).
+            _slides_preview_b64 = self._first_preview_base64(preview_images)
+            if _slides_preview_b64 and allow_llm_see_data and _model and getattr(_model, "supports_vision", False):
+                observation["summary"] += " First slide preview is attached — review it for visual correctness."
+                observation["images"] = [{
+                    "data": _slides_preview_b64,
+                    "media_type": "image/png",
+                    "source_type": "base64",
+                }]
 
         if warnings:
             observation["warnings"] = warnings
@@ -1557,15 +2042,17 @@ fill.fore_color.rgb = RGBColor(15, 23, 42)
 list is empty for a narrative deck):
 ```python
 viz = visualizations[0]
-columns = viz['columns']  # e.g. ['AlbumTitle', 'Revenue', 'UnitsSold']
+# Each entry of viz['columns'] is a DICT, e.g. {{'field': 'Revenue', 'headerName': 'Revenue'}}.
+# Extract the row keys from the 'field' values first:
+fields = [c['field'] if isinstance(c, dict) else str(c) for c in viz['columns']]  # e.g. ['AlbumTitle', 'Revenue']
 rows = viz['rows']        # list of dicts like {{'AlbumTitle': 'Greatest Hits', 'Revenue': 1500.0}}
 
 # Get categories and values for a chart:
-categories = [str(row[columns[0]]) for row in rows]  # First column as labels
-values = [float(row[columns[1]]) if row[columns[1]] else 0 for row in rows]  # Second column as values
+categories = [str(row.get(fields[0], '')) for row in rows]  # First column as labels
+values = [float(row.get(fields[1]) or 0) for row in rows]   # Second column as values
 
-# IMPORTANT: columns[i] returns a string like 'Revenue', then use that to index into row
-# row[columns[1]] is the same as row['Revenue'] if columns[1] == 'Revenue'
+# IMPORTANT: never pass a column dict itself to a text property or a row index —
+# use fields[i] (a string like 'Revenue'): row[fields[1]] is row['Revenue']
 ```
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1821,7 +2308,7 @@ AVAILABLE COMPONENTS (convenience shortcuts — not requirements):
   - Dark: `className="bg-slate-900 border-slate-700 text-white" titleClassName="text-slate-400"`
   - Colored: `className="bg-indigo-50 border-indigo-200 text-indigo-900" titleClassName="text-indigo-600"`
 - `<SectionCard title="" subtitle="" className="" titleClassName="" subtitleClassName="" style={{{{}}}}>...children...</SectionCard>` — same theming: `className` replaces defaults, `titleClassName`/`subtitleClassName` for text. Theme to match.
-- `<FilterSelect label="" options={{arr}} selected={{arr}} onChange={{fn}} searchable={{bool}} className="" style={{{{}}}} />` — multi-select dropdown (portaled). Built-in search at 8+ options. `className` replaces default theme (bg-white border-slate-200 text-slate-900) — pass e.g. `className="bg-slate-900 border-slate-700 text-slate-100"` for dark.
+- `<FilterSelect label="" options={{arr}} selected={{arr}} onChange={{fn}} single={{bool}} searchable={{bool}} className="" style={{{{}}}} />` — dropdown (portaled). Multi-select by default: `onChange` receives the full ARRAY of selected `option.value`s. Pass `single` for a one-value choice (radio list, picking replaces the selection and closes the dropdown, no "Clear all"): `onChange` then receives `[value]`. Built-in search at 8+ options. `className` replaces default theme (bg-white border-slate-200 text-slate-900) — pass e.g. `className="bg-slate-900 border-slate-700 text-slate-100"` for dark.
 - `<FilterSearch label="" value={{str}} onChange={{e => setFilter(field, e.target.value)}} placeholder="Search..." className="" style={{{{}}}} />` — text search. `className` replaces default theme.
 - `<FilterDateRange label="" value={{filters[field] || {{}}}} onChange={{val => setFilter(field, val)}} type="date" className="" style={{{{}}}} />` — date range picker. `className` replaces default theme.
 - `fmt(n, opts)` — `{{currency:true}}`, `{{pct:true}}`, auto K/M/B
@@ -1829,7 +2316,9 @@ AVAILABLE COMPONENTS (convenience shortcuts — not requirements):
 
 All components are fully themeable via `className`/`titleClassName`/`subtitleClassName`/`style`. Don't leave default white/slate styling when your design calls for something different. If the design needs something these can't express — build custom React + Tailwind.
 
-**INFO POPOVER (required):** Pass `viz={{viz[N]}}` to every `<KPICard>` and `<SectionCard>` you build from a visualization. This renders a small built-in "ⓘ" button that lets users inspect the data behind each component (Data tab with rows, Code tab with the query). Use the index of the visualization the card is derived from (the primary one if it combines several). When a card renders FILTERED rows (you called `filterRows(viz[N].rows)`), ALSO pass `rows={{<those filtered rows>}}` so the popover shows the filtered view that matches the component, not the full dataset. When a card AGGREGATES or derives its value client-side, ALSO pass `calc="<formula>"` describing the math with real column names, e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"` or `calc="COUNT(DISTINCT CustomerId)"` — the popover shows it as a "Calculation" line. If you render a chart with a bare `<EChart>` that is NOT inside a `<SectionCard>`, pass `viz={{viz[N]}}` (and `rows`/`calc` if relevant) to the `<EChart>` itself so it still gets the popover.
+**HOST DARK MODE:** The sandbox runs Tailwind with `darkMode: 'class'`; the host toggles a `dark` class on `<html>` to match the viewer's theme (live, no reload). Component DEFAULTS already adapt (they carry `dark:` variants), as do the iframe body and charts (bow/bow-dark ECharts themes). So: prefer the defaults when no specific color story is requested — they look right in both modes. When you hardcode light colors on custom markup or via `className` overrides, pair them with `dark:` variants (`bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100`). **When the USER asks for a dark design** (dark regardless of their app theme): put `className="dark"` (plus your dark page background) on the artifact's ROOT wrapper div — Tailwind's class strategy matches ancestors, so every built-in component flips to its dark variant automatically. NEVER mix a dark page background with default light cards; if you don't use the root `dark` class, you must restyle EVERY component (`className` on each KPICard/SectionCard/DataTable/filter) to match the dark background.
+
+**INFO POPOVER (required):** Pass `viz={{vizById("<uuid>")}}` (or the const you bound from it) to every `<KPICard>` and `<SectionCard>` you build from a visualization. This renders a small built-in "ⓘ" button that lets users inspect the data behind each component (Data tab with rows, Code tab with the query). Use the id of the visualization the card is derived from (the primary one if it combines several). When a card renders FILTERED rows (you called `filterRows(vizById("<uuid>").rows)`), ALSO pass `rows={{<those filtered rows>}}` so the popover shows the filtered view that matches the component, not the full dataset. When a card AGGREGATES or derives its value client-side, ALSO pass `calc="<formula>"` describing the math with real column names, e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"` or `calc="COUNT(DISTINCT CustomerId)"` — the popover shows it as a "Calculation" line. If you render a chart with a bare `<EChart>` that is NOT inside a `<SectionCard>`, pass `viz={{vizById("<uuid>")}}` (and `rows`/`calc` if relevant) to the `<EChart>` itself so it still gets the popover.
 
 **CUSTOM MARKUP — add `data-bow-*` attributes (required):** Whenever you build your OWN containers instead of `<KPICard>`/`<SectionCard>`/`<EChart>` (custom `<div>` KPI tiles, chart wrappers, tables), annotate each item's outer element with `data-bow-viz="N"` (source visualization index) and `data-bow-calc="<formula>"` when the value is derived. A global overlay then renders the same Data/Code/Calc popover on each item. Example: `<div data-bow-viz={{0}} data-bow-calc="SUM(UnitPrice × Quantity)">...custom tile...</div>`. EVERY metric, chart, and table must be reachable via either a prebuilt component's `viz` prop OR a `data-bow-viz` attribute — never leave an item with no way to inspect its data.
 
@@ -1856,7 +2345,8 @@ Each visualization:
 - Use `column.field` to access row values: `row[column.field]`
 - Use `column.headerName` for display labels
 - Column metadata includes `dtype` (pandas type) and `unique_count` — use these for filter/format decisions
-- **Do not hardcode data** — all values should come from `data.visualizations[N].rows`
+- **Do not hardcode data** — all values should come from the viz data payload (`vizById("<uuid>").rows`)
+- **DATA ACCESS IS ID-KEYED (MANDATORY):** every visualization in YOUR VISUALIZATIONS has an `id` (uuid). Bind data with `vizById("<that uuid>")` — e.g. `const revTrend = vizById("2f9c…");` — NEVER by position (`viz[0]`, `viz[1]`, `data.visualizations[N]`). Positional indexes silently repoint at the wrong dataset when the viz set changes; id-keyed access is stable. Copy each uuid EXACTLY from the `id` field of the viz it renders. (The uuids live in code only — never display them in visible text.)
 - **Sample vs full data:** the `rows`/`sample_rows` shown in the user message are a SAMPLE (capped at 100 rows per visualization) for generation and preview. At runtime the dashboard receives the FULL dataset — `row_count` rows. `row_count` is the true dataset size; `sample_row_count` is the sample size. Write code that works on the full dataset (aggregate with reduce/Map, paginate long tables) and NEVER hardcode workarounds for the sample size.
 - **Defensive coding**: Row values and properties can be `null`/`undefined`. Use optional chaining or fallbacks before calling `.includes()`, `.toLowerCase()`, `.startsWith()`, `.split()`, etc. Example: `(row.name || '').includes('x')` or `String(val ?? '').toLowerCase()`. Do not call string methods on a value that could be nullish.
 
@@ -1865,9 +2355,10 @@ The `view_config` on each visualization describes how the author wants the data 
 
 - `view_config.aggregation` (`"sum" | "avg" | "count" | "min" | "max"`): the raw rows are granular, so aggregate the relevant value column before rendering (especially for `count`, `metric_card`, `pie_chart`, `heatmap`). Use `rows.reduce(...)`. Example for a metric card with aggregation=sum:
   ```js
+  const revenue = vizById("<uuid of the revenue viz>");
   const total = useMemo(
-    () => viz[0].rows.reduce((s, r) => s + (Number(r.revenue) || 0), 0),
-    [viz]
+    () => revenue.rows.reduce((s, r) => s + (Number(r.revenue) || 0), 0),
+    [revenue]
   );
   ```
   For pie/heatmap/bar charts that group by a category, group first and aggregate the value per group rather than using the first matching row.
@@ -1883,7 +2374,7 @@ The `view_config` on each visualization describes how the author wants the data 
     setFilter('column_name', value);
   }}, []);
   ```
-  If the underlying runtime uses richer operators (`equals`, `greater_than`, etc.), either call `setFilter` with the operator-aware object it expects, or compute the filtered rows directly via `filterRows(viz[N].rows)` once the filter is seeded. Render the filtered view when defaults are present so the initial numbers match the author's intent.
+  If the underlying runtime uses richer operators (`equals`, `greater_than`, etc.), either call `setFilter` with the operator-aware object it expects, or compute the filtered rows directly via `filterRows(vizById("<uuid>").rows)` once the filter is seeded. Render the filtered view when defaults are present so the initial numbers match the author's intent.
 
 FILTERING:
 - Use `useFilters()` hook for cross-visualization filtering — returns `{{ filters, setFilter, resetFilters, filterRows }}`
@@ -1891,7 +2382,7 @@ FILTERING:
   - `<FilterSelect>` for low-cardinality columns (`unique_count` < ~50, dtype "object"/"int64" with few values)
   - `<FilterSearch>` for high-cardinality text columns (`unique_count` > 50, dtype "object")
   - `<FilterDateRange>` for date/time columns (dtype contains "datetime" or values are date strings)
-- Get unique values directly: `[...new Set(viz[N].rows.map(r => r[field]))]`
+- Get unique values directly: `[...new Set(vizById("<uuid>").rows.map(r => r[field]))]`
 
 FILTER FEASIBILITY AUDIT — DO THIS FIRST, BEFORE WRITING CODE:
 Before wiring any cross-viz filter, verify it will actually work. A filter that looks wired but silently leaves some vizs untouched is a broken dashboard, not a partial one.
@@ -1911,7 +2402,7 @@ FILTER PLACEMENT — global vs local:
 
 FILTER DATA FLOW:
 - Every viz that passes the feasibility audit for a filter should use `filterRows()` as its data source — for charts, tables, and any KPI/summary derived from that viz.
-- KPI cards that summarize filtered data (sum, count, avg) should be computed from filtered rows, not from raw `viz[N].rows`.
+- KPI cards that summarize filtered data (sum, count, avg) should be computed from filtered rows, not from raw `vizById("<uuid>").rows`.
 - Do not call `filterRows` on a viz that doesn't have the filter column just to "be safe" — silently passing rows through makes the filter look active when it isn't. Audit first, wire second.
 
 EXAMPLE 1 — Global "region" filter affecting KPIs + bar chart + table:
@@ -1989,7 +2480,8 @@ OUTPUT FORMAT
 function App() {{
   const data = useArtifactData();
   if (!data) return <div className="flex items-center justify-center h-screen text-gray-400"><LoadingSpinner size={{32}} /></div>;
-  const viz = data.visualizations;
+  // Id-keyed data access — one binding per viz, uuid copied from its `id`:
+  const revTrend = vizById("<uuid from YOUR VISUALIZATIONS>");
   // ... concise dashboard code
 }}
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
@@ -1998,9 +2490,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 
 Structure: all code should be inside `function App() {{ ... }}` with `ReactDOM.createRoot(document.getElementById('root')).render(<App />);` at the end. Do not put return statements outside a function.
 
-Rules: `<script type="text/babel">` wrapper. `useArtifactData()` for data. `<EChart option={{...}} />` for charts. Pass `viz={{viz[N]}}` to every KPICard/SectionCard so the built-in info popover shows the data behind it. RESPONSIVE — fluid width, responsive grids (`grid-cols-1 md:grid-cols-2 lg:grid-cols-N`), no fixed-pixel widths, no horizontal page scroll at any width (see RESPONSIVE LAYOUT section above); required unless the user asked for a fixed width. Handle zero rows. No hardcoded data. No UUIDs/branding/emoji. Guard nullish values before string methods (use `(val || '')` or `String(val ?? '')`).
+Rules: `<script type="text/babel">` wrapper. `useArtifactData()` for data; bind each viz by id with `vizById("<uuid>")` — NEVER positional `viz[N]`. `<EChart option={{...}} />` for charts. Pass `viz={{vizById("<uuid>")}}` (or the binding you made from it) to every KPICard/SectionCard so the built-in info popover shows the data behind it. RESPONSIVE — fluid width, responsive grids (`grid-cols-1 md:grid-cols-2 lg:grid-cols-N`), no fixed-pixel widths, no horizontal page scroll at any width (see RESPONSIVE LAYOUT section above); required unless the user asked for a fixed width. Handle zero rows. No hardcoded data. No UUIDs, branding, or emoji in user-visible text (uuids belong in vizById() calls only). Guard nullish values before string methods (use `(val || '')` or `String(val ?? '')`).
 
-**Code size:** Write compact code — no unnecessary variables, comments, or verbose JSX. Omit default props. Don't repeat theme styling the 'bow' theme already provides. Prefer inline expressions over separate variables when used once. For simple dashboards target under 8K characters. For detailed/specific user requests, use as much space as needed to faithfully implement their design — fidelity to the user's request is more important than brevity."""
+**Code formatting:** Keep the code concise by omitting redundancy (unnecessary comments, default props, theme styling the 'bow' theme already provides) — never by minifying. Write ONE statement per line and break long expressions across lines: syntax errors report line:col, and a 300-char one-liner makes both authoring mistakes and fixing them far more likely. Name an intermediate variable instead of nesting calls more than ~3 levels deep (paren-soup like `f(g(h(x)))))` is where unbalanced brackets come from). Use as much space as the design needs — fidelity to the user's request is more important than brevity."""
 
     def _build_page_prompt(
         self,
@@ -2014,6 +2506,8 @@ Rules: `<script type="text/babel">` wrapper. `useArtifactData()` for data. `<ECh
         image_count: int = 0,
         organization_settings: Any = None,
         files: Optional[List[Dict[str, Any]]] = None,
+        identity_context: str = "",
+        prior_code: str = "",
     ) -> str:
         """Build the dynamic user prompt for page/dashboard generation.
 
@@ -2021,6 +2515,68 @@ Rules: `<script type="text/babel">` wrapper. `useArtifactData()` for data. `<ECh
         as the system prompt); this carries only per-call state.
         """
         viz_json = json.dumps(viz_profiles, indent=2, default=str)
+
+        # Rebuild baseline: the report's current artifact code. A rebuild is
+        # not a blank slate — everything the request doesn't name must survive.
+        prior_code_block = ""
+        if prior_code:
+            _clipped = prior_code[:30000]
+            _truncation_note = ""
+            if len(prior_code) > 30000:
+                _truncation_note = (
+                    f"\nNOTE: the baseline below is TRUNCATED at 30,000 of {len(prior_code)} "
+                    "characters. Preserve everything visible; for the truncated remainder, use "
+                    "the YOUR VISUALIZATIONS list to ensure every viz still gets a section — do "
+                    "not invent content for parts you cannot see, and do not drop their vizs.\n"
+                )
+            prior_code_block = (
+                "\n**REBUILD OVER EXISTING ARTIFACT — PRESERVE BY DEFAULT:** this report already "
+                "has a dashboard; its current code is below. You are rebuilding it, not starting "
+                "fresh. Reproduce EVERYTHING the request does not explicitly change — the same "
+                "charts, layout structure, styling, titles, and filters — and apply only the "
+                "requested changes on top. Do not drop, restyle, or reorganize anything the user "
+                "didn't name.\n" + _truncation_note + "\n```jsx\n" + _clipped + "\n```\n"
+            )
+
+        # Server-side query parameters: when any viz declares them, the
+        # dashboard must wire controls through useParams() (not useFilters).
+        params_directive = ""
+        _param_profiles = [
+            (p.get("title") or p.get("id"), p.get("parameters"))
+            for p in viz_profiles if p.get("parameters")
+        ]
+        if _param_profiles:
+            _lines = "\n".join(
+                f"  - {title}: " + ", ".join(
+                    f"{d.get('name')} ({d.get('type', 'string')}, {d.get('source', 'input')})"
+                    for d in decls
+                )
+                for title, decls in _param_profiles
+            )
+            params_directive = (
+                "\n**Server-side query parameters (MANDATORY UI):** these visualizations' queries "
+                "declare parameters — the platform re-runs them at the data source when a value "
+                "changes (see useParams() in the runtime reference):\n" + _lines + "\n"
+                "Rules: render ONE control per unique param name (same name across queries = one "
+                "control driving all of them) wired to useParams().setParam(name, value); an "
+                "optional param gets an 'All' choice that sets null; identity-source params get NO "
+                "input — show a small 'scoped to you' badge; show a subtle loading state while "
+                "useParams().loading is true, and ALWAYS render useParams().error when set (a "
+                "small banner/toast) — a failed re-run must never look like a stale table. "
+                "Do NOT emulate these with useFilters/client-side "
+                "filtering — the fresh rows arrive through useArtifactData() automatically. "
+                "A control's choice list must be STABLE: populate it from useParamOptions(name) "
+                "(declared options / options-source query, host-resolved) — NEVER derive choices "
+                "from the rows that control filters, or selecting a value collapses the list to "
+                "the current selection. Bind option.value into setParam — never the label. "
+                "A list-typed param renders as a MULTI-select (or checkable list) that submits "
+                "an ARRAY of option.value entries; empty selection = null (All). "
+                "Every OTHER param type (string/number/date/id) holds ONE value and MUST use a "
+                "single-choice control — `<FilterSelect single selected={[values.name]} "
+                "onChange={arr => setParam('name', arr[0] ?? null)} />` — never a multi-select "
+                "read through `selected[0]`: with the default multi-select, picking a second "
+                "option only appends a checkbox and the param never changes.\n"
+            )
 
         language_directive = build_language_directive(organization_settings)
 
@@ -2055,9 +2611,11 @@ Design request (primary specification — takes precedence when it conflicts wit
 **User Request:** {user_prompt}
 {images_context}
 {files_context}
+{params_directive}
 {f"**Organization Instructions:**{chr(10)}{instructions_context}" if instructions_context else ""}
-
+{identity_context}
 {f"**Conversation History:**{chr(10)}{messages_context}" if messages_context else ""}
+{prior_code_block}
 {language_directive}
 
 If the user specified a theme, layout, colors, or style above — follow that exactly.
@@ -2093,6 +2651,8 @@ Now create the dashboard:"""
         image_count: int = 0,
         organization_settings: Any = None,
         files: Optional[List[Dict[str, Any]]] = None,
+        identity_context: str = "",
+        prior_code: str = "",
     ) -> str:
         """Build the prompt for generating artifact code. Dispatches to mode-specific builders."""
         if mode == "slides":
@@ -2119,6 +2679,8 @@ Now create the dashboard:"""
             image_count=image_count,
             organization_settings=organization_settings,
             files=files,
+            identity_context=identity_context,
+            prior_code=prior_code,
         )
 
     def _extract_code(self, response: str, mode: str = "page") -> str:

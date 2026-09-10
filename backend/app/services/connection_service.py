@@ -10,7 +10,7 @@ from typing import List, Optional
 from uuid import UUID
 import uuid as uuid_module
 
-from sqlalchemy import delete, func
+from sqlalchemy import delete, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload, lazyload
@@ -27,6 +27,7 @@ from app.models.user import User
 from app.models.user_connection_credentials import UserConnectionCredentials
 from app.models.user_connection_overlay import UserConnectionTable, UserConnectionColumn
 from app.models.webhook_data_source_association import webhook_data_source_association
+from app.models.domain_connection import domain_connection
 from app.schemas.data_source_registry import (
     resolve_client_class,
     list_available_data_sources,
@@ -235,7 +236,7 @@ def default_user_auth_modes(conn_type: str, config: dict, credentials: dict) -> 
     from app.services.connection_oauth_service import ENTRA_OBO_CONNECTION_TYPES
     if conn_type in ENTRA_OBO_CONNECTION_TYPES:
         return ["oauth"]
-    if conn_type in ("servicenow", "snowflake", "bigquery") and (credentials or {}).get("oauth_client_id"):
+    if conn_type in ("servicenow", "snowflake", "bigquery", "monday") and (credentials or {}).get("oauth_client_id"):
         # Admin supplied an OAuth app/security integration → per-user auth
         # means OAuth sign-in (Fabric-style). Without one, modes stay unset so
         # users may still bring their own credentials (password, keypair, or
@@ -772,6 +773,15 @@ class ConnectionService:
                                 webhook_data_source_association.c.data_source_id == ds.id
                             )
                         )
+                        # Preserve per-agent Drafts suites and their cases. The
+                        # suite link is a home only, so removing the sole-linked
+                        # agent turns it back into an org-level suite.
+                        from app.models.eval import TestSuite
+                        await db.execute(
+                            update(TestSuite)
+                            .where(TestSuite.data_source_id == ds.id)
+                            .values(data_source_id=None)
+                        )
                         await db.delete(ds)
 
             await db.delete(connection)
@@ -1048,7 +1058,7 @@ class ConnectionService:
             roster.append({
                 "user_id": r.user_id,
                 "principal": md.get("principal"),
-                "verified": bool(r.last_used_at),
+                "verified": bool(r.last_used_at and not md.get("last_error")),
                 "last_verified_at": r.last_used_at,
                 "last_error": md.get("last_error"),
             })
@@ -1100,6 +1110,35 @@ class ConnectionService:
                 except Exception:
                     pass
             return {"success": False, "message": str(e)}
+
+    async def save_windows_user_credentials(self, db, connection, user, payload) -> dict:
+        """Canonical per-user credential storage for the on-prem file connector.
+
+        Keep OAuth and legacy datasource credential flows unchanged. Callers
+        must authorize read access to the connection before invoking this.
+        """
+        from app.errors import AppError, ErrorCode
+        from app.models.user_connection_credentials import UserConnectionCredentials
+        from app.schemas.data_sources.configs import SharePointOnpremNtlmCredentials
+        from app.services.connection_identity import get_user_conn_cred_row
+        if connection.type != "sharepoint_onprem" or connection.auth_policy != "user_required" or payload.auth_mode != "ntlm":
+            raise AppError.bad_request(ErrorCode.VALIDATION, "This connection does not accept manual Windows credentials")
+        if connection.allowed_user_auth_modes and payload.auth_mode not in connection.allowed_user_auth_modes:
+            raise AppError.bad_request(ErrorCode.VALIDATION, "Authentication mode is not permitted by this connection")
+        try:
+            credentials = SharePointOnpremNtlmCredentials(**payload.credentials).model_dump()
+        except ValueError:
+            raise AppError(ErrorCode.VALIDATION, "A domain username and password are required", status_code=422)
+        row = await get_user_conn_cred_row(db, connection, user)
+        if row is None:
+            row = UserConnectionCredentials(connection_id=str(connection.id), user_id=str(user.id),
+                organization_id=str(connection.organization_id), auth_mode="ntlm", is_active=True, is_primary=True)
+        row.auth_mode = "ntlm"
+        row.last_used_at = None
+        row.encrypt_credentials(credentials)
+        db.add(row)
+        await db.commit()
+        return {"success": True, "auth_mode": "ntlm"}
 
     async def delete_user_credentials(
         self,
@@ -1731,7 +1770,15 @@ class ConnectionService:
             # Models contributed by users' own discovery live on DataSourceTable
             # instead — include them so the connect test has something to probe
             # and does not reject a member who can genuinely query.
-            ds_ids = [str(ds.id) for ds in (connection.data_sources or [])]
+            # Do not touch ``connection.data_sources`` here: after credential
+            # resolution/commits the relationship may be expired, and async
+            # lazy-loading it raises MissingGreenlet. Read the junction table
+            # explicitly through the active AsyncSession instead.
+            ds_ids = [str(row[0]) for row in (await db.execute(
+                select(domain_connection.c.data_source_id).where(
+                    domain_connection.c.connection_id == str(connection.id)
+                )
+            )).all()]
             if ds_ids:
                 rows += (await db.execute(
                     select(DataSourceTable.name, DataSourceTable.metadata_json).where(
@@ -1826,10 +1873,19 @@ class ConnectionService:
         # --- Kerberos SSO (per-user constrained delegation) ---
         # No stored secret is involved: the app impersonates the user's AD
         # principal via S4U at connect time, so a missing credential row is not
-        # an error — the principal is derived from the login identity unless the
-        # user saved an explicit override.
+        # an error — the principal comes only from the verified directory object.
         kerberos_creds = self._kerberos_delegated_credentials(connection, current_user, row)
         if kerberos_creds is not None:
+            import asyncio
+            from app.ee.ldap.connection import LDAPConnectionManager
+            from app.settings.config import settings
+            identity = current_user.ldap_identity
+            try:
+                fresh = await asyncio.to_thread(LDAPConnectionManager(settings.bow_config.ldap).read_identity, identity["dn"])
+                if any(fresh.get(k) != identity.get(k) for k in ("provider", "guid", "sid_hex", "principal")):
+                    raise ValueError("Directory identity changed")
+            except Exception:
+                raise HTTPException(status_code=403, detail="Directory identity verification failed")
             self.last_credential_identity = "user"
             return kerberos_creds
 
@@ -1889,7 +1945,14 @@ class ConnectionService:
         # Overlay variants (e.g. Qlik on-prem "identity") carry only the user's
         # identity fields — merge them over the connection's system credentials.
         from app.schemas.data_source_registry import overlay_system_credentials
-        return overlay_system_credentials(connection, row.decrypt_credentials() or {}, row.auth_mode)
+        credentials = row.decrypt_credentials() or {}
+        if connection.type.lower() == "mssql":
+            from app.schemas.data_source_registry import get_entry
+            variant = get_entry("MSSQL").credentials_auth.by_auth.get(row.auth_mode)
+            if variant is None or "user" not in variant.scopes:
+                raise HTTPException(status_code=403, detail="User authentication mode rejected")
+            credentials = variant.schema(**credentials).model_dump()
+        return overlay_system_credentials(connection, credentials, row.auth_mode)
 
     @staticmethod
     def _kerberos_delegated_credentials(connection: Connection, user: User, row) -> Optional[dict]:
@@ -1915,15 +1978,16 @@ class ConnectionService:
         marker = row if (row is not None and row.auth_mode == KERBEROS_SSO_MODE) else None
         principal = resolve_kerberos_principal(user, marker)
         if not principal:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Kerberos SSO requires an Active Directory principal (UPN). "
-                    "Your login identity has no UPN-shaped email — save your AD "
-                    "principal in your connection credentials."
-                ),
+            from app.errors import AppError, ErrorCode
+            raise AppError.forbidden(
+                ErrorCode.ACCESS_DENIED,
+                "Kerberos SSO requires a verified directory identity. "
+                "Sign in with your directory account.",
             )
-        return {"use_kerberos": True, "kerberos_impersonate": principal}
+        if (user.ldap_identity.get("organization_id") != str(connection.organization_id)):
+            raise HTTPException(status_code=403, detail="Directory identity scope mismatch")
+        return {"use_kerberos": True, "kerberos_impersonate": principal,
+                "kerberos_expected_sid": user.ldap_identity["sid_hex"]}
 
     def _resolve_client_by_type(
         self,
@@ -1954,7 +2018,9 @@ class ConnectionService:
             # auth_type="none", so an oauth_app API root 404 looked like a failure.
             # Clients that don't accept auth_type drop it via the signature narrowing below.
             meta_keys = {"auth_policy", "allowed_user_auth_modes"}
-            client_params = {k: v for k, v in client_params.items() if v is not None and v != "" and k not in meta_keys and not k.startswith("oauth_")}
+            client_params = {k: v for k, v in client_params.items()
+                             if v is not None and (v != "" or (data_source_type == "sharepoint_onprem" and k == "drive_name"))
+                             and k not in meta_keys and not k.startswith("oauth_")}
 
             # Narrow to constructor signature — but skip narrowing when the
             # constructor accepts **kwargs. Thin subclasses like OnedriveClient /

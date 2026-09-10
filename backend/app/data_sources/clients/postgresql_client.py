@@ -4,6 +4,7 @@ import pandas as pd
 import sqlalchemy
 
 from app.data_sources.engine_pool import get_engine
+from app.data_sources.fk_reflection import attach_foreign_keys
 from app.data_sources.query_cancellation import track
 from sqlalchemy import text
 from contextlib import contextmanager
@@ -20,12 +21,13 @@ class PostgresqlClient(DataSourceClient):
     # of literal dates that go stale when saved code is re-executed.
     relative_date_hint = "Relative dates (PostgreSQL): CURRENT_DATE, CURRENT_DATE - INTERVAL '7 days', date_trunc('month', CURRENT_DATE); the clock is the DB server's."
 
-    def __init__(self, host, port, database, user, password="", schema=None):
+    def __init__(self, host, port, database, user, password="", schema=None, sslmode="prefer"):
         self.host = host
         self.port = port
         self.database = database
         self.user = user
         self.password = password
+        self.sslmode = sslmode
         # Optional schema or comma-separated list of schemas
         self.schema = schema
         self._schemas = []
@@ -53,7 +55,7 @@ class PostgresqlClient(DataSourceClient):
         """Yield a connection to a Postgres db."""
         conn = None
         try:
-            engine = get_engine(self.pg_uri)
+            engine = get_engine(self.pg_uri, connect_args={"sslmode": self.sslmode})
             conn = engine.connect()
             # Set search_path if schemas are provided
             if self._schemas:
@@ -157,6 +159,7 @@ class PostgresqlClient(DataSourceClient):
             # Materialized views are not exposed via information_schema, so fetch
             # them separately from pg_catalog and merge into the result.
             self._append_materialized_views(conn, tables, with_comments=True)
+            self._attach_foreign_keys(conn, tables)
             return list(tables.values())
 
     def _append_materialized_views(self, conn, tables: dict, with_comments: bool) -> None:
@@ -272,10 +275,25 @@ class PostgresqlClient(DataSourceClient):
 
                 # Materialized views are absent from information_schema; merge them in.
                 self._append_materialized_views(conn, tables, with_comments=False)
+                self._attach_foreign_keys(conn, tables)
                 return list(tables.values())
         except Exception as e:
             print(f"Error retrieving tables: {e}")
             return []
+
+    def _attach_foreign_keys(self, conn, tables) -> None:
+        """Populate `fks` on the tables just collected.
+
+        `name_fn` mirrors the `f"{table_schema}.{table_name}"` this client uses
+        for `Table.name` — the two must agree or downstream resolution, which is
+        an exact string match, drops every edge without complaining.
+        """
+        attach_foreign_keys(
+            conn,
+            tables,
+            self._schemas or None,
+            lambda schema, table: f"{schema}.{table}",
+        )
 
     def get_schema(self, table_id: str) -> Table:
         """This method is now obsolete. Please use get_tables() instead."""

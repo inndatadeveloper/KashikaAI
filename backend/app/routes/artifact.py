@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import re
+from collections import defaultdict as _defaultdict
 from typing import List, Dict, Any, Optional
 from io import BytesIO
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func as sa_func
 from sqlalchemy.orm import selectinload
 from lxml import html as lxml_html
 
@@ -36,6 +37,9 @@ from app.services.artifact_codegen import (
     generate_scaffold,
     inject_section_into_code,
     is_table_type,
+    remove_injected_section,
+    restore_removed_viz_references,
+    stub_out_viz_references,
 )  # noqa: F401 — some used only in the scaffold (no-artifact) path
 from app.services.pptx_export_service import PptxExportService
 
@@ -486,6 +490,199 @@ async def export_artifact_pptx(
     )
 
 
+@router.get("/{artifact_id}/export/html")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def export_artifact_html(
+    artifact_id: str,
+    request: Request,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Export a page-mode dashboard as one standalone, fully offline HTML file.
+
+    Everything the dashboard needs — runtime, styles, chart library, data and
+    embedded media — is inlined, so the downloaded file renders with no server,
+    no network and no session. See services/html_export_service.py.
+    """
+    from urllib.parse import quote
+    from fastapi.responses import Response
+    from app.ee.audit.service import audit_service
+    from app.services.html_export_service import (
+        ExportUnavailable,
+        ascii_fallback_filename,
+        build_standalone_html,
+        suggested_filename,
+    )
+
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    if (artifact.mode or "page") != "page":
+        raise HTTPException(
+            status_code=400,
+            detail="Only dashboards can be exported as HTML",
+        )
+
+    # The export bakes in the shared Step snapshot, exactly as the PPTX and
+    # slide-preview renders do, so it is gated by the same viewer policy.
+    await _guard_rendered_artifact_for_viewer(db, artifact, current_user)
+
+    if artifact.status == "failed":
+        raise HTTPException(
+            status_code=400,
+            detail="This dashboard failed to generate. Regenerate it before exporting.",
+        )
+
+    try:
+        html = await build_standalone_html(db, artifact)
+    except ExportUnavailable as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    filename = suggested_filename(artifact)
+    # Titles are routinely non-Latin (the product ships RTL locales), and a raw
+    # non-ASCII byte in a header is invalid. Send a transliterated ASCII
+    # fallback plus the RFC 5987 form, which carries the real name wherever it
+    # is supported.
+    disposition = (
+        f'attachment; filename="{ascii_fallback_filename(filename)}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization.id,
+            action="artifact.exported",
+            user_id=current_user.id,
+            resource_type="artifact",
+            resource_id=artifact_id,
+            details={"format": "html", "title": artifact.title},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition": disposition,
+            # A dashboard snapshot must never be reused for another viewer.
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# One render per artifact at a time: each export launches a headless Chromium,
+# so concurrent clicks would stack browser instances and race on the same
+# uploads/pdfs/{artifact_id}.pdf. Mirrors the report-level lock in routes/report.py.
+_artifact_pdf_export_locks: dict[str, asyncio.Lock] = _defaultdict(asyncio.Lock)
+
+# Waiting for the lock (at most one render already in flight) plus our own
+# render. Without an outer bound a request queued behind a wedged render would
+# wait forever and the client would sit at "Exporting..." with no way to learn
+# it failed.
+_ARTIFACT_PDF_EXPORT_TIMEOUT_SECONDS = 330
+
+
+@router.get("/{artifact_id}/export/pdf")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def export_artifact_pdf(
+    artifact_id: str,
+    request: Request,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Export a dashboard, deck or document as PDF.
+
+    Same renderer the emailed dashboard share already uses
+    (ReportPdfService.generate_for_artifact -> headless Chromium over the
+    shared snapshot); this only exposes it to the owner in-app, alongside the
+    PPTX and HTML exports above. A document takes the same route: the renderer
+    prints the app's own standalone paper page for it (/print/doc), so a doc
+    exports as a document rather than through the browser's print dialog.
+    """
+    import os
+    from fastapi.responses import FileResponse
+    from app.ee.audit.service import audit_service
+    from app.core.path_safety import UnsafePathError, safe_join
+    from app.services.report_pdf_service import ReportPdfService
+
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    # The render bakes in the shared Step snapshot, exactly as the PPTX and
+    # HTML exports do, so it is gated by the same viewer policy.
+    await _guard_rendered_artifact_for_viewer(db, artifact, current_user)
+
+    if artifact.status == "failed":
+        raise HTTPException(
+            status_code=400,
+            detail="This artifact failed to generate. Regenerate it before exporting.",
+        )
+
+    async def _generate_locked() -> Optional[str]:
+        async with _artifact_pdf_export_locks[str(artifact_id)]:
+            return await ReportPdfService().generate_for_artifact(str(artifact_id))
+
+    try:
+        pdf_path = await asyncio.wait_for(
+            _generate_locked(), timeout=_ARTIFACT_PDF_EXPORT_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="PDF export timed out. Please try again.",
+        )
+
+    if not pdf_path or not os.path.isfile(pdf_path):
+        raise HTTPException(
+            status_code=409,
+            detail="PDF export is not available for this artifact",
+        )
+
+    # Defense-in-depth: generate_for_artifact builds this path from the DB
+    # artifact id under UPLOADS_DIR, never from request input. Still, rebuild
+    # the served path from that fixed root plus only the bare filename, so no
+    # directory component of the computed path can point outside the tree.
+    try:
+        safe_pdf = safe_join(ReportPdfService.UPLOADS_DIR, os.path.basename(pdf_path))
+    except UnsafePathError:
+        safe_pdf = None
+    if safe_pdf is None or not safe_pdf.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="PDF export is not available for this artifact",
+        )
+
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization.id,
+            action="artifact.exported",
+            user_id=current_user.id,
+            resource_type="artifact",
+            resource_id=artifact_id,
+            details={"format": "pdf", "title": artifact.title},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    safe_title = (artifact.title or "artifact").encode("ascii", "ignore").decode("ascii")
+    safe_title = re.sub(r'[^\w\s-]', '', safe_title).strip() or "artifact"
+    return FileResponse(
+        str(safe_pdf),
+        media_type="application/pdf",
+        filename=f"{safe_title}.pdf",
+        content_disposition_type="attachment",
+    )
+
+
 @router.get("/{artifact_id}/previews")
 @requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
 async def list_slide_previews(
@@ -561,6 +758,43 @@ async def get_slide_preview(
 
 class AddVisualizationBody(PydanticBaseModel):
     visualization_id: str
+    # The artifact the caller is looking at. Without it the operation targets
+    # the report's newest page artifact — wrong on reports holding several
+    # dashboards.
+    artifact_id: Optional[str] = None
+
+
+async def _resolve_base_artifact(db, report_id: str, artifact_id: Optional[str]):
+    """The artifact an add/remove builds its new version on: the explicitly
+    named one (must belong to this report), else the report's latest."""
+    if artifact_id:
+        base = await service.get(db, artifact_id)
+        if not base or str(base.report_id) != str(report_id):
+            raise HTTPException(status_code=404, detail="Artifact not found in this report")
+        # Only page dashboards: docs carry markdown (versioning one through
+        # the code-rewriting paths would wipe it), and slides only render
+        # <section class="slide"> blocks — an injected card would be
+        # invisible there.
+        if base.mode != "page":
+            raise HTTPException(
+                status_code=400,
+                detail="Queries can only be added to or removed from dashboard artifacts",
+            )
+        return base
+    return await service.get_latest_by_report(db, report_id)
+
+
+async def _next_artifact_version(db, report_id: str) -> int:
+    """Report-wide next version number. Basing on max(version) — not the
+    base artifact's own version — keeps numbers unique when a new version
+    is built on an artifact that is not the newest."""
+    res = await db.execute(
+        select(sa_func.max(ArtifactModel.version)).where(
+            ArtifactModel.report_id == str(report_id),
+            ArtifactModel.deleted_at.is_(None),
+        )
+    )
+    return (res.scalar() or 0) + 1
 
 
 @router.post("/report/{report_id}/add-visualization", response_model=ArtifactSchema)
@@ -607,8 +841,9 @@ async def add_visualization_to_dashboard(
     data_model = step.data_model
     viz_title = viz.title or step.title or "Untitled"
 
-    # 3. Fetch latest artifact for this report
-    latest = await service.get_latest_by_report(db, report_id)
+    # 3. Fetch the artifact this add builds on (the one the caller is
+    # looking at, else the report's latest)
+    latest = await _resolve_base_artifact(db, report_id, body.artifact_id)
 
     if latest:
         # Check for duplicate
@@ -619,7 +854,12 @@ async def add_visualization_to_dashboard(
         viz_index = len(existing_viz_ids)
 
         existing_code = (latest.content or {}).get("code", "")
-        new_code = inject_section_into_code(existing_code, viz_title, data_model, viz_index)
+        # A previous remove may have left this viz's original section in
+        # place, stubbed and tagged. Restoring the binding relights that
+        # card where it was — instead of appending a duplicate at the bottom.
+        new_code = restore_removed_viz_references(existing_code, body.visualization_id)
+        if new_code is None:
+            new_code = inject_section_into_code(existing_code, viz_title, data_model, viz_index)
         if new_code is None:
             raise HTTPException(
                 status_code=400,
@@ -628,7 +868,8 @@ async def add_visualization_to_dashboard(
             )
 
         new_viz_ids = existing_viz_ids + [body.visualization_id]
-        new_content = {"code": new_code, "visualization_ids": new_viz_ids}
+        # Spread first: whatever else content carries survives the rewrite
+        new_content = {**(latest.content or {}), "code": new_code, "visualization_ids": new_viz_ids}
 
         # Create new version
         new_artifact = ArtifactModel(
@@ -639,7 +880,7 @@ async def add_visualization_to_dashboard(
             mode=latest.mode,
             content=new_content,
             generation_prompt=latest.generation_prompt,
-            version=latest.version + 1,
+            version=await _next_artifact_version(db, report_id),
             status="completed",
         )
         db.add(new_artifact)
@@ -670,6 +911,68 @@ async def add_visualization_to_dashboard(
         await db.refresh(new_artifact)
 
     # 4. Trigger thumbnail regeneration in background
+    try:
+        from app.services.thumbnail_service import ThumbnailService
+        asyncio.create_task(ThumbnailService().regenerate_for_report(report_id))
+    except Exception:
+        logger.warning("Failed to schedule thumbnail regeneration", exc_info=True)
+
+    return ArtifactSchema.model_validate(new_artifact)
+
+
+@router.post("/report/{report_id}/remove-visualization", response_model=ArtifactSchema)
+@requires_permission('update_reports', model=ReportModel, owner_only=True)
+async def remove_visualization_from_dashboard(
+    report_id: str,
+    body: AddVisualizationBody,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Detach a visualization from the dashboard artifact (inverse of
+    add-visualization). Creates a new artifact version; the query itself is
+    untouched and can be re-added later.
+
+    Code handling: positional ``viz[N]`` references are first migrated to
+    id-keyed ``vizById()`` (deterministic codemod) so dropping an id never
+    re-points the remaining sections at the wrong dataset. The
+    programmatically injected section for this viz is stripped; any other
+    remaining reference to it is replaced with an empty-data stub TAGGED
+    with the viz id, so the page keeps rendering and a later re-add can
+    restore the original binding in place.
+    """
+    from app.ai.tools.implementations._artifact_refs import migrate_positional_viz_refs
+
+    latest = await _resolve_base_artifact(db, report_id, body.artifact_id)
+    if not latest:
+        raise HTTPException(status_code=404, detail="No dashboard artifact for this report")
+
+    existing_viz_ids = (latest.content or {}).get("visualization_ids", [])
+    if body.visualization_id not in existing_viz_ids:
+        raise HTTPException(status_code=404, detail="Visualization is not on the dashboard")
+
+    code = (latest.content or {}).get("code", "") or ""
+    # Freeze bindings against the current order before the list shrinks
+    code, _ = migrate_positional_viz_refs(code, existing_viz_ids)
+    code = remove_injected_section(code, body.visualization_id)
+    code = stub_out_viz_references(code, body.visualization_id)
+
+    new_viz_ids = [v for v in existing_viz_ids if v != body.visualization_id]
+    new_artifact = ArtifactModel(
+        report_id=str(latest.report_id),
+        user_id=str(current_user.id),
+        organization_id=str(latest.organization_id),
+        title=latest.title,
+        mode=latest.mode,
+        content={**(latest.content or {}), "code": code, "visualization_ids": new_viz_ids},
+        generation_prompt=latest.generation_prompt,
+        version=await _next_artifact_version(db, report_id),
+        status="completed",
+    )
+    db.add(new_artifact)
+    await db.commit()
+    await db.refresh(new_artifact)
+
     try:
         from app.services.thumbnail_service import ThumbnailService
         asyncio.create_task(ThumbnailService().regenerate_for_report(report_id))

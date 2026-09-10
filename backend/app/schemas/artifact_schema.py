@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Literal
 from datetime import datetime
 
@@ -42,9 +42,24 @@ class ArtifactCreate(ArtifactBase):
 
 class ArtifactUpdate(BaseModel):
     """Schema for updating an existing artifact."""
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=255)
     content: Optional[dict] = None
     generation_prompt: Optional[str] = None
+
+    @field_validator("title")
+    @classmethod
+    def _title_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        # A rename from the UI must never leave the dashboard nameless: the
+        # column is nullable and the service writes whatever it gets, so an
+        # empty/whitespace title would render as a blank dropdown label and
+        # a blank browser tab on the share page. Omitting the field (None)
+        # still means "leave the title alone".
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("title must not be blank")
+        return v
 
 
 class ArtifactSchema(ArtifactBase):
@@ -60,6 +75,26 @@ class ArtifactSchema(ArtifactBase):
     status: str = "completed"
     created_at: datetime
     updated_at: datetime
+    # Which of content.visualization_ids the page code actually renders.
+    # Membership in visualization_ids only means "attached to the dashboard";
+    # a viz whose id the code never binds silently disappears from the page —
+    # this is how clients tell the two states apart.
+    used_visualization_ids: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _compute_used_visualization_ids(self):
+        content = self.content or {}
+        viz_ids = [str(v) for v in (content.get("visualization_ids") or [])]
+        code = content.get("code")
+        if code is None:
+            # doc/slides content has no page code to scan — every member counts
+            self.used_visualization_ids = viz_ids
+        else:
+            # Lazy: importing the tools package at module load would drag in
+            # every tool implementation (and risk cycles)
+            from app.ai.tools.implementations._artifact_refs import referenced_viz_ids
+            self.used_visualization_ids = referenced_viz_ids(code, viz_ids)
+        return self
 
     class Config:
         from_attributes = True

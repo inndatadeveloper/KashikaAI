@@ -8,14 +8,16 @@ from app.models.llm_model import LLMModel
 from app.models.organization import Organization
 from app.models.user import User
 from app.settings.config import settings
-from app.models.llm_provider import LLM_PROVIDER_DETAILS
-from app.models.llm_model import LLM_MODEL_DETAILS
+from app.models.llm_provider import LLM_PROVIDER_DETAILS, EDITABLE_MODEL_ID_PROVIDER_TYPES
+from app.models.llm_model import LLM_MODEL_DETAILS, DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW
 from app.schemas.llm_schema import AnthropicCredentials, OpenAICredentials, GoogleCredentials, LLMModelSchema, LLMProviderCreate, LLMProviderTestConnection
 from app.ai.llm.llm import LLM
+from app.ai.llm.header_injection import validate_header_config
 from app.dependencies import async_session_maker
 from datetime import datetime
 from app.core.telemetry import telemetry
 from app.ee.audit.service import audit_service
+from app.errors import AppError, ErrorCode
 from app.settings.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -254,7 +256,10 @@ class LLMService:
                 row.is_small_default = False
 
         row = LLMModel(
-            name=model.name or model.model_id,
+            # Display name is user-supplied for custom models; blank falls back
+            # to the model_id (the column is NOT NULL). See update_model for the
+            # rename path and why presets don't get one.
+            name=(model.name or "").strip() or model.model_id,
             model_id=model.model_id,
             provider_id=provider.id,
             organization_id=organization.id,
@@ -272,7 +277,14 @@ class LLMService:
             max_output_tokens=getattr(model, "max_output_tokens", None),
             input_cost_per_million_tokens_usd=getattr(model, "input_cost_per_million_tokens_usd", None),
             output_cost_per_million_tokens_usd=getattr(model, "output_cost_per_million_tokens_usd", None),
+            # Model-specific config (e.g. an explicit sampling temperature) —
+            # update_model already accepts and merges this; creation should too.
+            config=dict(getattr(model, "config", None) or {}) or None,
         )
+        # Same NULL-window guard as _create_models: a custom model with no
+        # explicit size gets the conservative default, never NULL.
+        if row.is_custom and row.context_window_tokens is None:
+            row.context_window_tokens = DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW
         db.add(row)
         await db.commit()
         await db.refresh(row)
@@ -286,17 +298,65 @@ class LLMService:
         model_id: str,
         model_data,
     ) -> LLMModel:
-        """Update a model's editable fields (name, config).
+        """Update a model's editable fields (name, model_id, config).
 
         Like create_model, the route PATCH /llm/models/{model_id} predates the
         implementation — it used to 500 with AttributeError. Config keys are
         merged (not replaced) so e.g. routing_hint survives an unrelated update.
+
+        Renaming is limited to custom models on purpose. A preset's name is
+        catalog-owned: _apply_catalog_model_details reassigns it from
+        LLM_MODEL_DETAILS on every _sync_provider_with_latest_models pass, which
+        get_models runs on each models-list load — so a preset rename would be
+        silently reverted within seconds. Rejecting it is honest; accepting it
+        would look like it worked. A blank name resets a custom model back to
+        its model_id rather than violating the NOT NULL column.
+
+        Editing model_id is narrower still: only a custom model on an
+        EDITABLE_MODEL_ID_PROVIDER_TYPES provider, where the id names something
+        the admin created (an Azure deployment, a Bedrock model/inference
+        profile, a self-hosted model) rather than a catalog entry. Elsewhere the
+        id is the catalog key that _apply_catalog_model_details matches on, so
+        changing it would silently detach the row from its pricing and context
+        window. Both fields are applied against the pre-update model_id, so a
+        single request can rename and re-point a model at once.
         """
         model = await self._get_owned_model(db, organization, model_id)
 
         data = model_data.dict(exclude_unset=True)
-        if data.get("name"):
-            model.name = data["name"]
+        new_model_id = None
+        if "model_id" in data:
+            new_model_id = await self._validated_new_model_id(db, organization, model, data["model_id"])
+        if "name" in data:
+            if not model.is_custom:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Only custom models can be renamed; preset names come from the model catalog",
+                )
+            model.name = (data["name"] or "").strip() or (new_model_id or model.model_id)
+        if new_model_id is not None:
+            # A custom model created without a display name got its model_id as
+            # the name (see create_model). Keep that fallback in sync instead of
+            # leaving the row labelled with the id it no longer uses — unless
+            # this request also set a name, which wins.
+            if "name" not in data and model.name == model.model_id:
+                model.name = new_model_id
+            model.model_id = new_model_id
+            # Re-pointing the id is the remedy for a deployment name that does
+            # not resolve, and that failure classifies as model_not_found, which
+            # opens a *sticky* fallback breaker keyed by this row's db id — an id
+            # the edit leaves untouched. Clear it here so the corrected model is
+            # eligible again at once, rather than being skipped as a fallback or
+            # routing candidate for the remainder of the cooldown, which reads
+            # from the admin's side as the fix not having taken.
+            try:
+                from app.ai.llm.fallback import breaker as _breaker
+                _breaker.clear_model(str(model.id))
+            except Exception:
+                logger.warning(
+                    "Failed to clear fallback breaker after model_id edit: model=%s",
+                    model.id, exc_info=True,
+                )
         if data.get("config") is not None:
             # Reassign (not mutate) so SQLAlchemy detects the JSON change.
             model.config = {**dict(model.config or {}), **data["config"]}
@@ -374,6 +434,52 @@ class LLMService:
             if not await user_can_use_model(db, current_user.id, organization.id, model):
                 raise HTTPException(status_code=403, detail="You do not have access to this model")
         return model
+
+    async def _validated_new_model_id(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        model: LLMModel,
+        raw_model_id,
+    ) -> "str | None":
+        """Vet a requested model_id change, returning None when it is a no-op.
+
+        Guards mirror create_model: non-blank, and unique among the live models
+        of the same provider (the pair is what create_model rejects duplicates
+        on, so an edit must not be able to sneak past it).
+        """
+        candidate = (raw_model_id or "").strip()
+        if not candidate:
+            raise AppError.bad_request(
+                ErrorCode.LLM_MODEL_ID_REQUIRED, "Model ID cannot be empty"
+            )
+        if candidate == model.model_id:
+            return None
+
+        provider = await db.get(LLMProvider, model.provider_id) if model.provider_id else None
+        provider_type = getattr(provider, "provider_type", None)
+        if not model.is_custom or provider_type not in EDITABLE_MODEL_ID_PROVIDER_TYPES:
+            raise AppError.bad_request(
+                ErrorCode.LLM_MODEL_ID_NOT_EDITABLE,
+                "Only custom models on Azure, AWS Bedrock or custom (OpenAI-compatible) "
+                "providers can have their model ID edited",
+            )
+
+        dup = (await db.execute(
+            select(LLMModel)
+            .filter(LLMModel.organization_id == organization.id)
+            .filter(LLMModel.provider_id == model.provider_id)
+            .filter(LLMModel.model_id == candidate)
+            .filter(LLMModel.id != model.id)
+            .filter(LLMModel.deleted_at == None)  # noqa: E711
+        )).unique().scalars().first()
+        if dup is not None:
+            raise AppError.conflict(
+                ErrorCode.LLM_MODEL_ID_DUPLICATE,
+                f"Model '{candidate}' already exists on this provider",
+                model_id=candidate,
+            )
+        return candidate
 
     async def _get_owned_model(
         self,
@@ -720,12 +826,19 @@ class LLMService:
         )
         providers = providers.unique().scalars().all()
 
-        # Sync new models for each provider
+        # Sync every provider whose provider_type has catalog entries, so a
+        # deployment upgrade's new catalog models reach existing orgs on the
+        # next models-list load — customer-created (bring-your-own-key)
+        # providers included, not just BOW-managed preset ones. Provider types
+        # with no catalog (the OpenAI-compatible "custom" type) have nothing
+        # to sync from and are skipped entirely.
+        catalog_provider_types = {m["provider_type"] for m in LLM_MODEL_DETAILS}
         for provider in providers:
-            # Only auto-sync preset providers with our curated catalog.
-            # Custom (non-preset) providers should respect the user's explicit selections.
-            if provider.is_preset:
-                await self._sync_provider_with_latest_models(db, provider, organization)
+            if provider.is_preset or provider.provider_type in catalog_provider_types:
+                await self._sync_provider_with_latest_models(
+                    db, provider, organization,
+                    customer_managed=not provider.is_preset,
+                )
 
         await db.commit()
 
@@ -1001,6 +1114,60 @@ class LLMService:
 
         return {"success": True}
 
+    async def set_temperature(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        model_id: str,
+        temperature: float | None,
+    ):
+        """Set (or clear) a model's explicit sampling temperature.
+
+        Stored on ``LLMModel.config['temperature']`` and merged so other config
+        keys (e.g. routing_hint) are preserved. None clears the override — the
+        client then sends no temperature parameter at all and the endpoint's own
+        default applies, which is the only universally safe behavior (a growing
+        set of models rejects any non-default temperature with a 400).
+        """
+        if temperature is not None and not (0.0 <= temperature <= 2.0):
+            raise HTTPException(status_code=400, detail="Temperature must be between 0 and 2")
+
+        model = await db.execute(
+            select(LLMModel).join(LLMProvider).filter(
+                LLMModel.id == model_id,
+                LLMProvider.organization_id == organization.id,
+            )
+        )
+        model = model.scalar_one_or_none()
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        cfg = dict(model.config or {})
+        if temperature is not None:
+            cfg["temperature"] = temperature
+        else:
+            cfg.pop("temperature", None)
+        # Reassign (not mutate) so SQLAlchemy detects the JSON change.
+        model.config = cfg
+        await db.commit()
+
+        logger.info(
+            "LLM model temperature set: id=%s, model_id=%s, temperature=%s, org_id=%s",
+            model.id, model.model_id, temperature, organization.id,
+        )
+        try:
+            await audit_service.log(
+                db=db, organization_id=str(organization.id),
+                action="llm_model.temperature_set", user_id=str(current_user.id),
+                resource_type="llm_model", resource_id=str(model.id),
+                details={"model_id": model.model_id, "temperature": temperature},
+            )
+        except Exception:
+            pass
+
+        return {"success": True, "temperature": temperature}
+
     async def set_context_window(
         self,
         db: AsyncSession,
@@ -1046,6 +1213,10 @@ class LLMService:
             )
             if catalog and catalog.get("context_window_tokens") is not None:
                 model.context_window_tokens = catalog["context_window_tokens"]
+            elif model.is_custom and model.context_window_tokens is None:
+                # Clearing the override on a custom model must not reintroduce
+                # a NULL window — fall back to the same default used at creation.
+                model.context_window_tokens = DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW
         await db.commit()
 
         logger.info("LLM model context window set: id=%s, name=%s, model_id=%s, context_window_tokens=%s, override=%s, org_id=%s", model.id, model.name, model.model_id, model.context_window_tokens, tokens, organization.id)
@@ -1096,9 +1267,13 @@ class LLMService:
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
 
+        # Store the admin's rate as an override (so catalog re-syncs never
+        # revert it) and as the resolved value everything else reads.
         if input_cost is not None:
+            model.input_cost_per_million_tokens_usd_override = float(input_cost)
             model.input_cost_per_million_tokens_usd = float(input_cost)
         if output_cost is not None:
+            model.output_cost_per_million_tokens_usd_override = float(output_cost)
             model.output_cost_per_million_tokens_usd = float(output_cost)
         await db.commit()
 
@@ -1352,7 +1527,15 @@ class LLMService:
             db_model.organization_id = organization.id
             db_model.provider = provider
             db_model.is_custom = model.get("is_custom", False)
-            
+            # A custom model's name is whatever the admin typed in the provider
+            # dialog. Blank (or a client that omits it entirely) falls back to
+            # the model_id — `name` is NOT NULL, so without this an API caller
+            # that sends only a model_id gets an IntegrityError. The catalog
+            # branch below can still upgrade a *nameless* custom model to the
+            # catalog's nicer label; an explicit name always wins.
+            if db_model.is_custom:
+                db_model.name = (model.get("name") or "").strip() or model["model_id"]
+
             # Check if this model would be default according to config
             model_details = _catalog_details(model)
 
@@ -1410,9 +1593,15 @@ class LLMService:
                 if model_details.get("max_output_tokens") is not None:
                     db_model.max_output_tokens = model_details["max_output_tokens"]
                 if model_details.get("input_cost_per_million_tokens_usd") is not None:
-                    db_model.input_cost_per_million_tokens_usd = model_details["input_cost_per_million_tokens_usd"]
+                    db_model.input_cost_per_million_tokens_usd = self._resolve_cost(
+                        db_model.input_cost_per_million_tokens_usd_override,
+                        model_details["input_cost_per_million_tokens_usd"],
+                    )
                 if model_details.get("output_cost_per_million_tokens_usd") is not None:
-                    db_model.output_cost_per_million_tokens_usd = model_details["output_cost_per_million_tokens_usd"]
+                    db_model.output_cost_per_million_tokens_usd = self._resolve_cost(
+                        db_model.output_cost_per_million_tokens_usd_override,
+                        model_details["output_cost_per_million_tokens_usd"],
+                    )
                 db_model.supports_vision = self._resolve_supports_vision(
                     vision_override, model_details.get("supports_vision", False)
                 )
@@ -1452,6 +1641,11 @@ class LLMService:
             # A non-null context-window override always wins over catalog/user values.
             if cw_override is not None:
                 db_model.context_window_tokens = int(cw_override)
+            # Custom model, no catalog match, no user/admin size: assume a
+            # conservative default rather than leaving the window NULL (which
+            # silently degrades every window-derived budget downstream).
+            if db_model.is_custom and db_model.context_window_tokens is None:
+                db_model.context_window_tokens = DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW
 
             db.add(db_model)
 
@@ -1479,6 +1673,31 @@ class LLMService:
                 elif credentials.get("endpoint_url") is None or credentials.get("endpoint_url") == "":
                     # Explicitly clear endpoint_url when set to empty/null
                     existing_additional_config.pop("endpoint_url", None)
+
+            # Entra ID auth: auth_mode + service-principal identifiers are
+            # non-secret → additional_config; the client_secret is a secret and
+            # rides the encrypted api_secret slot (api_key keeps the API key so
+            # switching modes doesn't lose either credential).
+            if "auth_mode" in credentials:
+                raw_auth_mode = credentials.get("auth_mode")
+                auth_mode = raw_auth_mode.lower() if isinstance(raw_auth_mode, str) else raw_auth_mode
+                allowed_auth_modes = {"api_key", "entra_client_secret", "entra_default"}
+                if auth_mode not in allowed_auth_modes:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid auth_mode for Azure provider: {raw_auth_mode!r}. "
+                               f"Allowed values are: {', '.join(sorted(allowed_auth_modes))}."
+                    )
+                existing_additional_config = { **existing_additional_config, "auth_mode": auth_mode }
+            for entra_field in ("tenant_id", "client_id"):
+                if entra_field in credentials:
+                    value = credentials.get(entra_field)
+                    if value:
+                        existing_additional_config = { **existing_additional_config, entra_field: value }
+                    else:
+                        existing_additional_config.pop(entra_field, None)
+            if credentials.get("client_secret"):
+                api_secret = credentials["client_secret"]
 
         # OpenAI: base_url (optional)
         if provider.provider_type == "openai":
@@ -1550,6 +1769,29 @@ class LLMService:
                 api_key = credentials["aws_access_key_id"]
             if credentials.get("aws_secret_access_key"):
                 api_secret = credentials["aws_secret_access_key"]
+
+        # All providers: custom outbound headers + per-user identity forwarding
+        # (non-secret → additional_config, mirroring MCP connections). Present
+        # keys replace the stored value; empty clears it.
+        if "headers" in credentials or "header_injection" in credentials:
+            try:
+                clean_headers, clean_rules = validate_header_config(
+                    credentials.get("headers") if "headers" in credentials
+                    else existing_additional_config.get("headers"),
+                    [r.dict() if hasattr(r, "dict") else r for r in credentials.get("header_injection") or []]
+                    if "header_injection" in credentials
+                    else existing_additional_config.get("header_injection"),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if clean_headers:
+                existing_additional_config = { **existing_additional_config, "headers": clean_headers }
+            else:
+                existing_additional_config.pop("headers", None)
+            if clean_rules:
+                existing_additional_config = { **existing_additional_config, "header_injection": clean_rules }
+            else:
+                existing_additional_config.pop("header_injection", None)
         provider.additional_config = existing_additional_config if existing_additional_config else None
 
         # Only (re-)encrypt credentials when a new key/secret is provided
@@ -1611,7 +1853,11 @@ class LLMService:
                 if not db_model:
                     raise HTTPException(status_code=404, detail="Model not found")
 
-                # Update fields that can be changed
+                # Update fields that can be changed. Note `name` is deliberately
+                # NOT among them: the provider dialog echoes back whatever name
+                # it loaded, so honoring it here would let a stale dialog undo a
+                # rename made through PATCH /llm/models/{id}. Renames go through
+                # update_model only; this path just leaves the stored name alone.
                 if db_model.is_enabled != model.is_enabled:
                     db_model.is_enabled = model.is_enabled
                     db.add(db_model)
@@ -1639,9 +1885,15 @@ class LLMService:
                         if catalog.get("max_output_tokens") is not None:
                             db_model.max_output_tokens = catalog["max_output_tokens"]
                         if catalog.get("input_cost_per_million_tokens_usd") is not None:
-                            db_model.input_cost_per_million_tokens_usd = catalog["input_cost_per_million_tokens_usd"]
+                            db_model.input_cost_per_million_tokens_usd = self._resolve_cost(
+                                db_model.input_cost_per_million_tokens_usd_override,
+                                catalog["input_cost_per_million_tokens_usd"],
+                            )
                         if catalog.get("output_cost_per_million_tokens_usd") is not None:
-                            db_model.output_cost_per_million_tokens_usd = catalog["output_cost_per_million_tokens_usd"]
+                            db_model.output_cost_per_million_tokens_usd = self._resolve_cost(
+                                db_model.output_cost_per_million_tokens_usd_override,
+                                catalog["output_cost_per_million_tokens_usd"],
+                            )
                     catalog_vision = catalog.get("supports_vision", False) if catalog else db_model.supports_vision
                     db_model.supports_vision = self._resolve_supports_vision(
                         db_model.supports_vision_override, catalog_vision
@@ -2114,6 +2366,13 @@ class LLMService:
         return catalog_value
 
     @staticmethod
+    def _resolve_cost(override, catalog_value):
+        """Effective per-million-token USD cost: a non-null admin override always wins over the catalog."""
+        if override is not None:
+            return float(override)
+        return catalog_value
+
+    @staticmethod
     def _apply_catalog_model_details(model: LLMModel, model_data: dict, *, sync_enabled: bool = False) -> None:
         model.name = model_data["name"]
         model.is_preset = model_data.get("is_preset", True)
@@ -2131,29 +2390,57 @@ class LLMService:
         )
         if "max_output_tokens" in model_data:
             model.max_output_tokens = model_data.get("max_output_tokens")
-        model.input_cost_per_million_tokens_usd = model_data.get("input_cost_per_million_tokens_usd")
-        model.output_cost_per_million_tokens_usd = model_data.get("output_cost_per_million_tokens_usd")
+        # Same for pricing: an admin-corrected rate survives catalog re-syncs.
+        model.input_cost_per_million_tokens_usd = LLMService._resolve_cost(
+            getattr(model, "input_cost_per_million_tokens_usd_override", None),
+            model_data.get("input_cost_per_million_tokens_usd"),
+        )
+        model.output_cost_per_million_tokens_usd = LLMService._resolve_cost(
+            getattr(model, "output_cost_per_million_tokens_usd_override", None),
+            model_data.get("output_cost_per_million_tokens_usd"),
+        )
 
     async def _sync_provider_with_latest_models(
         self,
         db: AsyncSession,
         provider: LLMProvider,
-        organization: Organization
+        organization: Organization,
+        customer_managed: bool = False,
     ):
-        """Sync a provider with the latest models from LLM_MODEL_DETAILS"""
+        """Sync a provider with the latest models from LLM_MODEL_DETAILS.
+
+        ``customer_managed`` marks a bring-your-own-key provider the admin
+        created and curates. The catalog is still the source of truth for
+        model *metadata* and for which models exist, but the admin's choices
+        win over the catalog's opinions:
+          - a model the admin disabled stays disabled (no enabled-state sync),
+          - a model the admin deleted stays deleted (tombstones honored),
+          - the org's default/small-default models are never re-pointed —
+            except as a safety net when the org would otherwise be left with
+            no enabled default at all (e.g. its default model id was retired
+            from the catalog).
+        New catalog models are added enabled for both kinds of provider.
+        """
         available_models = [
-            model for model in LLM_MODEL_DETAILS 
+            model for model in LLM_MODEL_DETAILS
             if model["provider_type"] == provider.provider_type
         ]
         catalog_by_id = {model["model_id"]: model for model in available_models}
 
-        existing_models = await db.execute(
+        all_rows = (await db.execute(
             select(LLMModel)
             .filter(LLMModel.provider_id == provider.id)
-            .filter(LLMModel.deleted_at == None)
-        )
-        provider_models = existing_models.unique().scalars().all()
+        )).unique().scalars().all()
+        provider_models = [m for m in all_rows if m.deleted_at is None]
         existing_by_id = {model.model_id: model for model in provider_models}
+        # On customer-managed providers a soft-deleted row is a tombstone: the
+        # admin removed that model on purpose, so the add-missing pass below
+        # must not resurrect it. Preset (BOW-managed) providers keep the
+        # historical recreate-anything-missing behavior.
+        blocked_ids = (
+            {m.model_id for m in all_rows if m.deleted_at is not None}
+            if customer_managed else set()
+        )
 
         provider_had_default = any(model.is_default for model in provider_models)
         provider_had_small_default = any(model.is_small_default for model in provider_models)
@@ -2162,30 +2449,48 @@ class LLMService:
             model_data = catalog_by_id.get(model.model_id)
             if not model.is_preset:
                 continue
-            # Preset row whose id left the catalog: the provider retired the
-            # model, so every call to it is a permanent 404 that no retry or
-            # fallback can heal. Disable it and surrender the default flags —
-            # the promotion below then moves the org onto the catalog's current
-            # default instead of leaving it pinned to a dead id. Custom models
-            # (skipped above) stay untouched; the row itself is kept so history
-            # and usage records still resolve.
+            # Preset row whose id left the catalog. On a BOW-managed preset
+            # provider the catalog is an exhaustive mirror, so a missing id
+            # means the provider retired the model and every call to it is a
+            # permanent 404 that no retry or fallback can heal: disable it and
+            # surrender the default flags — the promotion below then moves the
+            # org onto the catalog's current default instead of leaving it
+            # pinned to a dead id. On a customer-managed provider the catalog
+            # is only a curated subset — ids that fell out of it (e.g. older
+            # dated Anthropic snapshots) are usually still perfectly valid at
+            # the provider, and force-disabling them on every models-list load
+            # would silently revert the admin's enable toggle forever. Leave
+            # those rows exactly as the admin set them. Custom models (skipped
+            # above) stay untouched; the row itself is kept so history and
+            # usage records still resolve.
             if not model_data:
+                if customer_managed:
+                    continue
                 model.is_enabled = False
                 model.is_default = False
                 model.is_small_default = False
                 db.add(model)
                 continue
 
-            self._apply_catalog_model_details(model, model_data, sync_enabled=True)
-            if not model_data.get("is_default", False) or not model.is_enabled:
-                model.is_default = False
-            if not model_data.get("is_small_default", False) or not model.is_enabled:
-                model.is_small_default = False
+            # Customer-managed: refresh catalog metadata but never sync the
+            # enabled flag (the admin's on/off choices stand) and never strip
+            # the admin's default flags to match catalog opinion.
+            self._apply_catalog_model_details(model, model_data, sync_enabled=not customer_managed)
+            if not customer_managed:
+                if not model_data.get("is_default", False) or not model.is_enabled:
+                    model.is_default = False
+                if not model_data.get("is_small_default", False) or not model.is_enabled:
+                    model.is_small_default = False
             db.add(model)
 
-        # Add any missing models
+        # Add any missing models. On customer-managed providers only usable
+        # (catalog-enabled) models are added — a catalog entry that ships
+        # disabled would just clutter the admin's curated list with a dead row.
+        # Preset providers keep the full catalog mirror.
         for model_data in available_models:
-            if model_data["model_id"] not in existing_by_id:
+            if customer_managed and not model_data.get("is_enabled", True):
+                continue
+            if model_data["model_id"] not in existing_by_id and model_data["model_id"] not in blocked_ids:
                 model = LLMModel(
                     name=model_data["name"],
                     model_id=model_data["model_id"],
@@ -2220,7 +2525,14 @@ class LLMService:
         )
         desired_default = existing_by_id.get(default_data["model_id"]) if default_data else None
         has_enabled_default = any(model.is_default and model.is_enabled for model in org_models)
-        if desired_default and desired_default.is_enabled and (provider_had_default or not has_enabled_default):
+        # Customer-managed providers never have their default re-pointed to the
+        # catalog's pick — promotion runs only as a safety net when the org has
+        # no enabled default left (e.g. its default's model id was retired).
+        default_promotion_allowed = (
+            (not has_enabled_default) if customer_managed
+            else (provider_had_default or not has_enabled_default)
+        )
+        if desired_default and desired_default.is_enabled and default_promotion_allowed:
             for model in org_models:
                 model.is_default = False
                 db.add(model)
@@ -2233,7 +2545,11 @@ class LLMService:
         )
         desired_small_default = existing_by_id.get(small_default_data["model_id"]) if small_default_data else None
         has_enabled_small_default = any(model.is_small_default and model.is_enabled for model in org_models)
-        if desired_small_default and desired_small_default.is_enabled and (provider_had_small_default or not has_enabled_small_default):
+        small_default_promotion_allowed = (
+            (not has_enabled_small_default) if customer_managed
+            else (provider_had_small_default or not has_enabled_small_default)
+        )
+        if desired_small_default and desired_small_default.is_enabled and small_default_promotion_allowed:
             for model in org_models:
                 model.is_small_default = False
                 db.add(model)

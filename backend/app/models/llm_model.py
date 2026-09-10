@@ -2,7 +2,35 @@ from sqlalchemy import Column, String, JSON, ForeignKey, Boolean, Integer, Float
 from sqlalchemy.orm import relationship
 from app.models.base import BaseSchema
 
+# Assumed context window for a custom model whose model_id matches nothing in
+# the catalog and whose admin set no explicit size. A NULL window quietly
+# degrades every window-derived budget (prompt trim, compaction thresholds,
+# transcript decay, fallback candidate selection), so custom models get a
+# default instead; admins can adjust it per model in settings. 200k matches
+# DEFAULT_TOKEN_BUDGET (context trim) and the compaction service's assumed
+# window, and is a safe middle ground: most hosted models are ≥200k, and if
+# the real window is smaller the overflow handler's budget-shrink retry now
+# converges after one rejected call.
+DEFAULT_CUSTOM_MODEL_CONTEXT_WINDOW = 200_000
+
 LLM_MODEL_DETAILS = [
+    {
+        # https://developers.openai.com/api/docs/models/gpt-6-astra
+        "name": "GPT-6 Astra",
+        "model_id": "gpt-6-astra",
+        "provider_type": "openai",
+        "is_preset": True,
+        "is_enabled": True,
+        # Selectable, but not the default: Astra is ~4x Terra's input price and
+        # 3.3x its output price, so switching every org's default on upgrade is
+        # a cost decision, not a catalog one.
+        "is_default": False,
+        "supports_vision": True,
+        "context_window_tokens": 1050000,
+        "max_output_tokens": 128000,
+        "input_cost_per_million_tokens_usd": 10.00,
+        "output_cost_per_million_tokens_usd": 50.00
+    },
     {
         "name": "GPT-5.6 Sol",
         "model_id": "gpt-5.6-sol",
@@ -257,6 +285,12 @@ class LLMModel(BaseSchema):
     # Pricing (USD per million tokens)
     input_cost_per_million_tokens_usd = Column(Float, nullable=True)
     output_cost_per_million_tokens_usd = Column(Float, nullable=True)
+    # Manual admin pricing overrides. NULL = follow the catalog (LLM_MODEL_DETAILS);
+    # a value = admin-set via the pricing endpoint (e.g. a negotiated or corrected
+    # rate), persisted across catalog re-syncs. The two columns above stay the
+    # resolved values the cost console and Auto-router savings math read.
+    input_cost_per_million_tokens_usd_override = Column(Float, nullable=True)
+    output_cost_per_million_tokens_usd_override = Column(Float, nullable=True)
     
     provider_id = Column(String, ForeignKey('llm_providers.id'), nullable=False)
     provider = relationship("LLMProvider", back_populates="models", lazy="selectin")

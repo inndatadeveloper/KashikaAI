@@ -5,7 +5,7 @@ import json
 from types import SimpleNamespace
 from typing import Optional, List, Dict, Any
 
-from sqlalchemy import and_, bindparam, func, select, text
+from sqlalchemy import and_, bindparam, func, null, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import lazyload
 
@@ -19,7 +19,9 @@ from app.models.mention import Mention, MentionType
 from app.models.file import File
 from app.models.data_source import DataSource
 from app.models.datasource_table import DataSourceTable
+from app.ee.encryption import envelope_marker_sql
 from app.models.tool_execution import ToolExecution
+from app.models.agent_execution import AgentExecution
 from app.ai.context.session_events import (
     EVENT_ROLE,
     is_event_kind_llm_visible,
@@ -29,6 +31,15 @@ from app.ai.context.summary_write_through import (
     TERMINAL_TOOL_EXECUTION_STATUSES,
     persist_tool_context_projections,
 )
+from app.ai.persisted_summary import (
+    TOOL_CONTEXT_KIND_FIELD,
+    TOOL_CONTEXT_OBSERVATION_KIND,
+    tool_context_for_replay,
+)
+
+
+_COMPACTION_OBSERVATION_MAX_CHARS_PER_TOOL = 3_000
+_COMPACTION_OBSERVATION_MAX_CHARS_TOTAL = 24_000
 
 
 def _json_value(value: Any) -> Any:
@@ -44,11 +55,102 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _compaction_observation_text(tool_execution: Any) -> str:
+    """Bound the exact observation for the background rolling summarizer.
+
+    Only new, explicitly tagged snapshots qualify. Historical result
+    projections and row-heavy specialized summaries keep their existing
+    digest paths, so this cannot rehydrate raw canonical result payloads.
+    """
+    summary = getattr(tool_execution, "context_summary_json", None)
+    if not (
+        isinstance(summary, dict)
+        and summary.get(TOOL_CONTEXT_KIND_FIELD)
+        == TOOL_CONTEXT_OBSERVATION_KIND
+    ):
+        return ""
+    observation = tool_context_for_replay(summary)
+    if not isinstance(observation, dict):
+        return ""
+    try:
+        rendered = json.dumps(
+            observation,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except Exception:
+        rendered = str(observation)
+    if len(rendered) > _COMPACTION_OBSERVATION_MAX_CHARS_PER_TOOL:
+        rendered = (
+            rendered[: _COMPACTION_OBSERVATION_MAX_CHARS_PER_TOOL - 1]
+            + "…"
+        )
+    return rendered
+
+
 def _is_postgres_session(db: AsyncSession) -> bool:
     try:
         return db.get_bind().dialect.name == "postgresql"
     except Exception:
         return False
+
+
+def _digest_data_result(rj: dict, allow_llm_see_data: bool, *, applied_params: dict | None = None) -> str:
+    """One history digest for every tool whose result carries a
+    ``data_preview`` (create_data, describe_entity): shape, column names,
+    chart type, viz id, the top row when data may be shown, and — for
+    parameterized results — the values it ran with, so a later turn can reuse
+    the result instead of reading or rebuilding it."""
+    if not isinstance(rj, dict):
+        return ""
+    preview = rj.get('data_preview') or {}
+    stats = rj.get('stats') or {}
+    data_obj = rj.get('data') or {}
+    columns = preview.get('columns') or data_obj.get('columns', []) or []
+    rows = data_obj.get('rows', []) or []
+    preview_rows = preview.get('rows') or []
+    col_names = [
+        (c.get('field') or c.get('headerName'))
+        for c in columns
+        if isinstance(c, dict) and (c.get('field') or c.get('headerName'))
+    ]
+    row_count = (
+        stats.get('total_rows')
+        or preview.get('row_count')
+        or len(rows)
+        or len(preview_rows)
+    )
+    parts = [f"{row_count} rows × {len(col_names)} cols"]
+    if col_names:
+        head_cols = ", ".join(col_names[:10])
+        parts.append(f"cols: {head_cols}{'…' if len(col_names) > 10 else ''}")
+    if applied_params:
+        try:
+            parts.append("params: " + ", ".join(f"{k}={v!r}" for k, v in applied_params.items()))
+        except Exception:
+            pass
+    try:
+        dm = rj.get('data_model') or {}
+        dm_type = str(dm.get('type') or '').strip()
+        if dm_type and dm_type != 'table':
+            parts.append(f"chart: {dm_type}")
+    except Exception:
+        pass
+    try:
+        viz_ids = rj.get('created_visualization_ids') or []
+        if viz_ids:
+            parts.append(f"viz_id: {viz_ids[0]}")
+    except Exception:
+        pass
+    if allow_llm_see_data:
+        sample_row = preview_rows[0] if preview_rows else (rows[0] if rows else None)
+        if sample_row:
+            try:
+                parts.append(f"top row: {json.dumps(sample_row)}")
+            except Exception:
+                pass
+    return "; ".join(parts)
 
 
 def _digest_read_query(tool_execution) -> str:
@@ -765,6 +867,20 @@ class MessageContextBuilder:
         # refreshes. This matters for old read_query rows whose full JSON can
         # take PostgreSQL seconds to parse even when SQL returns only a digest.
         self._terminal_tool_context_cache: Dict[str, Any] = {}
+        # Populated from the same batched block/tool query used to render the
+        # conversation. AgentV2 adopts it once at run start, so durable replay
+        # adds no query to the critical path.
+        from app.ai.context.transcript import Transcript
+        self._durable_transcript = Transcript()
+        self._durable_tool_execution_ids: set[str] = set()
+        # AgentV2 opts in before its initial warm-context build. Other callers
+        # keep the long-standing rendered Tool: lines and pay no transcript
+        # assembly cost.
+        self.use_durable_transcript = False
+
+    def get_durable_transcript(self):
+        """Return the native tool turns from the latest live-window build."""
+        return self._durable_transcript
 
     async def _protected_head_completions(self):
         """The report's opening exchange (never folded into the compaction
@@ -917,7 +1033,9 @@ class MessageContextBuilder:
         return loaded.get(str(tool_execution_id))
 
     async def _load_tool_executions_for_context(
-        self, tool_execution_ids: List[str]
+        self,
+        tool_execution_ids: List[str],
+        completion_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Batch-load history metadata while projecting row-heavy results.
 
@@ -928,7 +1046,10 @@ class MessageContextBuilder:
         multi-megabyte payloads on every planner refresh.
         """
         ids = list(dict.fromkeys(str(value) for value in tool_execution_ids if value))
-        if not ids:
+        completion_ids = list(
+            dict.fromkeys(str(value) for value in (completion_ids or []) if value)
+        )
+        if not ids and not completion_ids:
             return {}
 
         loaded: Dict[str, Any] = {
@@ -936,47 +1057,99 @@ class MessageContextBuilder:
             for execution_id in ids
             if execution_id in self._terminal_tool_context_cache
         }
+        if completion_ids:
+            loaded.update(
+                {
+                    execution_id: execution
+                    for execution_id, execution in self._terminal_tool_context_cache.items()
+                    if str(getattr(execution, "completion_id", "") or "")
+                    in completion_ids
+                }
+            )
         missing_ids = [execution_id for execution_id in ids if execution_id not in loaded]
-        if not missing_ids:
+        if not missing_ids and not completion_ids:
             return loaded
 
-        rows = await self.db.execute(
-            select(
-                ToolExecution.id,
-                ToolExecution.tool_name,
-                ToolExecution.tool_action,
-                ToolExecution.arguments_json,
-                ToolExecution.status,
-                ToolExecution.result_summary,
-                ToolExecution.context_summary_json,
-                ToolExecution.created_widget_id,
-                ToolExecution.created_step_id,
-                ToolExecution.error_message,
-                ToolExecution.updated_at,
-            ).where(ToolExecution.id.in_(missing_ids))
+        predicates = []
+        # The native replay path asks for every execution belonging to the
+        # visible completions so it can recover an intent even when SIGKILL
+        # happened before a CompletionBlock was written. That predicate is a
+        # superset of the block ids; adding ``id IN (...) OR completion IN``
+        # made SQLite/PostgreSQL choose a worse plan for no extra coverage.
+        if missing_ids and not completion_ids:
+            predicates.append(ToolExecution.id.in_(missing_ids))
+        if completion_ids:
+            completion_predicate = AgentExecution.completion_id.in_(completion_ids)
+            if loaded:
+                completion_predicate = and_(
+                    completion_predicate,
+                    ToolExecution.id.not_in(list(loaded)),
+                )
+            predicates.append(completion_predicate)
+        if not predicates:
+            return loaded
+
+        tool_query = select(
+            ToolExecution.id,
+            ToolExecution.tool_name,
+            ToolExecution.tool_action,
+            ToolExecution.arguments_json,
+            ToolExecution.agent_execution_id,
+            ToolExecution.plan_decision_id,
+            ToolExecution.provider_call_id,
+            ToolExecution.provider_name,
+            ToolExecution.provider_signature,
+            ToolExecution.action_index,
+            ToolExecution.status,
+            ToolExecution.result_summary,
+            ToolExecution.context_summary_json,
+            ToolExecution.created_widget_id,
+            ToolExecution.created_step_id,
+            ToolExecution.error_message,
+            ToolExecution.updated_at,
         )
+        if completion_ids:
+            tool_query = tool_query.add_columns(
+                AgentExecution.completion_id,
+            ).join(
+                AgentExecution,
+                AgentExecution.id == ToolExecution.agent_execution_id,
+            )
+        else:
+            # Preserve the legacy lookup's original no-join query plan.
+            tool_query = tool_query.add_columns(
+                null().label("completion_id"),
+            )
+        rows = await self.db.execute(tool_query.where(or_(*predicates)))
+        newly_loaded_ids: list[str] = []
         for row in rows:
+            newly_loaded_ids.append(str(row.id))
+            context_summary = _json_value(row.context_summary_json)
             loaded[str(row.id)] = SimpleNamespace(
                 id=row.id,
                 tool_name=row.tool_name,
                 tool_action=row.tool_action,
                 arguments_json=_json_value(row.arguments_json) or {},
+                agent_execution_id=row.agent_execution_id,
+                plan_decision_id=row.plan_decision_id,
+                provider_call_id=row.provider_call_id,
+                provider_name=row.provider_name,
+                provider_signature=row.provider_signature,
+                action_index=row.action_index,
                 status=row.status,
                 result_summary=row.result_summary,
-                context_summary_json=_json_value(row.context_summary_json),
+                context_summary_json=context_summary,
                 created_widget_id=row.created_widget_id,
                 created_step_id=row.created_step_id,
                 error_message=row.error_message,
                 updated_at=row.updated_at,
+                completion_id=row.completion_id,
                 # New executions carry the exact bounded history projection in
                 # a separate small column. Historical rows use the behavior-
                 # preserving JSON projection once, then write it through.
-                result_json=_json_value(row.context_summary_json),
+                result_json=tool_context_for_replay(context_summary),
             )
 
-        newly_loaded_ids = [
-            execution_id for execution_id in missing_ids if execution_id in loaded
-        ]
         read_query_ids = [
             execution_id for execution_id in newly_loaded_ids
             if (
@@ -1038,7 +1211,7 @@ class MessageContextBuilder:
             ],
         )
 
-        for execution_id in missing_ids:
+        for execution_id in newly_loaded_ids:
             execution = loaded.get(execution_id)
             if (
                 execution is not None
@@ -1046,11 +1219,35 @@ class MessageContextBuilder:
             ):
                 self._terminal_tool_context_cache[execution_id] = execution
 
-        return {
-            execution_id: loaded[execution_id]
-            for execution_id in ids
-            if execution_id in loaded
-        }
+        if completion_ids:
+            return {
+                execution_id: execution
+                for execution_id, execution in loaded.items()
+                if (
+                    execution_id in ids
+                    or str(getattr(execution, "completion_id", "") or "")
+                    in completion_ids
+                )
+            }
+        return {execution_id: loaded[execution_id] for execution_id in ids if execution_id in loaded}
+
+    async def _load_decrypted_results(
+        self, tool_execution_ids: List[str]
+    ) -> List[tuple]:
+        """Hydrate result_json for rows SQL could not project (encrypted ones).
+
+        Returns (id, result_json) pairs. Reading through the ORM column type is
+        what decrypts; the caller then projects in Python. Only ever called for
+        rows whose envelope marker was detected, so the common all-plaintext
+        path never issues this query.
+        """
+        if not tool_execution_ids:
+            return []
+        rows = await self.db.execute(
+            select(ToolExecution.id, ToolExecution.result_json)
+            .where(ToolExecution.id.in_(tool_execution_ids))
+        )
+        return [(str(row.id), _json_value(row.result_json)) for row in rows]
 
     async def _load_create_data_result_projection(self, tool_execution_id: str) -> Dict[str, Any]:
         projections = await self._load_create_data_result_projections([str(tool_execution_id)])
@@ -1086,16 +1283,26 @@ class MessageContextBuilder:
                 json_extract(result_json, '$.data.rows[0]') AS data_first_row,
                 json_array_length(result_json, '$.data.rows') AS data_row_count
             """
+        # Encrypted results are opaque to the JSON operators above. Flag them per
+        # row and hydrate just those through the ORM, which decrypts.
+        encrypted_sql = envelope_marker_sql(
+            "result_json", postgres=_is_postgres_session(self.db)
+        )
         stmt = text(
             f"""
-            SELECT id, {projected_columns}, {data_shape_columns}
+            SELECT id, {projected_columns}, {data_shape_columns},
+                   {encrypted_sql} AS encrypted_marker
             FROM tool_executions
             WHERE id IN :tool_execution_ids
             """
         ).bindparams(bindparam("tool_execution_ids", expanding=True))
         rows = await self.db.execute(stmt, {"tool_execution_ids": tool_execution_ids})
         projections: Dict[str, Dict[str, Any]] = {}
+        encrypted_ids: List[str] = []
         for row in rows:
+            if row.encrypted_marker is not None:
+                encrypted_ids.append(str(row.id))
+                continue
             projection = {
                 field: _json_value(getattr(row, field))
                 for field in fields
@@ -1122,14 +1329,19 @@ class MessageContextBuilder:
             if preview:
                 projection["data_preview"] = preview
             projections[str(row.id)] = projection
+        for execution_id, result in await self._load_decrypted_results(encrypted_ids):
+            projections[execution_id] = _project_create_data_result(result)
         return projections
 
     async def _load_read_query_result_projections(
         self, tool_execution_ids: List[str]
     ) -> Dict[str, Dict[str, Any]]:
         """Project nested read_query metadata without selecting results[*].data."""
+        encrypted_sql = envelope_marker_sql(
+            "te.result_json", postgres=_is_postgres_session(self.db)
+        )
         if _is_postgres_session(self.db):
-            statement = """
+            statement = f"""
                 SELECT
                     te.id,
                     te.result_json->'success' AS success,
@@ -1138,7 +1350,8 @@ class MessageContextBuilder:
                     COALESCE(expanded.item->>'title', te.result_json->>'title') AS title,
                     COALESCE(expanded.item->'data_preview', te.result_json->'data_preview') AS data_preview,
                     COALESCE(expanded.item->>'error', te.result_json->>'error') AS error,
-                    te.result_json->'errors' AS errors
+                    te.result_json->'errors' AS errors,
+                    {encrypted_sql} AS encrypted_marker
                 FROM tool_executions AS te
                 LEFT JOIN LATERAL json_array_elements(
                     CASE
@@ -1151,7 +1364,7 @@ class MessageContextBuilder:
                 ORDER BY te.id, expanded.item_index
             """
         else:
-            statement = """
+            statement = f"""
                 SELECT
                     te.id,
                     json_extract(te.result_json, '$.success') AS success,
@@ -1160,7 +1373,8 @@ class MessageContextBuilder:
                     COALESCE(json_extract(item.value, '$.title'), json_extract(te.result_json, '$.title')) AS title,
                     COALESCE(json_extract(item.value, '$.data_preview'), json_extract(te.result_json, '$.data_preview')) AS data_preview,
                     COALESCE(json_extract(item.value, '$.error'), json_extract(te.result_json, '$.error')) AS error,
-                    json_extract(te.result_json, '$.errors') AS errors
+                    json_extract(te.result_json, '$.errors') AS errors,
+                    {encrypted_sql} AS encrypted_marker
                 FROM tool_executions AS te
                 LEFT JOIN json_each(te.result_json, '$.results') AS item ON 1 = 1
                 WHERE te.id IN :tool_execution_ids
@@ -1169,8 +1383,13 @@ class MessageContextBuilder:
         stmt = text(statement).bindparams(bindparam("tool_execution_ids", expanding=True))
         rows = await self.db.execute(stmt, {"tool_execution_ids": tool_execution_ids})
         projected: Dict[str, Dict[str, Any]] = {}
+        encrypted_ids: List[str] = []
         for row in rows:
             execution_id = str(row.id)
+            if row.encrypted_marker is not None:
+                if execution_id not in encrypted_ids:
+                    encrypted_ids.append(execution_id)
+                continue
             result = projected.setdefault(
                 execution_id,
                 {
@@ -1188,6 +1407,8 @@ class MessageContextBuilder:
             }
             if any(value is not None for value in item.values()):
                 result["results"].append(item)
+        for execution_id, result_json in await self._load_decrypted_results(encrypted_ids):
+            projected[execution_id] = _project_read_query_result(result_json)
         return projected
     
     async def build_context(
@@ -1375,69 +1596,19 @@ class MessageContextBuilder:
                                     tool_info += " - " + "; ".join(digest_parts)
                                 # Digest for create_data results (same style as create_widget)
                                 elif tool_execution.tool_name == 'create_data' and tool_execution.result_json:
-                                    rj = tool_execution.result_json or {}
-                                    preview = rj.get('data_preview') or {}
-                                    stats = rj.get('stats') or {}
-                                    data_obj = rj.get('data') or {}
-                                    columns = preview.get('columns') or data_obj.get('columns', []) or []
-                                    rows = data_obj.get('rows', []) or []
-                                    preview_rows = preview.get('rows') or []
-                                    col_names = [
-                                        (c.get('field') or c.get('headerName'))
-                                        for c in columns
-                                        if isinstance(c, dict) and (c.get('field') or c.get('headerName'))
-                                    ]
-                                    row_count = (
-                                        stats.get('total_rows')
-                                        or preview.get('row_count')
-                                        or len(rows)
-                                        or len(preview_rows)
-                                    )
-                                    sample_row = None
-                                    if allow_llm_see_data:
-                                        if preview_rows:
-                                            sample_row = preview_rows[0]
-                                        elif rows:
-                                            sample_row = rows[0]
-                                    digest_parts = [f"{row_count} rows × {len(col_names)} cols"]
-                                    if col_names:
-                                        head_cols = ", ".join(col_names[:10])
-                                        digest_parts.append(f"cols: {head_cols}{'…' if len(col_names) > 10 else ''}")
-                                    # If a non-table viz was inferred, surface it concisely
-                                    try:
-                                        dm = rj.get('data_model') or {}
-                                        dm_type = str(dm.get('type') or '').strip()
-                                        if dm_type and dm_type != 'table':
-                                            digest_parts.append(f"chart: {dm_type}")
-                                    except Exception:
-                                        pass
-                                    # Surface visualization_id if available (added by orchestrator)
-                                    try:
-                                        viz_ids = rj.get('created_visualization_ids') or []
-                                        if viz_ids:
-                                            digest_parts.append(f"viz_id: {viz_ids[0]}")
-                                    except Exception:
-                                        pass
-                                    if sample_row:
-                                        try:
-                                            digest_parts.append(f"top row: {json.dumps(sample_row)}")
-                                        except Exception:
-                                            pass
-                                    tool_info += " - " + "; ".join(digest_parts)
-                                # Digest for describe_entity results
+                                    digest = _digest_data_result(tool_execution.result_json or {}, allow_llm_see_data)
+                                    if digest:
+                                        tool_info += " - " + digest
+                                # Digest for describe_entity results: the entity plus the
+                                # same shape/values digest create_data gets.
                                 elif tool_execution.tool_name == 'describe_entity' and tool_execution.result_json:
                                     rj = tool_execution.result_json or {}
                                     digest_parts = []
-                                    entity_title = rj.get('title')
-                                    if entity_title:
-                                        digest_parts.append(f"entity: {entity_title}")
-                                    # Surface visualization_id if created
-                                    try:
-                                        viz_ids = rj.get('created_visualization_ids') or []
-                                        if viz_ids:
-                                            digest_parts.append(f"viz_id: {viz_ids[0]}")
-                                    except Exception:
-                                        pass
+                                    if rj.get('title'):
+                                        digest_parts.append(f"entity: {rj.get('title')}")
+                                    digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None)
+                                    if digest:
+                                        digest_parts.append(digest)
                                     if digest_parts:
                                         tool_info += " - " + "; ".join(digest_parts)
                                 elif tool_execution.tool_name == 'read_query' and tool_execution.result_json:
@@ -1961,11 +2132,76 @@ class MessageContextBuilder:
                 for b in blks
                 if getattr(b, 'tool_execution_id', None)
             ]
-            if tool_exec_ids:
+            if tool_exec_ids or system_completion_ids:
                 try:
-                    tool_exec_by_id = await self._load_tool_executions_for_context(tool_exec_ids)
+                    tool_exec_by_id = await self._load_tool_executions_for_context(
+                        tool_exec_ids,
+                        completion_ids=(
+                            system_completion_ids
+                            if completion_ids is None and self.use_durable_transcript
+                            else None
+                        ),
+                    )
                 except Exception:
                     tool_exec_by_id = {}
+
+        # The live planner consumes provider-native tool turns below. The
+        # rolling compactor intentionally uses the textual fold path instead,
+        # so give only that path the exact bounded observations captured at
+        # execution time. Prefer the newest fold candidates when the global
+        # budget is exhausted; older tools still retain their existing digest.
+        compaction_observations: Dict[str, str] = {}
+        if completion_ids is not None:
+            remaining_observation_chars = (
+                _COMPACTION_OBSERVATION_MAX_CHARS_TOTAL
+            )
+            for completion in reversed(completions_to_process):
+                blocks = blocks_by_completion.get(str(completion.id), [])
+                for block in reversed(blocks):
+                    execution_id = str(
+                        getattr(block, "tool_execution_id", "") or ""
+                    )
+                    tool_execution = tool_exec_by_id.get(execution_id)
+                    rendered = (
+                        _compaction_observation_text(tool_execution)
+                        if tool_execution is not None
+                        else ""
+                    )
+                    if not rendered or execution_id in compaction_observations:
+                        continue
+                    if remaining_observation_chars <= 1:
+                        break
+                    if len(rendered) > remaining_observation_chars:
+                        rendered = (
+                            rendered[: remaining_observation_chars - 1] + "…"
+                        )
+                    compaction_observations[execution_id] = rendered
+                    remaining_observation_chars -= len(rendered)
+                if remaining_observation_chars <= 1:
+                    break
+
+        # Reuse the exact same bounded projections already fetched for message
+        # history to build provider-native tool turns. On the live path those
+        # represented tool lines are omitted from the XML conversation below,
+        # preventing prompt duplication. Compaction builds keep their original
+        # full text because they do not feed AgentV2's transcript.
+        if completion_ids is None and self.use_durable_transcript:
+            try:
+                from app.ai.context.durable_transcript import build_durable_transcript
+
+                (
+                    self._durable_transcript,
+                    self._durable_tool_execution_ids,
+                ) = build_durable_transcript(
+                    completions=completions_to_process,
+                    blocks_by_completion=blocks_by_completion,
+                    tool_exec_by_id=tool_exec_by_id,
+                )
+            except Exception:
+                from app.ai.context.transcript import Transcript
+
+                self._durable_transcript = Transcript()
+                self._durable_tool_execution_ids = set()
 
         for completion in completions_to_process:
             ts = completion.created_at.strftime("%H:%M") if getattr(completion, 'created_at', None) else None
@@ -2078,7 +2314,15 @@ class MessageContextBuilder:
                         system_parts.append(f"Thinking: {block.reasoning.strip()}")
                     if block.content and block.content.strip():
                         system_parts.append(f"Response: {block.content.strip()}")
-                    if block.tool_execution_id:
+                    if (
+                        block.tool_execution_id
+                        and not (
+                            completion_ids is None
+                            and self.use_durable_transcript
+                            and str(block.tool_execution_id)
+                            in self._durable_tool_execution_ids
+                        )
+                    ):
                         tool_execution = tool_exec_by_id.get(str(block.tool_execution_id))
                         if tool_execution:
                             tool_info = f"Tool: {tool_execution.tool_name}"
@@ -2107,65 +2351,19 @@ class MessageContextBuilder:
                                             pass
                                 tool_info += " - " + "; ".join(digest_parts)
                             elif tool_execution.status == 'success' and tool_execution.tool_name == 'create_data' and tool_execution.result_json:
-                                rj = tool_execution.result_json or {}
-                                preview = rj.get('data_preview') or {}
-                                stats = rj.get('stats') or {}
-                                data_obj = rj.get('data') or {}
-                                columns = preview.get('columns') or data_obj.get('columns', []) or []
-                                rows = data_obj.get('rows', []) or []
-                                preview_rows = preview.get('rows') or []
-                                col_names = [
-                                    (c.get('field') or c.get('headerName'))
-                                    for c in columns
-                                    if isinstance(c, dict) and (c.get('field') or c.get('headerName'))
-                                ]
-                                row_count = (
-                                    stats.get('total_rows')
-                                    or preview.get('row_count')
-                                    or len(rows)
-                                    or len(preview_rows)
-                                )
-                                digest_parts = [f"{row_count} rows × {len(col_names)} cols"]
-                                if col_names:
-                                    head_cols = ", ".join(col_names[:10])
-                                    digest_parts.append(f"cols: {head_cols}{'…' if len(col_names) > 10 else ''}")
-                                if allow_llm_see_data:
-                                    sample_row = preview_rows[0] if preview_rows else (rows[0] if rows else None)
-                                    if sample_row:
-                                        try:
-                                            digest_parts.append(f"top row: {json.dumps(sample_row)}")
-                                        except Exception:
-                                            pass
-                                # If a non-table viz was inferred, surface it concisely
-                                try:
-                                    dm = rj.get('data_model') or {}
-                                    dm_type = str(dm.get('type') or '').strip()
-                                    if dm_type and dm_type != 'table':
-                                        digest_parts.append(f"chart: {dm_type}")
-                                except Exception:
-                                    pass
-                                # Surface visualization_id if available (added by orchestrator)
-                                try:
-                                    viz_ids = rj.get('created_visualization_ids') or []
-                                    if viz_ids:
-                                        digest_parts.append(f"viz_id: {viz_ids[0]}")
-                                except Exception:
-                                    pass
-                                tool_info += " - " + "; ".join(digest_parts)
+                                digest = _digest_data_result(tool_execution.result_json or {}, allow_llm_see_data)
+                                if digest:
+                                    tool_info += " - " + digest
                             elif tool_execution.status == 'success' and tool_execution.tool_name == 'describe_entity' and tool_execution.result_json:
-                                # Digest for describe_entity results
+                                # Digest for describe_entity results: the entity plus the
+                                # same shape/values digest create_data gets.
                                 rj = tool_execution.result_json or {}
                                 digest_parts = []
-                                entity_title = rj.get('title')
-                                if entity_title:
-                                    digest_parts.append(f"entity: {entity_title}")
-                                # Surface visualization_id if created
-                                try:
-                                    viz_ids = rj.get('created_visualization_ids') or []
-                                    if viz_ids:
-                                        digest_parts.append(f"viz_id: {viz_ids[0]}")
-                                except Exception:
-                                    pass
+                                if rj.get('title'):
+                                    digest_parts.append(f"entity: {rj.get('title')}")
+                                digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None)
+                                if digest:
+                                    digest_parts.append(digest)
                                 if digest_parts:
                                     tool_info += " - " + "; ".join(digest_parts)
                             elif tool_execution.status == 'success' and tool_execution.tool_name == 'read_query' and tool_execution.result_json:
@@ -2382,6 +2580,14 @@ class MessageContextBuilder:
                                 if len(error) > 50:
                                     error = error[:50] + "..."
                                 tool_info += f" - Error: {error}"
+                            compact_observation = compaction_observations.get(
+                                str(block.tool_execution_id)
+                            )
+                            if compact_observation:
+                                tool_info += (
+                                    " | Model-visible result: "
+                                    + compact_observation
+                                )
                             system_parts.append(tool_info)
                 if in_knowledge_wrap:
                     system_parts.append("</post_analysis_knowledge_update>")
@@ -2487,3 +2693,68 @@ class MessageContextBuilder:
                 parts.append(f"  {i+1}. [{timestamp}] {msg.role}: {content_preview}...")
         
         return "\n".join(parts)
+
+
+# --- Python equivalents of the in-SQL result projections -------------------
+# Encrypted result_json is opaque to SQL, so the few enveloped rows are
+# hydrated through the ORM and projected here instead. These must produce the
+# same shape as the SQL above: conversation history has to read identically
+# whether or not payload encryption is switched on.
+
+_CREATE_DATA_PROJECTED_FIELDS = (
+    "success", "data_preview", "stats", "data_model", "view",
+    "created_visualization_ids", "query_id", "query_timings",
+    "codegen_ms", "execution_ms", "errors",
+)
+
+
+def _project_create_data_result(result_json: Any) -> Dict[str, Any]:
+    """Bound a create_data result to its history digest (mirrors the SQL)."""
+    source = result_json if isinstance(result_json, dict) else {}
+    projection = {
+        field: source[field]
+        for field in _CREATE_DATA_PROJECTED_FIELDS
+        if source.get(field) is not None
+    }
+
+    data = source.get("data")
+    data = data if isinstance(data, dict) else {}
+    rows = data.get("rows")
+    rows = rows if isinstance(rows, list) else None
+    columns = data.get("columns")
+
+    preview = projection.get("data_preview")
+    preview = dict(preview) if isinstance(preview, dict) else {}
+    if not preview.get("columns") and isinstance(columns, list):
+        preview["columns"] = columns
+    if not preview.get("rows") and rows:
+        # Historical digest contract: show only the first result row.
+        preview["rows"] = [rows[0]]
+    if preview.get("row_count") is None and rows is not None:
+        preview["row_count"] = len(rows)
+    if preview:
+        projection["data_preview"] = preview
+    return projection
+
+
+def _project_read_query_result(result_json: Any) -> Dict[str, Any]:
+    """Bound a read_query result to its history digest (mirrors the SQL)."""
+    source = result_json if isinstance(result_json, dict) else {}
+    results = source.get("results")
+    items = results if isinstance(results, list) else [None]
+
+    projected_items: List[Dict[str, Any]] = []
+    for entry in items:
+        entry = entry if isinstance(entry, dict) else {}
+        item = {
+            key: entry[key] if entry.get(key) is not None else source.get(key)
+            for key in ("query_id", "visualization_id", "title", "data_preview", "error")
+        }
+        if any(value is not None for value in item.values()):
+            projected_items.append(item)
+
+    return {
+        "success": source.get("success"),
+        "results": projected_items,
+        "errors": source.get("errors"),
+    }

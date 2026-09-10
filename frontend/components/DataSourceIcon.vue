@@ -49,6 +49,7 @@ const normalizeType = (raw: string) => {
     t = t.replace(/_\d+$/g, '')
 
     // aliases
+    if (t === 'sharepoint_onprem') t = 'sharepoint'
     if (t === 'postgres') t = 'postgresql'
     if (t === 'sqlserver' || t === 'sql_server') t = 'mssql'
     if (t === 'awsathena') t = 'aws_athena'
@@ -101,6 +102,8 @@ const iconPath = computed(() => {
         outlook_mail: 'outlook_mail.svg',
         elasticsearch: 'elasticsearch.svg',
         s3: 's3.svg',
+        // Same brand asset as the monday MCP preset (CONNECTOR_ICON_FILE above).
+        monday: 'monday.svg',
     };
     if (TYPE_ICON_FILE[t]) {
         return `/data_sources_icons/${TYPE_ICON_FILE[t]}`;

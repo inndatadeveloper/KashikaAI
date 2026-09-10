@@ -59,8 +59,9 @@
                     <div v-if="isConvLoading" class="flex-1 flex items-center justify-center">
                         <Spinner class="w-5 h-5 text-gray-400" />
                     </div>
-                    <div v-else class="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-5">
+                    <div v-else class="flex-1 min-h-0 overflow-y-auto overscroll-contain px-4 py-4 space-y-5">
                         <div v-for="(turn, i) in turns" :key="turn.completion_id || i"
+                             :data-completion-id="turn.completion_id || ''"
                              :class="['rounded-lg px-1.5 py-1.5 transition-colors', turn.completion_id === selectedCompletionId ? 'bg-blue-50/40 ring-1 ring-blue-100' : '']">
                             <!-- User bubble -->
                             <div class="flex justify-end mb-2">
@@ -111,7 +112,7 @@
                     <div class="px-4 py-2.5 border-b border-gray-200 dark:border-gray-800 text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Timeline</div>
                     <div v-if="isLoading" class="flex-1 flex items-center justify-center"><Spinner class="w-5 h-5 text-gray-400" /></div>
                     <div v-else-if="!visibleLeftItems.length" class="flex-1 flex items-center justify-center text-xs text-gray-400 dark:text-gray-500 px-4 text-center">Select a turn</div>
-                    <div v-else class="flex-1 min-h-0 overflow-y-auto p-3 space-y-1">
+                    <div v-else class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-3 space-y-1">
                         <template v-for="item in visibleLeftItems" :key="item.id">
                             <div v-if="item.kind === 'section'"
                                  class="px-1 py-1 flex items-center gap-1 cursor-pointer text-[10px] text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 select-none"
@@ -181,7 +182,7 @@
                         </div>
                     </div>
 
-                    <div class="flex-1 min-h-0 overflow-y-auto p-5">
+                    <div class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-5">
                         <!-- Loading -->
                         <div v-if="isLoading" class="h-full flex items-center justify-center">
                             <div class="text-center">
@@ -269,7 +270,7 @@
                                                 <span v-if="ins.category" class="text-[9px] px-1.5 py-0.5 rounded bg-gray-200 dark:bg-gray-800 text-gray-600 dark:text-gray-400 flex-shrink-0">{{ ins.category }}</span>
                                                 <span class="text-[9px] px-1.5 py-0.5 rounded flex-shrink-0"
                                                       :class="ins.load_mode === 'always' ? 'bg-green-100 text-green-700' : ins.load_mode === 'intelligent' ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-600'">
-                                                    {{ ins.load_mode || 'always' }}
+                                                    {{ getLoadModeLabel(ins.load_mode) }}
                                                 </span>
                                             </div>
                                         </div>
@@ -520,6 +521,8 @@ import SearchInstructionsTool from '../tools/SearchInstructionsTool.vue'
 import ReadInstructionTool from '../tools/ReadInstructionTool.vue'
 import DataSourceIcon from '../DataSourceIcon.vue'
 import Spinner from '../Spinner.vue'
+// Render load_mode via the shared label map — the UI calls 'intelligent' mode "Smart".
+const { getLoadModeLabel } = useInstructionHelpers()
 const { isJudgeEnabled } = useOrgSettings()
 const { t } = useI18n()
 
@@ -872,6 +875,16 @@ const fetchConversation = async () => {
     } finally {
         isConvLoading.value = false
     }
+    // The conversation rail renders only after isConvLoading flips false, and it
+    // opens scrolled to the top — bring the preselected turn into view.
+    await scrollToSelectedTurn()
+}
+
+const scrollToSelectedTurn = async () => {
+    if (!selectedCompletionId.value) return
+    await nextTick()
+    const el = document.querySelector(`[data-completion-id="${selectedCompletionId.value}"]`)
+    el?.scrollIntoView({ block: 'center' })
 }
 
 const selectTurn = async (turn: ConversationTurn) => {
@@ -1218,10 +1231,20 @@ function shouldUseToolComponent(toolExecution: any): boolean {
     return getToolComponent(toolExecution.tool_name) !== null
 }
 
-// Watch for modal opening
+// Watch for modal opening. Also lock body scroll while open — the pages that
+// host this modal (diagnosis, report chat) scroll behind UModal's overlay
+// otherwise (same workaround as InstructionModalComponent).
 watch(() => props.modelValue, (newValue) => {
     if (newValue) {
         fetchConversation()
+        document.body.style.overflow = 'hidden'
+    } else {
+        document.body.style.overflow = ''
     }
+})
+
+onUnmounted(() => {
+    // Restore body scroll if the host page unmounts while the modal is open
+    document.body.style.overflow = ''
 })
 </script> 

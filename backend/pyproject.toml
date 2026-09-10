@@ -11,6 +11,10 @@ dependencies = [
     "pydantic>=2.13.4,<2.14",
     "pydantic-settings>=2.14.2,<2.15",
     "python-multipart>=0.0.32,<0.1",
+    # Payload (de)serialization for encrypted analytical columns. Several times
+    # faster than the stdlib json module, which is what keeps app.ee.encryption
+    # off the critical path — see app/ee/encryption/types.py.
+    "orjson>=3.11.0,<4",
     "email-validator>=2.3.0,<2.4",
     "jinja2>=3.1.6,<3.2",
     "fastapi-users[sqlalchemy]>=15.0.5,<15.1",
@@ -66,6 +70,7 @@ dependencies = [
     "pyarrow>=18.1.0,<18.2",
     "pandas>=2.3.3,<2.4",
     "numpy>=1.26.4,<1.27",
+    "scikit-learn>=1.8.0,<1.9",
     "matplotlib>=3.11.0,<3.12",
     "pillow>=12.3.0,<12.4",
     "openpyxl>=3.1.5,<3.2",
@@ -111,20 +116,22 @@ dependencies = [
     # transitive dep of uvicorn[standard]. >=14 is required: that release renamed
     # connect()'s `extra_headers` to `additional_headers`.
     "websockets>=14.0,<17",
+    "kubernetes>=36.0.3",
 ]
 
 [project.optional-dependencies]
-# Kerberos constrained delegation (S4U) for per-user SSO to on-prem SQL Server.
+# Kerberos constrained delegation (SQL Server SSO) and SharePoint HTTP auth.
 # Needs MIT krb5 headers to build (libkrb5-dev + krb5-config on Debian/Ubuntu).
 kerberos = [
     "gssapi>=1.8.3,<2",
+    "requests-gssapi>=1.4,<2",
 ]
 dev = [
     "pytest>=8.4.2,<8.5",
     "pytest-asyncio>=0.23.8,<0.24",
     "pytest-timeout>=2.4.0,<2.5",
     "pytest-xdist>=3.6.1,<4",
-    "testcontainers[postgres,mysql]>=4.14.2,<4.15",
+    "testcontainers[postgres,mysql,mssql]>=4.14.2,<4.15",
     "aiosmtpd>=1.4.6,<1.5",
     "ruff>=0.15.18,<0.16",
     "ty>=0.0.51,<0.1",

@@ -8,7 +8,7 @@ from app.core.permissions_decorator import requires_permission
 from app.models.user import User
 from app.models.organization import Organization
 from app.models.query import Query
-from app.schemas.query_schema import QueryCreate, QuerySchema, QueryRunRequest
+from app.schemas.query_schema import QueryCreate, QuerySchema, QueryRunRequest, QueryLastRunSchema
 from app.services.query_service import QueryService
 
 
@@ -39,10 +39,18 @@ async def list_queries(
     # policy so a non-owner never receives a withheld creator snapshot in the
     # embedded default_step.
     viewer_id = str(current_user.id) if current_user else None
+    last_runs = await service.get_last_runs(db, [str(q.id) for q in queries])
     result = []
+    scope_memo: dict = {}
     for q in queries:
         schema = QuerySchema.model_validate(q)
         schema = await service.overlay_viewer_on_query_schema(db, q, schema, viewer_id)
+        schema = await service.annotate_credential_scope(db, q, schema, memo=scope_memo)
+        lr = last_runs.get(str(q.id))
+        # Withheld-snapshot viewers must not see the creator's run outcome —
+        # status_reason carries raw execution errors (table names, SQL).
+        if lr and not (schema.default_step and schema.default_step.snapshot_withheld):
+            schema.last_run = QueryLastRunSchema(**lr)
         result.append(schema)
     return result
 
@@ -83,7 +91,31 @@ async def get_query(
         raise HTTPException(status_code=404, detail="Query not found")
     schema = QuerySchema.model_validate(q)
     viewer_id = str(current_user.id) if current_user else None
-    return await service.overlay_viewer_on_query_schema(db, q, schema, viewer_id)
+    schema = await service.overlay_viewer_on_query_schema(db, q, schema, viewer_id)
+    schema = await service.annotate_credential_scope(db, q, schema)
+    lr = (await service.get_last_runs(db, [str(q.id)])).get(str(q.id))
+    if lr and not (schema.default_step and schema.default_step.snapshot_withheld):
+        schema.last_run = QueryLastRunSchema(**lr)
+    return schema
+
+@router.delete("/{query_id}", response_model=dict)
+@requires_permission('delete_reports', model=Query, owner_only=True)
+async def delete_query(
+    query_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Soft-delete a query along with its visualizations."""
+    deleted = await service.delete_query(
+        db,
+        query_id,
+        organization_id=str(organization.id) if organization else None,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Query not found")
+    return {"message": "Query deleted"}
+
 
 @router.post("/{query_id}/run", response_model=dict)
 @requires_permission('view_reports', model=Query)
@@ -95,6 +127,17 @@ async def run_query_new_step(
     db: AsyncSession = Depends(get_async_db),
 ):
     try:
+        if (payload.mode or "builder") == "viewer":
+            # Viewer-execute: run the default step's code with param values,
+            # cached per (step, viewer, values). No new Step is created.
+            result = await service.run_query_viewer(
+                db,
+                query_id,
+                payload,
+                organization_id=str(organization.id) if organization else None,
+                user_id=str(current_user.id) if current_user else None,
+            )
+            return result
         q_dict, step_obj = await service.run_query_new_step(
             db,
             query_id,

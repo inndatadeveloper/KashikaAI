@@ -50,6 +50,25 @@ class Report(BaseSchema):
     # rows — never in the shared Step.data snapshot.
     shared_run_identity = Column(String, nullable=False, default='viewer', server_default='viewer')
 
+    # Show the Data tab (the per-query execution history behind the report) to
+    # viewers of the shared artifact page /r/{id}. Artifact sharing only.
+    # Display-only: the public queries/step endpoints serve the same payload
+    # either way, because they also feed the artifact iframe itself — hiding
+    # the tab is a presentation choice, not a data boundary.
+    include_data_tab = Column(Boolean, nullable=False, default=True, server_default='1')
+
+    # Chat on the shared artifact page /r/{id}. Off by default; only meaningful
+    # while artifact_visibility != 'none'. Viewer conversations never touch this
+    # report's own transcript — each viewer gets a hidden child report
+    # (report_type='artifact_chat', forked_from_id=this) holding their thread.
+    artifact_chat_enabled = Column(Boolean, nullable=False, default=False, server_default='0')
+    # Which agents (data sources) artifact-page chat may query, chosen by the
+    # owner. null = inherit this report's attached roster; [] = no agents
+    # (answers come from the artifact's own data only); a list = explicit
+    # subset. Never Auto: a viewer's chat can only narrow from here — the
+    # effective set is this ∩ the viewer's own accessible agents.
+    artifact_chat_data_source_ids = Column(JSON, nullable=True, default=None)
+
     cron_schedule = Column(String, nullable=True)
     # Rerun the artifact's queries when a viewer opens the shared report page
     # (/r/{id}). Independent of cron_schedule — a report can refresh on view
@@ -58,7 +77,9 @@ class Report(BaseSchema):
     # ReportService.refresh_on_view_rerun (see REFRESH_ON_VIEW_MIN_INTERVAL_SECONDS):
     # because the interval is not owner-configurable, the gate doubles as the
     # ceiling — at most one rerun per report per interval regardless of traffic.
-    refresh_on_view = Column(Boolean, nullable=False, default=False, server_default='0')
+    # Default ON: artifacts open on fresh data unless the owner opts out (or
+    # picks a recurring schedule — the UI treats the modes as exclusive).
+    refresh_on_view = Column(Boolean, nullable=False, default=True, server_default='1')
     last_run_at = Column(DateTime, nullable=True, default=None)
     # Last conversation activity: bumped when a new user message is created and
     # when an agent turn finalizes. Distinct from `updated_at` (which bumps on any

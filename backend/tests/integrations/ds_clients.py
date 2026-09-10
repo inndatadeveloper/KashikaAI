@@ -22,9 +22,16 @@ logger = logging.getLogger(__name__)
 # SOURCE OF TRUTH: Data sources to test
 # =============================================================================
 DATA_SOURCES = [
+    "sharepoint_onprem",  # Real SharePoint Server; configure in integrations.json.
     "postgresql",
     "mysql",
-    "snowflake",
+    # Temporarily skipped: the CI Snowflake trial account is suspended for lack
+    # of a payment method, so every connection fails in the driver
+    # (ProgrammingError 000666 / SQLSTATE 57014) before any client code runs.
+    # Not a client defect — re-enable as soon as billing is restored, since
+    # #1069 added Snowflake foreign-key introspection that this is the only
+    # live coverage for.
+    pytest.param("snowflake", marks=pytest.mark.skip(reason="CI Snowflake account suspended (billing); tracked separately")),
     # Temporarily skipped: the CI BigQuery test dataset returns 0 tables
     # (empty dataset / lapsed permissions), unrelated to client code. Re-enable
     # once the CI service account's dataset is restored.
@@ -39,6 +46,22 @@ DATA_SOURCES = [
     # integrations.json at a live instance — `tools/zabbix/docker-compose.yaml`
     # + `seed_zabbix.py` stand one up locally with an API token.
     "zabbix",
+    # Remote mode: no real AppDynamics controller can run in CI (licensed
+    # binaries, GBs of RAM), so integrations.json points at either a live
+    # controller or the doc-shaped simulator:
+    # `tools/appdynamics/docker-compose.yaml` (mock_controller.py) —
+    #   {"appdynamics": {"enabled": true, "controller_url": "http://localhost:8090",
+    #                    "account_name": "customer1", "username": "admin",
+    #                    "password": "Secret123!"}}
+    "appdynamics",
+    # Remote mode: no Aria Operations appliance can run in CI (OVA, needs ESXi
+    # + a Broadcom entitlement), so integrations.json points at either a live
+    # appliance or the spec-shaped simulator:
+    # `tools/aria_operations/docker-compose.yaml` (mock_suite_api.py) —
+    #   {"aria_operations": {"enabled": true, "url": "http://localhost:8443",
+    #                        "auth_source": "LOCAL", "username": "admin",
+    #                        "password": "Aria!2024"}}
+    "aria_operations",
     # Remote mode: `tools/elastic/docker-compose.yaml` + `seed_elastic.py` stand
     # up a local Elasticsearch 8 with an API key. Not a bundled testcontainer to
     # avoid pulling in elasticsearch-py's strict server-version handshake.
@@ -65,6 +88,15 @@ DATA_SOURCES = [
     #               "username": "BWUSER", "password": "...", "catalog": "0D_NW_C01"}}
     "businessobjects",
     "sap_bw",
+    # Remote mode: monday.com has no self-hostable server, so this runs only
+    # against a live account configured in integrations.json (skips otherwise):
+    #   {"monday": {"enabled": true, "api_token": "..."}}
+    "monday",
+    # Container mode (testcontainers k3s): the k3s admin kubeconfig is used ONLY
+    # to seed tools/kubernetes/{rbac.yaml,manifests}; the client under test then
+    # authenticates with the service-account access file exactly the way a
+    # customer connection does. `{"kubernetes": {"enabled": true, "container": true}}`.
+    "kubernetes",
 ]
 
 
@@ -174,6 +206,66 @@ except ImportError:
     pass
 
 try:
+    from testcontainers.k3s import K3SContainer
+
+    _K8S_TOOLS = os.path.join(os.path.dirname(__file__), "..", "..", "..", "tools", "kubernetes")
+
+    class _K3sContainer(K3SContainer):
+        """k3s with tools/kubernetes mounted read-only at /bow so the seed can
+        `kubectl apply` inside the container — no host kubectl needed."""
+
+        def __init__(self, image="rancher/k3s:v1.31.4-k3s1"):
+            super().__init__(image)
+            self.with_volume_mapping(os.path.abspath(_K8S_TOOLS), "/bow", "ro")
+
+    def _k3s_exec(container, *cmd: str) -> str:
+        code, out = container.exec(list(cmd))
+        text = out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
+        assert code == 0, f"{' '.join(cmd)} failed ({code}): {text[-800:]}"
+        return text
+
+    def _seed_kubernetes(container) -> None:
+        import time
+        _k3s_exec(container, "kubectl", "apply", "-f", "/bow/rbac.yaml")
+        _k3s_exec(container, "kubectl", "apply", "-f", "/bow/manifests/50-crd.yaml")
+        _k3s_exec(container, "kubectl", "wait", "--for=condition=established", "--timeout=60s", "crd/widgets.example.com")
+        _k3s_exec(container, "kubectl", "apply", "-f", "/bow/manifests/")
+        # The token controller populates the Secret asynchronously.
+        for _ in range(60):
+            tok = _k3s_exec(container, "kubectl", "-n", "bagofwords", "get", "secret", "bagofwords-reader-token",
+                            "-o", "jsonpath={.data.token}").strip()
+            if tok:
+                return
+            time.sleep(1)
+        raise AssertionError("service-account token was never populated")
+
+    def _k3s_access_file(container) -> str:
+        import base64
+        import yaml
+        ca_b64 = _k3s_exec(container, "kubectl", "-n", "bagofwords", "get", "secret", "bagofwords-reader-token",
+                           "-o", "jsonpath={.data.ca\\.crt}").strip()
+        tok_b64 = _k3s_exec(container, "kubectl", "-n", "bagofwords", "get", "secret", "bagofwords-reader-token",
+                            "-o", "jsonpath={.data.token}").strip()
+        server = yaml.safe_load(container.config_yaml())["clusters"][0]["cluster"]["server"]
+        # What tools/kubernetes/print_access_file.sh prints.
+        return yaml.safe_dump({
+            "apiVersion": "v1", "kind": "Config",
+            "clusters": [{"name": "bagofwords", "cluster": {"server": server, "certificate-authority-data": ca_b64}}],
+            "users": [{"name": "bagofwords-reader", "user": {"token": base64.b64decode(tok_b64).decode()}}],
+            "contexts": [{"name": "bagofwords", "context": {"cluster": "bagofwords", "user": "bagofwords-reader"}}],
+            "current-context": "bagofwords",
+        })
+
+    CONTAINER_REGISTRY["kubernetes"] = {
+        "container_cls": _K3sContainer,
+        "image": "rancher/k3s:v1.31.4-k3s1",
+        "get_kwargs": lambda c: {"access_file": _k3s_access_file(c)},
+        "seed_fn": _seed_kubernetes,
+    }
+except ImportError:
+    pass
+
+try:
     from testcontainers.mysql import MySqlContainer
     CONTAINER_REGISTRY["mysql"] = {
         "container_cls": MySqlContainer,
@@ -216,6 +308,16 @@ def ds_kwargs(name: str) -> Dict[str, Any]:
     Extract and normalize kwargs for a data source from credentials.
     Skips the test if the data source is missing or disabled.
     """
+    if name == "sharepoint_onprem" and os.environ.get("SHAREPOINT_TEST_SITE_URL"):
+        return {
+            "site_url": os.environ["SHAREPOINT_TEST_SITE_URL"],
+            "username": os.environ.get("SHAREPOINT_TEST_USERNAME"),
+            "password": os.environ.get("SHAREPOINT_TEST_PASSWORD"),
+            "allow_http": os.environ.get("SHAREPOINT_TEST_ALLOW_HTTP") == "true",
+            "drive_name": os.environ.get("SHAREPOINT_TEST_LIBRARY", "Documents"),
+            "folder_path": os.environ.get("SHAREPOINT_TEST_FOLDER", ""),
+            "recursive": True,
+        }
     cfg = dict(DS_CREDENTIALS.get(name, {}))
     if not cfg:
         pytest.skip(f"{name} missing in integrations.json (data_sources)")

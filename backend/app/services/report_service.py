@@ -21,6 +21,7 @@ from fastapi import HTTPException
 
 import uuid
 from sqlalchemy import select, or_, func, cast, delete, case, String as SAString
+from sqlalchemy.exc import IntegrityError, OperationalError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.base import JobLookupError
@@ -189,6 +190,11 @@ class ReportService:
             await SessionEventService.emit_safe(
                 db, report=report, kind=kind, user=current_user, commit=False, meta=meta,
             )
+            await self._capture_share_telemetry(
+                report=report, share_type=share_type, visibility=visibility,
+                shared_user_ids=shared_user_ids, shared_group_ids=shared_group_ids,
+                current_user=current_user, shared=True,
+            )
         else:
             kind = REPORT_UNPUBLISHED if is_conv else ARTIFACT_UNSHARED
             content = ("Conversation sharing was turned off" if is_conv
@@ -197,6 +203,32 @@ class ReportService:
                 db, report=report, kind=kind, user=current_user, commit=False,
                 content=content, meta={"visibility": "none", "share_type": share_type},
             )
+            await self._capture_share_telemetry(
+                report=report, share_type=share_type, visibility="none",
+                shared_user_ids=None, shared_group_ids=None,
+                current_user=current_user, shared=False,
+            )
+
+    async def _capture_share_telemetry(
+        self, *, report, share_type, visibility, shared_user_ids, shared_group_ids,
+        current_user, shared: bool,
+    ) -> None:
+        """Telemetry for conversation/artifact share toggles. Counts only —
+        never the resolved names built in _emit_share_event's shared_with."""
+        try:
+            event = f"{share_type}_{'shared' if shared else 'unshared'}"
+            await telemetry.capture(
+                event,
+                {
+                    "visibility": visibility,
+                    "shared_user_count": len(shared_user_ids) if shared_user_ids else 0,
+                    "shared_group_count": len(shared_group_ids) if shared_group_ids else 0,
+                },
+                user_id=current_user.id if current_user else None,
+                org_id=str(report.organization_id) if getattr(report, "organization_id", None) else None,
+            )
+        except Exception:
+            pass
 
     async def set_visibility(
         self,
@@ -209,6 +241,9 @@ class ReportService:
         organization: Organization,
         run_identity: str | None = None,
         shared_group_ids: list[str] | None = None,
+        include_data_tab: bool | None = None,
+        artifact_chat_enabled: bool | None = None,
+        artifact_chat_data_source_ids: list[str] | None = None,
     ) -> dict:
         """Set visibility for artifact or conversation sharing.
 
@@ -219,6 +254,8 @@ class ReportService:
         shared_user_ids, None leaves the existing group grants unchanged
         run_identity: artifact only — whose credentials viewer-triggered runs
         use ('viewer' | 'creator'); None leaves the current setting unchanged
+        include_data_tab: artifact only — show viewers the Data tab on
+        /r/{id}; None leaves the current setting unchanged
         """
         from app.models.report_share import ReportShare
         from app.models.group import Group
@@ -244,6 +281,7 @@ class ReportService:
                 raise HTTPException(status_code=400, detail="Unknown group in shared_group_ids")
 
         field = 'artifact_visibility' if share_type == 'artifact' else 'conversation_visibility'
+        previous_visibility = getattr(report, field, None)
         setattr(report, field, visibility)
 
         if share_type == 'artifact' and run_identity in ('viewer', 'creator'):
@@ -260,6 +298,38 @@ class ReportService:
                         detail="This dashboard uses row-level security — viewers must run under their own identity, so 'run on my behalf' is not available.",
                     )
             report.shared_run_identity = run_identity
+
+        # Artifact-only, same as run_identity: the conversation share has no
+        # Data tab, so a conversation request carrying the field is ignored
+        # rather than writing a setting that means nothing there.
+        if share_type == 'artifact' and include_data_tab is not None:
+            report.include_data_tab = bool(include_data_tab)
+
+        # Artifact-only chat settings, same omit-means-unchanged semantics.
+        if share_type == 'artifact' and artifact_chat_enabled is not None:
+            report.artifact_chat_enabled = bool(artifact_chat_enabled)
+        if share_type == 'artifact' and artifact_chat_data_source_ids is not None:
+            if artifact_chat_data_source_ids == ["*"]:
+                # Sentinel: reset to "inherit the report's attached roster".
+                report.artifact_chat_data_source_ids = None
+            else:
+                # Validate every id is a data source of this org; anything else
+                # (typo, foreign org) must not end up in the allowlist.
+                from app.models.data_source import DataSource
+                ids = [str(x) for x in artifact_chat_data_source_ids]
+                if ids:
+                    valid_rows = (await db.execute(
+                        select(DataSource.id).where(
+                            DataSource.id.in_(ids),
+                            DataSource.organization_id == str(organization.id),
+                            DataSource.deleted_at.is_(None),
+                        )
+                    )).all()
+                    valid_ids = {str(r[0]) for r in valid_rows}
+                    unknown = [i for i in ids if i not in valid_ids]
+                    if unknown:
+                        raise HTTPException(status_code=400, detail="Unknown data source in artifact_chat_data_source_ids")
+                report.artifact_chat_data_source_ids = ids
 
         # Sync legacy fields for backward compatibility
         if share_type == 'artifact':
@@ -356,14 +426,28 @@ class ReportService:
 
         # Silent session event: conversation/artifact sharing changed. Covers
         # both share_types via the same set_visibility path.
-        try:
-            await self._emit_share_event(
-                db, report=report, share_type=share_type, visibility=visibility,
-                shared_user_ids=shared_user_ids, current_user=current_user,
-                shared_group_ids=shared_group_ids,
-            )
-        except Exception:
-            pass
+        #
+        # Only when sharing ACTUALLY changed. This endpoint doubles as the write
+        # path for the display-only toggles (include_data_tab, run_identity),
+        # which re-send the current visibility and omit both principal lists to
+        # leave grants untouched. Emitting unconditionally posted a
+        # "shared with ..." event into the report's conversation on every such
+        # click. A None list means "leave unchanged", so its presence — not its
+        # contents — is what marks a real grant edit.
+        sharing_changed = (
+            previous_visibility != visibility
+            or shared_user_ids is not None
+            or shared_group_ids is not None
+        )
+        if sharing_changed:
+            try:
+                await self._emit_share_event(
+                    db, report=report, share_type=share_type, visibility=visibility,
+                    shared_user_ids=shared_user_ids, current_user=current_user,
+                    shared_group_ids=shared_group_ids,
+                )
+            except Exception:
+                pass
 
         # Notify-first: the durable in-app notification is the canonical record of
         # "shared with you" — created here on the share grant itself (email stays
@@ -438,6 +522,7 @@ class ReportService:
             "shared_user_ids": shared_user_ids or [],
             "shared_group_ids": shared_group_ids or [],
             "shared_run_identity": report.shared_run_identity,
+            "include_data_tab": report.include_data_tab,
             "conversation_share_token": report.conversation_share_token if share_type == 'conversation' and visibility != 'none' else None,
         }
 
@@ -615,6 +700,9 @@ class ReportService:
             artifact_visibility=getattr(report, "artifact_visibility", "none") or "none",
             conversation_visibility=getattr(report, "conversation_visibility", "none") or "none",
             shared_run_identity=getattr(report, "shared_run_identity", "viewer") or "viewer",
+            include_data_tab=bool(getattr(report, "include_data_tab", True)),
+            artifact_chat_enabled=bool(getattr(report, "artifact_chat_enabled", False)),
+            artifact_chat_data_source_ids=getattr(report, "artifact_chat_data_source_ids", None),
             artifact_shared_user_ids=[
                 str(s.user_id) for s in (report.shares or [])
                 if s.share_type == 'artifact' and s.user_id and s.deleted_at is None
@@ -708,9 +796,6 @@ class ReportService:
         return report_schema
 
     async def create_report(self, db: AsyncSession, report_data: ReportCreate, current_user: User, organization: Organization) -> ReportSchema:
-        # Extract widget data and remove it from report_data
-        widget_data = report_data.widget
-        del report_data.widget
         file_uuids = report_data.files or []
         del report_data.files
         data_source_ids = report_data.data_sources or []
@@ -1179,9 +1264,15 @@ class ReportService:
             # step — client construction resolves credentials (and for ODBC
             # sources pays a connection handshake) per data source.
             from app.services.data_source_service import DataSourceService
+            from app.ai.tools.implementations.agent_focus_common import resolve_run_agents
             ds_service = DataSourceService()
             db_clients = {}
-            for data_source in report.data_sources:
+            # Auto (an unattached report) is a mode, not an empty set: resolve
+            # it against the run user's accessible agents exactly like the
+            # interactive path does, so saved step code that references
+            # "<Agent>:<Connection>" client keys finds them on rerun too.
+            run_agents = await resolve_run_agents(db, organization, current_user, report)
+            for data_source in run_agents:
                 try:
                     ds_clients = await ds_service.construct_clients(db, data_source, current_user=current_user)
                     db_clients.update(ds_clients)
@@ -1236,8 +1327,13 @@ class ReportService:
                     logger.warning(f"Failed to run widget {widget.id}: {e}; continuing")
                     continue
 
-        # Update last_run_at timestamp on the already-loaded ORM model
-        report.last_run_at = datetime.utcnow()
+        # Update last_run_at on the already-loaded ORM model — but only when
+        # the run actually produced something (or there was nothing to run).
+        # A fully-failed run must not stamp the report as fresh: the artifact
+        # would show stale data under a new timestamp, and the refresh-on-view
+        # staleness gate would then suppress retries for a whole interval.
+        if steps_total == 0 or steps_succeeded > 0:
+            report.last_run_at = datetime.utcnow()
         await db.commit()
 
         # Regenerate the artifact thumbnail in background — only when some
@@ -1384,10 +1480,14 @@ class ReportService:
         # a user_required connection) is reported; steps on other sources
         # still run.
         from app.services.data_source_service import DataSourceService
+        from app.ai.tools.implementations.agent_focus_common import resolve_run_agents
         ds_service = DataSourceService()
         db_clients: dict = {}
         data_source_errors: list[dict] = []
-        for data_source in report.data_sources:
+        # Auto (an unattached report) resolves like the interactive path — the
+        # credential user's accessible agents — instead of to an empty set.
+        run_agents = await resolve_run_agents(db, organization, credential_user, report)
+        for data_source in run_agents:
             try:
                 ds_clients = await ds_service.construct_clients(db, data_source, current_user=credential_user)
                 db_clients.update(ds_clients)
@@ -1661,10 +1761,15 @@ class ReportService:
             raise HTTPException(status_code=404, detail="Report not found")
 
         now = datetime.utcnow()
+        # Plain strings only past this point: rollback() expires every ORM
+        # instance in the session (current_user included), and reading an
+        # expired attribute afterwards raises MissingGreenlet.
+        user_id = str(current_user.id)
+        report_id = str(report_id)
         existing_result = await db.execute(
             select(ReportView).filter(
                 ReportView.report_id == report_id,
-                ReportView.user_id == current_user.id,
+                ReportView.user_id == user_id,
             )
         )
         existing = existing_result.scalar_one_or_none()
@@ -1672,26 +1777,34 @@ class ReportService:
             existing.last_viewed_at = now
             existing.deleted_at = None
         else:
-            db.add(ReportView(report_id=report_id, user_id=current_user.id, last_viewed_at=now))
+            db.add(ReportView(report_id=report_id, user_id=user_id, last_viewed_at=now))
         try:
             await db.commit()
-        except Exception:
+        except IntegrityError:
             # Two tabs can race the first insert into the (report, user)
             # unique row; the loser retries as an update.
             await db.rollback()
             retry = await db.execute(
                 select(ReportView).filter(
                     ReportView.report_id == report_id,
-                    ReportView.user_id == current_user.id,
+                    ReportView.user_id == user_id,
                 )
             )
             row = retry.scalar_one_or_none()
             if row is not None:
                 row.last_viewed_at = now
                 row.deleted_at = None
-                await db.commit()
+                try:
+                    await db.commit()
+                except OperationalError:
+                    await db.rollback()
+        except OperationalError:
+            # Lock/busy timeout under concurrent writers (agent run, refresh
+            # rerun). The watermark is debounced and re-sent on the next
+            # viewed ping — dropping this write beats a 500.
+            await db.rollback()
 
-        return {"id": str(report_id), "viewed_at": now.isoformat()}
+        return {"id": report_id, "viewed_at": now.isoformat()}
 
     async def derive_activity_sets(self, db: AsyncSession, visible_ids: list[str]) -> dict:
         """Org-level activity facts for a bounded set of report ids.
@@ -2002,7 +2115,11 @@ class ReportService:
                 lazyload("*"),
                 selectinload(Query.visualizations).options(lazyload("*")),
             )
-            .where(Query.report_id == report_id, Step.status == 'success')
+            .where(
+                Query.report_id == report_id,
+                Query.deleted_at.is_(None),
+                Step.status == 'success',
+            )
         )
 
         # Apply artifact filter if present
@@ -2070,6 +2187,16 @@ class ReportService:
         from app.services.viewer_data_policy import resolve_step_data
         resolution = await resolve_step_data(db, step, report, user)
 
+        # applied_params holds the values the snapshot was materialized with,
+        # identity values included — same trust boundary as `code` and `data`
+        # above, and this route serves anonymous readers.
+        from app.services.viewer_data_policy import redact_applied_params
+        applied_params = redact_applied_params(
+            getattr(step, "applied_params", None),
+            getattr(query, "parameters", None),
+            withheld=resolution.withheld,
+        )
+
         return PublicStepSchema(
             id=step.id,
             title=step.title,
@@ -2080,6 +2207,7 @@ class ReportService:
             view=view_dict,
             viewer_result=resolution.viewer_result,
             snapshot_withheld=resolution.withheld,
+            applied_params=applied_params,
         )
 
     async def get_public_artifacts(self, db: AsyncSession, report_id: str, user=None):
@@ -2571,7 +2699,6 @@ class ReportService:
                         organization_id=str(ds.organization_id),
                         created_at=ds.created_at,
                         updated_at=ds.updated_at,
-                        context=ds.context,
                         description=ds.description,
                         summary=ds.summary,
                         is_active=ds.is_active,
@@ -2718,7 +2845,8 @@ class ReportService:
                     schema.forked_from_user_name = parent.user.name or parent.user.email
 
     async def _set_slug_for_report(self, db: AsyncSession, report: Report):
-        title_slug = report.title.replace(" ", "-").lower()
+        # title is optional on create — a missing/empty one must not 500 here.
+        title_slug = (report.title or "untitled").replace(" ", "-").lower()
         title_slug = "".join(e for e in title_slug if e.isalnum() or e == "-")
 
         _uuid = uuid.uuid4().hex[:4]
@@ -3018,6 +3146,24 @@ class ReportService:
 
         if not report.refresh_on_view:
             return _skip("not enabled")
+
+        # An agent run in flight on this report owns its step graph: an owner
+        # rerun underneath it races the agent's step writes (both sides fail)
+        # and its commits expire the agent's cached ORM state mid-loop. Skip —
+        # the agent's own run leaves the data fresh anyway. Age-bounded so an
+        # orphaned in_progress row can't disable refresh-on-view forever.
+        from datetime import timedelta as _td
+        from app.models.completion import Completion as _Completion
+        active = (await db.execute(
+            select(func.count(_Completion.id)).where(
+                _Completion.report_id == str(report_id),
+                _Completion.role == 'system',
+                _Completion.status == 'in_progress',
+                _Completion.created_at >= datetime.utcnow() - _td(minutes=30),
+            )
+        )).scalar() or 0
+        if active:
+            return _skip("agent run in progress")
 
         # Staleness gate. last_run_at is written as naive UTC (datetime.utcnow).
         if report.last_run_at is not None:

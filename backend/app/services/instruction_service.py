@@ -1537,14 +1537,7 @@ class InstructionService:
         meta_src = None
         if instruction.current_version_id:
             meta_src = await self.version_service.get_version(db, instruction.current_version_id)
-        has_main_build = (await db.execute(
-            select(InstructionBuild.id).where(
-                InstructionBuild.organization_id == str(instruction.organization_id),
-                InstructionBuild.is_main == True,  # noqa: E712
-                InstructionBuild.deleted_at == None,  # noqa: E711
-            ).limit(1)
-        )).scalar_one_or_none()
-        if has_main_build:
+        if await self._org_has_main_build(db, instruction.organization_id):
             # The org HAS a main build and this instruction isn't in it: a NEW
             # instruction that so far exists only in pending suggestion builds.
             # Its live baseline is EMPTY text. The row/current-version cache
@@ -1758,6 +1751,7 @@ class InstructionService:
                 # only on the canonical current key.
                 for h in shown:
                     h.pop("_legacy_key", None)
+                    h.pop("_unscoped_key", None)
                 out.append(shown)
             return out
 
@@ -2203,6 +2197,118 @@ class InstructionService:
                 return r.get("proposed_version_id") == pv
         return False
 
+    async def _org_has_main_build(self, db: AsyncSession, organization_id) -> bool:
+        """True when the org keeps its live content in a main build at all.
+
+        False for orgs that predate main-build content, where the cached
+        instruction row / current version IS the live text. In such an org
+        `_is_in_main_build` is False for EVERY instruction, live ones included,
+        so its answer proves nothing on its own.
+        """
+        from app.models.instruction_build import InstructionBuild
+        return (await db.execute(
+            select(InstructionBuild.id).where(
+                InstructionBuild.organization_id == str(organization_id),
+                InstructionBuild.is_main == True,  # noqa: E712
+                InstructionBuild.deleted_at == None,  # noqa: E711
+            ).limit(1)
+        )).scalar_one_or_none() is not None
+
+    async def _is_in_main_build(self, db: AsyncSession, instruction) -> bool:
+        """True when the live build carries this instruction."""
+        from app.models.instruction_build import InstructionBuild
+        from app.models.build_content import BuildContent
+        return (await db.execute(
+            select(BuildContent.id)
+            .join(InstructionBuild, InstructionBuild.id == BuildContent.build_id)
+            .where(
+                InstructionBuild.is_main == True,  # noqa: E712
+                InstructionBuild.organization_id == str(instruction.organization_id),
+                InstructionBuild.deleted_at == None,  # noqa: E711
+                BuildContent.instruction_id == str(instruction.id),
+            ).limit(1)
+        )).scalar_one_or_none() is not None
+
+    # The one verdict reason callers match on: an instruction the main build
+    # carries is simply live, the ordinary case, not a near miss worth
+    # reporting. Matched by the backfill script — keep it a constant, not a
+    # prose string two files have to agree on by hand.
+    RETIREMENT_REASON_LIVE = "carried by the main build"
+
+    async def _retirement_verdict(self, db: AsyncSession, instruction, *,
+                                  organization: Organization) -> tuple[bool, str]:
+        """The retirement DECISION and why, with no write of its own.
+
+        Split from `_retire_rejected_create_suggestion` so the backfill script
+        (`tools/agent/retire_rejected_instruction_drafts.py`) can report what it
+        would do — and on what grounds — without re-implementing the rule and
+        drifting from it. See that method's docstring for what each condition
+        proves. The reason is narration for the report; the bool is the answer.
+        """
+        iid = str(instruction.id)
+        if not await self._org_has_main_build(db, instruction.organization_id):
+            return False, "org has no main build (legacy): absence proves nothing"
+        if await self._is_in_main_build(db, instruction):
+            return False, self.RETIREMENT_REASON_LIVE
+        rows = await self._pending_suggestion_builds(db, iid, organization)
+        if not rows:
+            # No proposal to have rejected — leave unexplained state alone.
+            return False, "no proposal on record"
+        open_count = 0
+        for build, _proposed_text, proposed_vid in rows:
+            if self._voided_marker_matches(build, iid):
+                continue
+            pv = str(proposed_vid) if proposed_vid else None
+            if not self._settled_marker_matches(build, iid, pv):
+                open_count += 1  # still on the table somewhere
+        if open_count:
+            return False, f"{open_count} proposal(s) still open"
+        return True, "every proposal for it was rejected; it never went live"
+
+    async def _retire_rejected_create_suggestion(self, db: AsyncSession, instruction, *,
+                                                 organization: Organization) -> bool:
+        """Soft-delete an instruction whose CREATE suggestion was rejected outright.
+
+        Rejecting an EDIT decides the edit; the live instruction is untouched.
+        Rejecting the suggestion that would have INTRODUCED an instruction
+        leaves nothing to review — but the draft row survived it, invisible on
+        every build-scoped surface (which read the main build) while still
+        answering ``search_instructions``. The agent kept finding rejected
+        suggestions and reporting them as existing instructions, and the row
+        count in chat drifted above what the Agents page shows. Retire the row
+        instead of leaving it orphaned.
+
+        Every condition must hold, and each is proven, never assumed: the org
+        keeps its live content in a main build, the instruction is absent from
+        that build, and every open proposal for it carries a terminal verdict.
+
+        The main-build-exists check is what keeps this from eating live text.
+        Absence from the main build only means "never went live" in an org that
+        HAS a main build; in a legacy org (see `_main_text_of`) there is none,
+        `_is_in_main_build` is False for EVERY row including live ones, and
+        without this guard rejecting an EDIT to a published instruction would
+        soft-delete the instruction the edit was written against.
+
+        Deliberately NOT gated on `Instruction.status`: the MCP create path
+        stages new instructions as "published" and lets the build carry the
+        approval, so a status gate would skip exactly the orphans this exists
+        to retire. Main-build membership, not status, is what "live" means here.
+        """
+        from datetime import datetime
+        iid = str(instruction.id)
+        may_retire, _why = await self._retirement_verdict(
+            db, instruction, organization=organization,
+        )
+        if not may_retire:
+            return False
+        instruction.deleted_at = datetime.utcnow()
+        await db.commit()
+        logger.info(
+            f"Retired instruction {iid}: its create suggestion was rejected and "
+            f"it never reached the main build"
+        )
+        return True
+
     async def _settle_resolved_suggestion_rows(self, db: AsyncSession, instruction, *,
                                                organization: Organization,
                                                build_ids: Optional[set] = None) -> None:
@@ -2287,16 +2393,20 @@ class InstructionService:
             expected_main_build_id != current_main_build_id
             or expected_main_version_id != current_main_version_id
         ):
-            return None, "conflict"
+            return None, "stale"
         requested = [(str(bid), str(key)) for bid, key in (selected_hunks or [])]
         if not requested or len(set(requested)) != len(requested):
-            return None, "conflict"
+            # A duplicated (build, key) pair is a malformed request, not a race
+            # — refreshing cannot fix it, so it must not claim "moved since you
+            # viewed". Position-aware keys make duplicates impossible for a
+            # well-behaved client; this now only guards direct API callers.
+            return None, "invalid_selection"
         requested_build_ids = {bid for bid, _key in requested}
 
         rows = await self._pending_suggestion_builds(db, instruction_id, organization)  # newest first
         rows = [r for r in rows if str(r[0].id) in requested_build_ids]
         if {str(r[0].id) for r in rows} != requested_build_ids:
-            return None, "conflict"
+            return None, "stale"
 
         # Read ORM-backed values on the event loop; the worker receives only
         # immutable strings and sets.
@@ -2310,6 +2420,10 @@ class InstructionService:
         row_build_ids = [str(build.id) for build, _text, _vid in rows]
 
         def _validate_and_apply():
+            # Returns (new_text, picked, fail_status); fail_status is None on
+            # success, else "stale" (the on-screen state no longer exists —
+            # refresh helps) or "invalid_selection" (the request itself is
+            # unservable — refresh cannot help).
             available: dict[tuple[str, str], tuple[int, dict]] = {}
             for idx, (base_text, proposed_text, rejected) in enumerate(rebase_inputs):
                 bid = row_build_ids[idx]
@@ -2321,11 +2435,11 @@ class InstructionService:
                 for h in rhs:
                     pair = (bid, h["key"])
                     if pair in available:
-                        return None, None  # ambiguous key collision: fail closed
+                        return None, None, "invalid_selection"  # ambiguous key collision: fail closed
                     available[pair] = (idx, h)
 
             if any(pair not in available for pair in requested):
-                return None, None
+                return None, None, "stale"
             picked = [available[pair] for pair in requested]
 
             # The UI suppresses overlapping suggestions because it cannot show
@@ -2342,21 +2456,23 @@ class InstructionService:
                      (start < ce and end > cs))
                     for cs, ce in claimed
                 ):
-                    return None, None
+                    return None, None, "invalid_selection"
                 claimed.append((start, end))
 
             text = main_text
             for _idx, h in sorted(picked, key=lambda item: item[1]["start"], reverse=True):
                 start, end = int(h["start"]), int(h["end"])
                 if main_text[start:end] != h["before"]:
-                    return None, None
+                    return None, None, "stale"
                 text = text[:start] + h["after"] + text[end:]
-            return text, picked
+            return text, picked, None
 
         async with _HUNK_CPU:
-            new_text, picked = await asyncio.to_thread(_validate_and_apply)
+            new_text, picked, fail_status = await asyncio.to_thread(_validate_and_apply)
+        if fail_status is not None:
+            return None, fail_status
         if new_text is None or picked is None or new_text == main_text:
-            return None, "conflict"
+            return None, "stale"
 
         accepted = [
             (rows[idx][0], h["key"], h.get("after"))
@@ -2403,7 +2519,7 @@ class InstructionService:
             if failed_build and not failed_build.is_main:
                 failed_build.status = "rejected"
                 await db.commit()
-            return None, "conflict"
+            return None, "stale"
 
         # Only write review decisions after the compare-and-swap promotion
         # succeeds. A failed or racing action therefore remains retryable and
@@ -2622,16 +2738,17 @@ class InstructionService:
             or (str(against_main_version_id) if against_main_version_id else None)
             != (str(main_vid) if main_vid else None)
         ):
-            return None, "conflict"
+            return None, "stale"
         requested = [(str(bid), str(key)) for bid, key in (selected_hunks or [])]
         if not requested or len(set(requested)) != len(requested):
-            return None, "conflict"
+            # Malformed request (see accept_all_hunks) — not a race.
+            return None, "invalid_selection"
         requested_set = set(requested)
         requested_build_ids = {bid for bid, _key in requested}
         rows = await self._pending_suggestion_builds(db, instruction_id, organization)
         rows = [r for r in rows if str(r[0].id) in requested_build_ids]
         if {str(r[0].id) for r in rows} != requested_build_ids:
-            return None, "conflict"
+            return None, "stale"
         # Same shape as review_hunks: read the ORM here, rebase the whole batch in
         # one worker thread under _HUNK_CPU, sharing a single cache (every
         # suggestion rebases against the SAME main text, so the quadratic
@@ -2647,6 +2764,8 @@ class InstructionService:
         row_build_ids = [str(build.id) for build, _text, _vid in rows]
 
         def _selected_live_hunks():
+            # Returns (selected, fail_status) — same status split as
+            # accept_all_hunks's _validate_and_apply.
             cache = RebasedHunkCache()
             available: dict[tuple[str, str], tuple[int, dict]] = {}
             for idx, (base_text, proposed_text, rejected) in enumerate(rebase_inputs):
@@ -2657,16 +2776,16 @@ class InstructionService:
                         continue
                     pair = (row_build_ids[idx], h["key"])
                     if pair in available:
-                        return None
+                        return None, "invalid_selection"
                     available[pair] = (idx, h)
             if any(pair not in available for pair in requested_set):
-                return None
-            return [available[pair] for pair in requested]
+                return None, "stale"
+            return [available[pair] for pair in requested], None
 
         async with _HUNK_CPU:
-            selected = await asyncio.to_thread(_selected_live_hunks)
+            selected, fail_status = await asyncio.to_thread(_selected_live_hunks)
         if selected is None:
-            return None, "conflict"
+            return None, fail_status or "stale"
 
         verdicts = []
         for idx, h in selected:
@@ -2697,7 +2816,18 @@ class InstructionService:
         await self._emit_review_verdict_events(
             db, instruction=instruction, verdicts=verdicts, user=current_user,
         )
-        return await self.get_instruction(db, instruction.id, organization, current_user), "ok"
+        # Read the response BEFORE any retirement below: the caller asked to
+        # reject a change, and answering its own request with a 404 because the
+        # row it named is now gone would read as a failure.
+        resolved = await self.get_instruction(db, instruction.id, organization, current_user)
+        try:
+            await self._retire_rejected_create_suggestion(
+                db, instruction, organization=organization,
+            )
+        except Exception as e:
+            # A leftover draft row is untidy, not broken — never fail the reject.
+            logger.warning(f"Failed to retire rejected create suggestion {instruction_id}: {e}")
+        return resolved, "ok"
 
     async def reject_hunk(self, db: AsyncSession, instruction_id: str, *, build_id: str, hunk_key: str,
                           against_main_build_id: Optional[str],
@@ -4182,6 +4312,7 @@ class InstructionService:
                         id=str(inst.id),
                         title=getattr(inst, "title", None),
                         preview=build_preview(inst.text),
+                        description=getattr(inst, "description", None),
                         status=inst.status,
                         category=inst.category,
                         kind=getattr(inst, "kind", "instruction") or "instruction",
@@ -4198,6 +4329,8 @@ class InstructionService:
                         ai_source=getattr(inst, "ai_source", None),
                         applicable_modes=getattr(inst, "applicable_modes", None),
                         applicable_channels=getattr(inst, "applicable_channels", None),
+                        catalog_key=getattr(inst, "catalog_key", None),
+                        catalog_version=getattr(inst, "catalog_version", None),
                         current_version_id=getattr(inst, "current_version_id", None),
                         table_ref_ids=table_ref_ids.get(str(inst.id), []),
                         data_sources=ds_min,
@@ -4238,6 +4371,12 @@ class InstructionService:
                     applicable_channels=getattr(inst, "applicable_channels", None),
                     kind=getattr(inst, "kind", "instruction") or "instruction",
                     title=getattr(inst, "title", None),
+                    # Declared on the schema but never populated here, so every
+                    # full list row reported description=None — which for a
+                    # skill is the one line that says what it is for.
+                    description=getattr(inst, "description", None),
+                    catalog_key=getattr(inst, "catalog_key", None),
+                    catalog_version=getattr(inst, "catalog_version", None),
                     structured_data=getattr(inst, "structured_data", None),
                     formatted_content=getattr(inst, "formatted_content", None),
                     # Build System fields
@@ -4372,6 +4511,191 @@ class InstructionService:
             "per_page": limit,
             "pages": (total + limit - 1) // limit if limit > 0 else 1
         }
+
+    async def export_agent_bundle_zip(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        data_source_id: str,
+    ) -> tuple[bytes, str]:
+        """Serialize one agent to a portable zip bundle. Returns ``(zip_bytes,
+        agent_name)``. Layout::
+
+            instructions/*.md   one file per live instruction, YAML frontmatter
+            agent.yaml          the agent manifest (config, tables, tools, members)
+            evals/*.yaml        one file per test suite scoped to this agent
+
+        Each instruction's frontmatter carries the metadata that
+        ``instruction_sync_service`` reads back (title, category, status,
+        load_mode, kind, references), so the markdown round-trips into a git repo
+        the agent can re-sync. ``agent.yaml`` / ``evals/*.yaml`` reuse the same
+        serializers as ``GET /agents/{name}.yaml`` and
+        ``GET /tests/suites/{id}/export``.
+
+        Authorization is enforced at the route layer (per-agent ``manage``, which
+        implies ``manage_instructions`` and ``manage_evals``); this method assumes
+        the caller may manage the agent. Instructions still run through
+        ``get_instructions`` so the same visibility rules as the list apply. The
+        agent.yaml and evals sections are best-effort: a failure in either is
+        logged and skipped rather than failing the whole download.
+        """
+        import io
+        import zipfile
+        import yaml
+
+        ds = (await db.execute(
+            select(DataSource).where(and_(
+                DataSource.id == data_source_id,
+                DataSource.organization_id == organization.id,
+            ))
+        )).scalar_one_or_none()
+        if ds is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent_name = getattr(ds, "name", None) or "agent"
+
+        # Live instructions the main build carries for this agent — what the list
+        # shows. Global (agent-less) instructions are intentionally excluded:
+        # export is per-agent. Paged rather than one capped call, so an agent
+        # with more instructions than any single page can't silently export a
+        # partial archive (a truncated backup reads as a complete one).
+        items = []
+        page_size = 500
+        skip = 0
+        while True:
+            result = await self.get_instructions(
+                db, organization, current_user,
+                skip=skip, limit=page_size,
+                data_source_ids=[data_source_id],
+                include_global=False,
+                include_own=True,
+                live=True,
+            )
+            batch = result.get("items", [])
+            items.extend(batch)
+            skip += page_size
+            # Continue while the SQL-level total says more pages exist. A short
+            # page alone is NOT a stop signal: the per-user table-accessibility
+            # post-filter trims pages after SQL pagination, so a mid-list page
+            # can come back short while rows remain beyond it.
+            if skip >= int(result.get("total") or 0):
+                break
+
+        # Resolve references (table / metadata-resource / memory scopes) for the
+        # visible instructions in one query, so a table- or tool-scoped rule
+        # carries that scope in its exported frontmatter. display_text is the
+        # human label shown in the UI; fall back to type:id when it's absent.
+        from app.models.instruction_reference import InstructionReference
+        refs_by_instruction: dict = {}
+        inst_ids = [str(it.id) for it in items]
+        if inst_ids:
+            ref_rows = (await db.execute(
+                select(
+                    InstructionReference.instruction_id,
+                    InstructionReference.object_type,
+                    InstructionReference.object_id,
+                    InstructionReference.display_text,
+                ).where(InstructionReference.instruction_id.in_(inst_ids))
+            )).all()
+            for iid, otype, oid, dtext in ref_rows:
+                label = dtext or f"{otype}:{oid}"
+                refs_by_instruction.setdefault(str(iid), []).append(label)
+
+        def _slug(value: str) -> str:
+            value = re.sub(r"[^\w\s-]", "", value or "").strip().replace(" ", "-").lower()
+            return value
+
+        buf = io.BytesIO()
+        used_names: set[str] = set()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for it in items:
+                # Prefer the git source path (already unique + meaningful), else a
+                # slug of the title, else the id — always ending in .md.
+                base = None
+                if getattr(it, "source_file_path", None):
+                    base = it.source_file_path.rsplit("/", 1)[-1]
+                    if not base.endswith(".md"):
+                        base = f"{base}.md"
+                if not base:
+                    base = f"{_slug(it.title) or str(it.id)}.md"
+
+                name = base
+                n = 1
+                while name in used_names:
+                    stem = base[:-3] if base.endswith(".md") else base
+                    name = f"{stem}-{n}.md"
+                    n += 1
+                used_names.add(name)
+                name = f"instructions/{name}"
+
+                # Frontmatter: only meaningful keys, in a stable order.
+                fm: dict = {}
+                if getattr(it, "title", None):
+                    fm["title"] = it.title
+                fm["category"] = getattr(it, "category", None) or "general"
+                fm["status"] = getattr(it, "status", None) or "published"
+                fm["load_mode"] = getattr(it, "load_mode", None) or "always"
+                if getattr(it, "kind", None) and it.kind != "instruction":
+                    fm["kind"] = it.kind
+                refs = refs_by_instruction.get(str(it.id))
+                if refs:
+                    fm["references"] = refs
+
+                front = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).strip()
+                body = it.text or ""
+                content = f"---\n{front}\n---\n\n{body}\n"
+                zf.writestr(name, content)
+
+            # agent.yaml — the full agent manifest (same serializer as
+            # GET /agents/{name}.yaml). Best-effort: skip on any failure.
+            try:
+                from app.services.agent_yaml_service import AgentYamlService
+                agent_yaml = await AgentYamlService().export(
+                    db, organization, current_user, ds.name
+                )
+                zf.writestr("agent.yaml", agent_yaml)
+            except Exception as e:
+                logger.warning(f"Skipping agent.yaml in export for {data_source_id}: {e}")
+
+            # evals/*.yaml — one file per test suite scoped to this agent (same
+            # serializer as GET /tests/suites/{id}/export). Best-effort per suite.
+            try:
+                from app.services.test_suite_service import TestSuiteService
+                suite_service = TestSuiteService()
+                # Page through the agent's suites — a single capped call would
+                # silently drop suites past the cap.
+                suites = []
+                page = 1
+                while True:
+                    batch = await suite_service.list_suites(
+                        db, str(organization.id), current_user,
+                        page=page, limit=100, data_source_id=data_source_id,
+                    )
+                    suites.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    page += 1
+                used_suite_names: set[str] = set()
+                for suite in suites:
+                    try:
+                        suite_yaml = await suite_service.export_yaml(
+                            db, str(organization.id), current_user, str(suite.id)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Skipping eval suite {suite.id} in export: {e}")
+                        continue
+                    base = f"{_slug(getattr(suite, 'name', '')) or str(suite.id)}.yaml"
+                    sname = base
+                    k = 1
+                    while sname in used_suite_names:
+                        sname = f"{base[:-5]}-{k}.yaml"
+                        k += 1
+                    used_suite_names.add(sname)
+                    zf.writestr(f"evals/{sname}", suite_yaml)
+            except Exception as e:
+                logger.warning(f"Skipping evals in export for {data_source_id}: {e}")
+
+        return buf.getvalue(), agent_name
 
     async def _table_inaccessible_instruction_ids(
         self,

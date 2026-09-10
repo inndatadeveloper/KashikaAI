@@ -17,10 +17,13 @@ class EntityContextBuilder:
     entities associated with the current report's data sources.
     """
 
-    def __init__(self, db: AsyncSession, organization: Organization, report=None):
+    def __init__(self, db: AsyncSession, organization: Organization, report=None, user=None):
         self.db = db
         self.organization = organization
         self.report = report
+        # The requesting user: entity snapshots are credential-scoped on
+        # user_required/RLS sources and must be resolved per reader.
+        self.user = user
 
     # ------------------------------------------------------------------ #
     # Keyword extraction helpers (kept local to the builder to avoid      #
@@ -65,17 +68,12 @@ class EntityContextBuilder:
         if types:
             stmt = stmt.where(Entity.type.in_(types))  # type: ignore[attr-defined]
 
-        # Keyword match on title OR description (case-insensitive)
-        if keywords:
-            like_terms = [f"%{kw}%" for kw in keywords]
-            title_clauses = [Entity.title.ilike(t) for t in like_terms]  # type: ignore[attr-defined]
-            desc_clauses = [Entity.description.ilike(t) for t in like_terms]  # type: ignore[attr-defined]
-            stmt = stmt.where(or_(or_(*title_clauses), or_(*desc_clauses)))
-
-        # Restrict to data sources associated to this report
+        # Restrict to the agents in play: the caller's explicit set (the run's
+        # resolved agents — an Auto report has none attached), else the
+        # report's attachments.
         if require_source_assoc:
             ids = data_source_ids
-            if ids is None:
+            if not ids:
                 try:
                     ids = [str(ds.id) for ds in (getattr(self.report, "data_sources", []) or [])]
                 except Exception:
@@ -89,11 +87,33 @@ class EntityContextBuilder:
                     .where(entity_data_source_association.c.data_source_id.in_(ids))
                 )
             else:
-                # No data sources on report - return empty to avoid showing unrelated entities
+                # No agents in play - return empty to avoid showing unrelated entities
                 return []
+        stmt_base = stmt
+
+        recent_first = stmt_base.order_by(
+            Entity.last_refreshed_at.desc().nullslast(), Entity.updated_at.desc()
+        ).limit(top_k)
+
+        # Keyword match on title OR description (case-insensitive)
+        if keywords:
+            like_terms = [f"%{kw}%" for kw in keywords]
+            title_clauses = [Entity.title.ilike(t) for t in like_terms]  # type: ignore[attr-defined]
+            desc_clauses = [Entity.description.ilike(t) for t in like_terms]  # type: ignore[attr-defined]
+            stmt = stmt.where(or_(or_(*title_clauses), or_(*desc_clauses)))
+        else:
+            stmt = recent_first
 
         res = await self.db.execute(stmt)
         rows = res.scalars().all()
+        if not rows and keywords:
+            # Nothing in the title/description shares a word with the ask.
+            # That is the common case for a parameterized saved query ("rock
+            # albums" vs "Albums by Genre") and for follow-up turns ("why not
+            # the saved query?"), so fall back to the most recently refreshed
+            # published entities on these agents — still bounded by top_k,
+            # so the planner can at least see what exists.
+            rows = (await self.db.execute(recent_first)).scalars().all()
         # De-duplicate while preserving order
         entities: List[Entity] = list(dict.fromkeys(rows))
 
@@ -124,6 +144,8 @@ class EntityContextBuilder:
             require_source_assoc=require_source_assoc,
             data_source_ids=data_source_ids,
         )
+        from app.services.viewer_data_policy import resolve_entity_data
+
         items: List[EntityItem] = []
         for e in ents:
             try:
@@ -131,6 +153,10 @@ class EntityContextBuilder:
                 ds_names = [n for n in ds_names if n]
             except Exception:
                 ds_names = []
+            # Per-reader snapshot resolution: on a user-scoped source the
+            # cached rows are the OWNER's slice — withheld readers get the
+            # entity without data (title/description/code stay discoverable).
+            data = await resolve_entity_data(self.db, e, self.user)
             items.append(
                 EntityItem(
                     id=str(e.id),
@@ -138,7 +164,7 @@ class EntityContextBuilder:
                     title=e.title,
                     description=e.description or "",
                     code=getattr(e, 'code', None),
-                    data=getattr(e, 'data', None),
+                    data=data or None,
                     data_model=(getattr(e, 'original_data_model', None) or getattr(e, 'view', None)),
                     ds_names=ds_names,
                 )
@@ -154,18 +180,20 @@ class EntityContextBuilder:
         keywords: Optional[List[str]] = None,
         user_text: Optional[str] = None,
         allow_llm_see_data: bool = True,
+        data_source_ids: Optional[List[str]] = None,
     ) -> Optional[EntitiesSection]:
-        # Prefer explicit keywords; else derive from current context inputs
+        # Prefer explicit keywords; else derive from current context inputs.
+        # No keywords at all still builds: load_entities then lists the most
+        # recent published entities on the agents in play (bounded by top_k).
         kw = [k for k in (keywords or []) if isinstance(k, str) and len(k.strip()) >= 2]
         if not kw:
             kw = self._extract_keywords_from_context(user_text, None)
-        if not kw:
-            return None
         return await self.build(
             keywords=kw,
             types=types,
             top_k=top_k,
             require_source_assoc=require_source_assoc,
+            data_source_ids=data_source_ids,
             allow_llm_see_data=allow_llm_see_data,
         )
 

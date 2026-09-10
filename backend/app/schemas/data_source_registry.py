@@ -24,6 +24,9 @@ from app.schemas.data_sources.configs import (
     ZohoBooksCredentials,
     # Configs
     PostgreSQLConfig,
+    SharePointOnpremConfig,
+    SharePointOnpremNtlmCredentials,
+    SharePointOnpremKerberosCredentials,
     SQLiteConfig,
     OracleConfig,
     SapHanaConfig,
@@ -43,14 +46,27 @@ from app.schemas.data_sources.configs import (
     GCPConfig,
     AWSCostConfig,
     AWSAthenaConfig,
+    # AWS CloudWatch
+    AWSCloudWatchConfig,
+    AWSCloudWatchKeyCredentials,
+    AWSCloudWatchRoleCredentials,
+    AWSCloudWatchDefaultCredentials,
     VerticaConfig,
     AwsRedshiftConfig,
     TableauConfig,
     SalesforceConfig,
+    MondayConfig,
     ServiceNowConfig,
     ZabbixConfig,
+    KubernetesConfig,
+    KubernetesAccessFileCredentials,
     ZabbixTokenCredentials,
     ZabbixUserPassCredentials,
+    AppDynamicsConfig,
+    AppDynamicsUserPassCredentials,
+    AriaOperationsConfig,
+    AriaOperationsUserPassCredentials,
+    AppDynamicsApiClientCredentials,
     ElasticsearchConfig,
     ElasticsearchApiKeyCredentials,
     ElasticsearchCredentials,
@@ -109,6 +125,8 @@ from app.schemas.data_sources.configs import (
     S3RoleCredentials,
     S3DefaultCredentials,
     # QVD Files
+    PBIXConfig,
+    PBIXCredentials,
     QVDConfig,
     QVDCredentials,
     # CSV Files
@@ -128,6 +146,8 @@ from app.schemas.data_sources.configs import (
     # SharePoint / OneDrive / Google Drive (file connectors)
     SharePointConfig,
     SharePointCredentials,
+    SharePointListsConfig,
+    SharePointListsCredentials,
     OneDriveConfig,
     OneDriveCredentials,
     OneNoteConfig,
@@ -192,6 +212,7 @@ from app.schemas.data_sources.configs import (
     SalesforceCredentials,
     SalesforceJWTCredentials,
     SalesforceClientCredentials,
+    MondayApiTokenCredentials,
     ServiceNowCredentials,
     MongoDBCredentials,
     PostHogCredentials,
@@ -247,10 +268,30 @@ class AuthOptions(BaseModel):
         arbitrary_types_allowed = True
 
 
+class SetupStep(BaseModel):
+    """One step of a connector's setup guide, rendered by the connect form above
+    the fields (numbered, with a copy button on `code`). For sources whose
+    credentials must be *produced* on the remote system first (a Kubernetes
+    service-account token, an API key minted in an admin UI) rather than
+    typed from memory (host/port/user/password).
+
+    `title`/`body` are English defaults; the frontend prefers the locale
+    catalog key `data.setupGuides.<type>.<n>.{title,body}` when it exists.
+    `code` is never localized.
+    """
+
+    title: str
+    body: str = ""
+    code: Optional[str] = None
+    language: str = "bash"
+
+
 class DataSourceRegistryEntry(BaseModel):
     type: str
     title: str
     description: str
+    # Optional numbered setup guide shown above the connect form (see SetupStep).
+    setup_guide: Optional[List[SetupStep]] = None
     status: str = "active"
     version: str = "1.0.0"
     # Deprecated entries stay resolvable (existing connections keep working) but
@@ -402,6 +443,105 @@ def _entry_visible(entry: DataSourceRegistryEntry) -> bool:
     if not entry.dev_only:
         return True
     return _is_dev_environment()
+
+
+# Step 2 of the Kubernetes setup guide. Identical to
+# tools/kubernetes/print_access_file.sh — keep the two in sync (a unit test pins it).
+# tools/kubernetes/rbac.yaml, verbatim — step 1 of the Kubernetes setup guide
+# shows the admin the exact manifest they are about to apply (a cluster-wide
+# read-only role deserves to be read before it is granted) instead of pointing
+# at a remote file. Pinned to the file by a unit test.
+KUBERNETES_RBAC_MANIFEST = r"""# Bag of Words — Kubernetes connector access.
+#
+# Creates a service account with CLUSTER-WIDE READ-ONLY access (cluster-admin
+# minus the write verbs) and a long-lived token Secret. One wildcard rule, so
+# every built-in kind, every CRD group and every aggregated API
+# (metrics-server) is covered without editing this file when the cluster
+# gains an operator.
+#
+# NOTE: RBAC has no "everything except" syntax, so this role can read Secrets
+# with kubectl. The connector itself never reads them (no secrets table, the
+# escape hatch refuses secrets paths, configmap values are hidden), but treat
+# the token like a database superuser password: it is encrypted at rest and
+# rotated by deleting the Secret below.
+#
+#   kubectl apply -f rbac.yaml
+#   bash print_access_file.sh > access.yaml   # paste into the connect form
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bagofwords
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bagofwords-reader
+  namespace: bagofwords
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bagofwords-cluster-reader
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["*"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bagofwords-cluster-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bagofwords-cluster-reader
+subjects:
+  - kind: ServiceAccount
+    name: bagofwords-reader
+    namespace: bagofwords
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bagofwords-reader-token
+  namespace: bagofwords
+  annotations:
+    kubernetes.io/service-account.name: bagofwords-reader
+type: kubernetes.io/service-account-token
+"""
+
+KUBERNETES_PRINT_ACCESS_FILE_SCRIPT = r"""#!/usr/bin/env bash
+# Prints the Bag of Words cluster access file for the bagofwords-reader service account.
+set -euo pipefail
+NS="${BOW_NAMESPACE:-bagofwords}"; SECRET="${BOW_SECRET:-bagofwords-reader-token}"
+TOKEN=""
+for _ in $(seq 1 30); do
+  TOKEN="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)"
+  [ -n "$TOKEN" ] && break; sleep 1
+done
+[ -n "$TOKEN" ] || { echo "no token in secret $NS/$SECRET yet — apply rbac.yaml first" >&2; exit 1; }
+CA="$(kubectl -n "$NS" get secret "$SECRET" -o jsonpath='{.data.ca\.crt}')"
+SERVER="$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.server}')"
+cat <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: bagofwords
+  cluster:
+    server: ${SERVER}
+    certificate-authority-data: ${CA}
+users:
+- name: bagofwords-reader
+  user:
+    token: ${TOKEN}
+contexts:
+- name: bagofwords
+  context: {cluster: bagofwords, user: bagofwords-reader}
+current-context: bagofwords
+EOF
+"""
 
 
 # Central registry for data sources
@@ -636,6 +776,27 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.servicenow_client.ServiceNowClient",
         version="beta",
     ),
+    "monday": DataSourceRegistryEntry(
+        type="monday",
+        category="services",
+        title="Monday data",
+        description="Query monday.com boards as data — items, statuses, dates, people and numbers become tables the agent can filter and aggregate.",
+        config_schema=MondayConfig,
+        credentials_auth=AuthOptions(default="api_token", by_auth={
+            # The api_token schema also carries optional oauth_client_id/secret
+            # (ServiceNow pattern): the service token drives catalog indexing,
+            # the OAuth app fields power the per-user "oauth" sign-in below.
+            # `user` scope on api_token = bring-your-own-token.
+            "api_token": AuthVariant(title="API Token", schema=MondayApiTokenCredentials, scopes=["system", "user"]),
+            # Per-user delegated OAuth: authorization-code flow against
+            # auth.monday.com; queries run as the signed-in user so board
+            # permissions apply natively. monday access tokens do not expire
+            # and no refresh token is issued.
+            "oauth": AuthVariant(title="Sign in with monday.com", schema=OAuthDelegatedCredentials, scopes=["user"]),
+        }),
+        client_path="app.data_sources.clients.monday_client.MondayClient",
+        version="beta",
+    ),
     "priority_erp": DataSourceRegistryEntry(
         type="priority_erp",
         category="services",
@@ -662,6 +823,25 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         catalog_nouns=("form", "forms"),
         version="beta",
     ),
+    "appdynamics": DataSourceRegistryEntry(
+        type="appdynamics",
+        category="infra",
+        title="AppDynamics",
+        description="APM platform (Cisco / Splunk AppDynamics). Query applications, tiers, the service map, business transactions, metrics, events and health-rule violations via the Controller REST API.",
+        config_schema=AppDynamicsConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            # Basic auth with the account-qualified login (user@account) — the
+            # default for locked-down on-prem controllers that cannot issue an
+            # API client. Per-user scope = bring-your-own credentials.
+            "userpass": AuthVariant(title="Username + Password", schema=AppDynamicsUserPassCredentials, scopes=["system", "user"]),
+            # API Client OAuth client-credentials (short-lived tokens, cached
+            # and refreshed automatically) — the auditable service identity.
+            "api_client": AuthVariant(title="API Client (OAuth)", schema=AppDynamicsApiClientCredentials, scopes=["system", "user"]),
+        }),
+        # Explicit path: dynamic resolution would derive "AppdynamicsClient".
+        client_path="app.data_sources.clients.appdynamics_client.AppDynamicsClient",
+        version="beta",
+    ),
     "zabbix": DataSourceRegistryEntry(
         type="zabbix",
         category="infra",
@@ -678,11 +858,62 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.zabbix_client.ZabbixClient",
         requires_license="enterprise",
     ),
+    "kubernetes": DataSourceRegistryEntry(
+        type="kubernetes",
+        category="infra",
+        title="Kubernetes",
+        description="Investigate a Kubernetes cluster: workloads, nodes, events, networking, storage, custom resources, live usage and pod logs — read-only, through the API server.",
+        config_schema=KubernetesConfig,
+        credentials_auth=AuthOptions(default="access_file", by_auth={
+            # ONE mechanism: the bearer token of a long-lived service-account
+            # token Secret, delivered inside the access file that
+            # tools/kubernetes/print_access_file.sh prints. No kubeconfig
+            # parsing beyond that shape, no exec plugins, no per-user scope.
+            "access_file": AuthVariant(title="Cluster access file", schema=KubernetesAccessFileCredentials, scopes=["system"]),
+        }),
+        setup_guide=[
+            SetupStep(
+                title="Grant read access on the cluster",
+                body="Review the manifest, then run it with cluster-admin rights. It creates the bagofwords namespace, a service account, a cluster-wide read-only role, its binding and a long-lived token.",
+                code="kubectl apply -f - <<'EOF'\n" + KUBERNETES_RBAC_MANIFEST + "EOF",
+            ),
+            SetupStep(
+                title="Print the access file",
+                body="Save this as print_access_file.sh and run it. It waits for the token, then prints one self-contained file (API server URL, cluster CA, token). Verify it with: kubectl --kubeconfig access.yaml get nodes. If the server URL is private to your network, edit it to the address this Bag of Words instance can reach.",
+                code=KUBERNETES_PRINT_ACCESS_FILE_SCRIPT,
+            ),
+            SetupStep(
+                title="Paste it below and test the connection",
+                body="Paste the whole output into the Cluster access file field, then click Test connection.",
+            ),
+        ],
+        client_path="app.data_sources.clients.kubernetes_client.KubernetesClient",
+        version="beta",
+        requires_license="enterprise",
+    ),
+    "aria_operations": DataSourceRegistryEntry(
+        type="aria_operations",
+        category="infra",
+        title="VMware Aria Operations",
+        description="VMware Aria Operations (vRealize Operations / VCF Operations). Query the vSphere estate and every installed management pack (storage arrays, NSX …): inventory, topology, metrics with history and dynamic thresholds, alerts and symptoms via the Suite API — for infrastructure RCA.",
+        config_schema=AriaOperationsConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            # The Suite API has no API keys: a local or LDAP/AD user acquires a
+            # 6-hour session token. Per-user scope = each analyst's own Aria
+            # login, so Aria's own RBAC applies.
+            "userpass": AuthVariant(title="Username + Password", schema=AriaOperationsUserPassCredentials, scopes=["system", "user"]),
+        }),
+        # Explicit path: dynamic resolution would derive "AriaOperationsClient"
+        # correctly today, but the explicit path is the contract.
+        client_path="app.data_sources.clients.aria_operations_client.AriaOperationsClient",
+        version="beta",
+        requires_license="enterprise",
+    ),
     "elasticsearch": DataSourceRegistryEntry(
         type="elasticsearch",
         category="infra",
         title="Elasticsearch",
-        description="Search & observability engine. Investigate logs and metrics across indices, patterns, and data streams with the query DSL, aggregations, SQL, or ES|QL.",
+        description="Search & observability engine. Investigate logs and metrics across indices, patterns, and data streams with the query DSL, aggregations, SQL, or ES|QL — and, with a Kibana URL configured, replay the team's Kibana dashboards and saved searches for incident RCA.",
         config_schema=ElasticsearchConfig,
         credentials_auth=AuthOptions(
             default="apikey",
@@ -734,7 +965,7 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
             # the user's UPN is derived from their login identity unless overridden.
             "kerberos_delegated": AuthVariant(title="Kerberos SSO (per-user delegation)", schema=MssqlKerberosDelegatedCredentials, scopes=["user"]),
         }),
-        client_path=None,
+        client_path="app.data_sources.clients.mssql_client.MSSQLClient",
     ),
     "clickhouse": DataSourceRegistryEntry(
         type="clickhouse",
@@ -800,6 +1031,38 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
             "key": AuthVariant(title="AWS Keys", schema=AWSCostCredentials, scopes=["system", "user"])  # system
         }),
         client_path=None,
+        version="beta",
+    ),
+    "aws_cloudwatch": DataSourceRegistryEntry(
+        type="aws_cloudwatch",
+        category="infra",
+        title="AWS CloudWatch",
+        description="Logs and metrics from AWS. Investigate log groups with Logs Insights and chart CloudWatch metrics — both are discovered as tables on one connection.",
+        config_schema=AWSCloudWatchConfig,
+        # Same three AWS credential shapes as S3/Athena. `aws_default` is the one
+        # that matters for in-AWS deployments (instance profile / EKS IRSA), where
+        # no secret should be stored at all.
+        credentials_auth=AuthOptions(
+            default="aws_keys",
+            by_auth={
+                "aws_keys": AuthVariant(
+                    title="AWS Access Key",
+                    schema=AWSCloudWatchKeyCredentials,
+                    scopes=["system"],
+                ),
+                "aws_role": AuthVariant(
+                    title="AWS Assume Role (STS)",
+                    schema=AWSCloudWatchRoleCredentials,
+                    scopes=["system"],
+                ),
+                "aws_default": AuthVariant(
+                    title="AWS Default Chain",
+                    schema=AWSCloudWatchDefaultCredentials,
+                    scopes=["system"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.aws_cloudwatch_client.AwsCloudWatchClient",
         version="beta",
     ),
     "vertica": DataSourceRegistryEntry(
@@ -950,7 +1213,7 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
             },
         ),
         client_path="app.data_sources.clients.prometheus_client.PrometheusClient",
-        dev_only=True,
+        version="beta",
     ),
     "jaeger": DataSourceRegistryEntry(
         type="jaeger",
@@ -1156,6 +1419,29 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.qvd_client.QVDClient",
         requires_license="enterprise",
     ),
+    "pbix": DataSourceRegistryEntry(
+        type="pbix",
+        category="files",
+        title="Power BI (.pbix)",
+        description=(
+            "Query Power BI (.pbix) files with SQL. Point at file paths or glob patterns; "
+            "each file's embedded semantic model becomes queryable tables (data reflects "
+            "the last refresh saved into the file)."
+        ),
+        config_schema=PBIXConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Authentication",
+                    schema=PBIXCredentials,
+                    scopes=["system"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.pbix_client.PBIXClient",
+        catalog_nouns=("model table", "model tables"),
+    ),
     "csv": DataSourceRegistryEntry(
         type="csv",
         category="files",
@@ -1237,6 +1523,22 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.qlik_sense_onprem_client.QlikSenseOnPremClient",
         requires_license="enterprise",
     ),
+    "sharepoint_onprem": DataSourceRegistryEntry(
+        type="sharepoint_onprem",
+        category="files",
+        title="SharePoint Server (on-prem)",
+        description="Read and search SharePoint Server document libraries using NTLM or Kerberos. No Microsoft Graph or Entra app required.",
+        config_schema=SharePointOnpremConfig,
+        credentials_auth=AuthOptions(default="ntlm", by_auth={
+            "ntlm": AuthVariant(title="Windows credentials (NTLM)", schema=SharePointOnpremNtlmCredentials, scopes=["system", "user"]),
+            "kerberos": AuthVariant(title="Kerberos service account (mounted keytab / ticket cache)", schema=SharePointOnpremKerberosCredentials, scopes=["system"]),
+        }),
+        client_path="app.data_sources.clients.sharepoint_onprem_client.SharepointOnpremClient",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+        requires_license="enterprise",
+    ),
     "sharepoint": DataSourceRegistryEntry(
         type="sharepoint",
         category="files",
@@ -1268,6 +1570,42 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         is_document_based=True,
         data_shape="files",
         catalog_ownership="shared",
+        requires_license="enterprise",
+    ),
+    "sharepoint_lists": DataSourceRegistryEntry(
+        type="sharepoint_lists",
+        category="files",
+        title="SharePoint Lists",
+        description="Query SharePoint lists as tables — every list on a site becomes a queryable table with typed columns and OData filters.",
+        config_schema=SharePointListsConfig,
+        # Same auth shape as the SharePoint files connector: the admin's Entra
+        # app credentials power both the (optional) app-only catalog crawl and
+        # the per-user "Sign in with Microsoft" flow. Unlike drives, Graph list
+        # reads DO work app-only when the app holds Sites.Read.All application
+        # permission — delegated sign-in is the default, not a requirement.
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Entra ID App (Service Principal)",
+                    schema=SharePointListsCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.graph_list_client.SharepointListsClient",
+        # Tables shape — lists carry typed columns and are queried via
+        # execute_query specs, so the standard tables agent path (schema
+        # context + create_data) applies. Catalog is shared: the site's lists
+        # are one universe; per-user overlays are ACL-filtered subsets.
+        data_shape="tables",
+        catalog_ownership="shared",
+        catalog_nouns=("list", "lists"),
         requires_license="enterprise",
     ),
     "onedrive": DataSourceRegistryEntry(
@@ -1916,6 +2254,7 @@ def list_available_data_sources(include_tool_providers: bool = True) -> list[dic
             "catalog_ownership": e.catalog_ownership,
             "ui_form": e.ui_form,
             "category": e.category,
+            "setup_guide": [s.model_dump() for s in e.setup_guide] if e.setup_guide else None,
         }
         for e in REGISTRY.values()
         if (
@@ -2054,6 +2393,20 @@ def requires_no_credentials(ds_type: str) -> bool:
         return get_entry(ds_type).credentials_auth.default == "none"
     except ValueError:
         return False
+
+
+def supports_user_auth(ds_type: str) -> bool:
+    """True when at least one auth variant is allowed in the `user` scope —
+    i.e. the connector can run under a `user_required` policy where each
+    member signs in with their own credentials. Single-mechanism, system-only
+    connectors (Kubernetes: one service-account token) return False, and the
+    connect form hides the "Require user authentication" toggle for them.
+    Unknown types default to True (never hide a control by accident)."""
+    try:
+        variants = get_entry(ds_type).credentials_auth.by_auth or {}
+    except ValueError:
+        return True
+    return any("user" in (v.scopes or []) for v in variants.values())
 
 
 def default_credentials_schema_for(ds_type: str) -> Type[BaseModel]:

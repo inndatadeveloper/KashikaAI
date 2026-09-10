@@ -50,19 +50,31 @@ class OpenAIResponsesClient(LLMClient):
     annotations) and never pass through our ToolRunner.
     """
 
+    # Class-level default so instances created without __init__ (test doubles
+    # built via __new__) still resolve the attribute.
+    temperature: Optional[float] = None
+
     def __init__(
         self,
         api_key: str,
         base_url: Optional[str] = None,
         enable_web_search: bool = False,
+        temperature: Optional[float] = None,
+        default_headers: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         client_kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
         self.client = OpenAI(**client_kwargs)
         self.async_client = AsyncOpenAI(**client_kwargs)
         self.enable_web_search = enable_web_search
+        # Admin-configured override; None keeps each path's historical default
+        # (the legacy Chat Completions helpers send 0.3/1.0, the Responses path
+        # sends nothing).
+        self.temperature = temperature
 
     async def generate_image(
         self,
@@ -119,11 +131,11 @@ class OpenAIResponsesClient(LLMClient):
         return content
 
     def inference(self, model_id: str, prompt: str, images: Optional[list[ImageInput]] = None) -> LLMResponse:
-        temperature = 1.0 if "gpt-5" in model_id else 0.3
+        temperature = self.temperature if self.temperature is not None else (1.0 if "gpt-5" in model_id else 0.3)
         chat_completion = self.client.chat.completions.create(
             model=model_id,
             messages=[{"role": "user", "content": self._build_chat_content(prompt, images)}],
-            temperature=temperature,
+            **({"temperature": temperature} if not model_id.startswith("gpt-6") else {}),
         )
         content = chat_completion.choices[0].message.content or ""
         usage_raw = getattr(chat_completion, "usage", None)
@@ -136,11 +148,11 @@ class OpenAIResponsesClient(LLMClient):
     async def inference_stream(
         self, model_id: str, prompt: str, images: Optional[list[ImageInput]] = None
     ) -> AsyncGenerator[str, None]:
-        temperature = 1.0 if "gpt-5" in model_id else 0.3
+        temperature = self.temperature if self.temperature is not None else (1.0 if "gpt-5" in model_id else 0.3)
         stream = await self.async_client.chat.completions.create(
             model=model_id,
             messages=[{"role": "user", "content": self._build_chat_content(prompt, images)}],
-            temperature=temperature,
+            **({"temperature": temperature} if not model_id.startswith("gpt-6") else {}),
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -301,6 +313,11 @@ class OpenAIResponsesClient(LLMClient):
             "input": input_items,
             "stream": True,
         }
+        # The Responses path historically sends no temperature (reasoning models
+        # reject it); only an explicit admin-configured value is forwarded, and
+        # not to reasoning models, which 400 on any sampling parameter.
+        if self.temperature is not None and not model_id.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6")):
+            request_kwargs["temperature"] = self.temperature
         if system:
             request_kwargs["instructions"] = system
         request_tools: list[dict] = self._translate_tools(tools) if tools else []
@@ -326,7 +343,7 @@ class OpenAIResponsesClient(LLMClient):
             if tools and disable_parallel_tools:
                 request_kwargs["parallel_tool_calls"] = False
         is_reasoning_model = (
-            model_id.startswith(("o1", "o3", "o4", "gpt-5"))
+            model_id.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6"))
             or model_id in {"o1", "o3"}
         )
         if thinking and is_reasoning_model:

@@ -5,6 +5,7 @@ import os
 import re as _re_mod
 import time as _time
 import uuid as _uuid_mod
+from collections import Counter
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
@@ -354,8 +355,16 @@ def _resolve_reasoning_effort(
     return "off"
 
 
+from app.ai.code_execution.code_execution import ml_training_settings
 from app.ai.agents.planner import PlannerV2, PlannerV3
 from app.ai.agents.notes_context import build_notes_context
+from app.ai.run_control import (
+    ApproachFailureTracker,
+    apply_failure_strategy_policy,
+    evaluate_completion_gate,
+    load_run_completion_checklist,
+    should_reject_completion,
+)
 from app.ai.context import ContextHub, ContextBuildSpec
 from app.ai.context.context_hub import DEFAULT_CONTEXT_LIMITS
 from app.ai.context.builders.observation_context_builder import ObservationContextBuilder
@@ -392,11 +401,32 @@ from app.services.instruction_usage_service import InstructionUsageService
 from app.ai.llm.types import ImageInput
 from app.ai.llm.image_utils import normalize_image_input
 from app.ai.llm.usage_attribution import set_usage_attribution, reset_usage_attribution
+from app.ai.llm.header_injection import set_llm_identity, reset_llm_identity
+from app.services.mcp_context_injection import IdentityContext
 from app.services.usage_policy_service import UsageLimitContext
 from app.core.otel import get_tracer
 
 INDEX_LIMIT = 1000  # Number of tables to include in the index
 tracer = get_tracer(__name__)
+
+# Tools available to shared-artifact viewer chat (report_type='artifact_chat').
+# Read/query only: the viewer may ask questions and run fresh queries against
+# the agents the owner shared, but never mutate the dashboard, message anyone,
+# schedule anything, or change agent scope. Everything else is filtered out of
+# the catalog before the planner ever sees it.
+ARTIFACT_CHAT_TOOL_ALLOWLIST = {
+    "clarify",
+    "describe_tables",
+    "describe_entity",
+    "create_data",       # run a fresh query inside the viewer's own thread
+    "inspect_data",
+    "read_query",
+    "read_artifact",
+    "list_files",
+    "read_file",
+    "grep_files",
+    "search_files",
+}
 
 
 class AgentV2:
@@ -442,6 +472,12 @@ class AgentV2:
         self.org_week_start = organization_settings.config.get('week_start') if organization_settings else None
 
         self.report = report
+        # Scalar ids cached once: the run holds these ORM instances across loop
+        # iterations, and any concurrent commit (e.g. a refresh-on-view rerun
+        # on the same report) expires them — a plain attribute read then raises
+        # MissingGreenlet under AsyncSession. Logging/steering/tracing must
+        # read the cached scalars, never the live instances.
+        self.report_id = str(report.id) if report is not None else None
         self.report_type = getattr(report, 'report_type', 'regular')
         self.model = model
         self.small_model = small_model
@@ -460,7 +496,29 @@ class AgentV2:
         self._fallback_controller = None
         self._fallback_engaged = False
         self.head_completion = head_completion
+        # Stamp the asker's identity for LLM header injection BEFORE the
+        # planner below constructs its LLM client — provider header_injection
+        # rules resolve at client construction. Membership role/attributes need
+        # a DB query, so main_execution enriches this stamp at run start; the
+        # user-level fields cover the common rules (user.email/name/id) for
+        # clients built here in __init__.
+        try:
+            _init_user = getattr(head_completion, "user", None) if head_completion else None
+        except Exception:
+            _init_user = None
+        set_llm_identity(
+            IdentityContext(
+                email=getattr(_init_user, "email", "") or "",
+                name=getattr(_init_user, "name", "") or "",
+                user_id=str(getattr(_init_user, "id", "") or ""),
+            )
+            if _init_user is not None
+            else None
+        )
         self.system_completion = system_completion
+        self.system_completion_id = (
+            str(system_completion.id) if system_completion is not None else None
+        )
         self.widget = widget
         self.step = step
         _quota_org_id = str(getattr(self.organization, "id", "") or "")
@@ -553,23 +611,32 @@ class AgentV2:
                 self.clients = {k: v for k, v in clients.items() if _client_is_live(k)}
             all_files = getattr(report, 'files', []) or []
             # Split files: images go to LLM vision, everything else goes through existing flow.
-            # Connector files are excluded from the vision set: they are agent
-            # fetches, and _load_images_as_input falls back to "most recent
-            # images on the report" when a turn uploads none — so a picture the
-            # agent happened to read once would ride along as a user attachment
-            # on every later turn. Tool-supplied images already reach the model
-            # through _collect_vision_images, bounded by
-            # _VISION_IMAGE_RETENTION_LOOPS. They stay in analysis_files, which
-            # is what the code sandbox reads by path.
-            def _is_connector(f) -> bool:
-                return (getattr(f, 'source_kind', '') or '') == 'connector'
+            # Only user uploads join the vision set. Connector caches and tool
+            # artifacts are agent files, and _load_images_as_input falls back
+            # to "most recent images on the report" when a turn uploads none —
+            # so a picture the agent happened to read or produce once would
+            # ride along as a user attachment on every later turn.
+            # Tool-supplied images already reach the model through
+            # _collect_vision_images, bounded by _VISION_IMAGE_RETENTION_LOOPS.
+            # They stay in analysis_files, which is what the code sandbox
+            # reads by path.
+            def _is_agent_file(f) -> bool:
+                return (getattr(f, 'source_kind', '') or 'upload') != 'upload'
 
             self.image_files = [
                 f for f in all_files
                 if (getattr(f, 'content_type', '') or '').startswith('image/')
-                and not _is_connector(f)
+                and not _is_agent_file(f)
             ]
-            self.analysis_files = [f for f in all_files if not (getattr(f, 'content_type', '') or '').startswith('image/')]
+            # "#source" rows are persist_source_document's viewer copies of
+            # original documents (the .pdf behind a .pdf.txt session file).
+            # They are linked to the report for the embed route, but they are
+            # not analyzable and must not rejoin the roster at init.
+            self.analysis_files = [
+                f for f in all_files
+                if not (getattr(f, 'content_type', '') or '').startswith('image/')
+                and not str(getattr(f, 'source_ref', '') or '').endswith('#source')
+            ]
         else:
             self.data_sources = []
             self.clients = {}
@@ -621,6 +688,12 @@ class AgentV2:
         # Agent execution tracking
         self.project_manager = ProjectManager()
         self.current_execution = None
+
+        # In-memory telemetry rollups for this run, flushed once at
+        # agent_execution_completed — cheap counters, no DB/IO in the hot path.
+        self._tool_call_counts: Counter = Counter()
+        self._mcp_tool_call_counts: Counter = Counter()
+        self._iteration_count: int = 0
 
         # Background DB writes scheduled during the loop. Drained before the
         # final `completion.finished` SSE so the API doesn't return a "done"
@@ -743,6 +816,16 @@ class AgentV2:
         if not self._notes_enabled:
             all_catalog_dicts = [t for t in all_catalog_dicts if t['name'] not in ('create_note', 'edit_note')]
 
+        # Shared-artifact viewer chat runs read/query-only: no artifact or
+        # dashboard mutations, no comms, no automation, no agent-scope tools
+        # (the roster is a server-synced hard scope — see ArtifactChatService).
+        # Keyed on the report's own type so no caller can forget to pass it.
+        if getattr(self.report, 'report_type', 'regular') == 'artifact_chat':
+            all_catalog_dicts = [
+                t for t in all_catalog_dicts
+                if t['name'] in ARTIFACT_CHAT_TOOL_ALLOWLIST
+            ]
+
         # Remove duplicates (for tools with category="both")
         seen_tools = set()
         unique_catalog = []
@@ -864,7 +947,7 @@ class AgentV2:
                 _select(_Report)
                 .where(
                     _Report.project_id == str(proj.id),
-                    _Report.id != str(self.report.id),
+                    _Report.id != str(self.report_id),
                     _Report.status != "archived",
                     _Report.deleted_at.is_(None),
                     _Report.report_type == "regular",
@@ -1225,11 +1308,12 @@ class AgentV2:
             from app.models.artifact import Artifact
             from app.models.query import Query
             from app.models.visualization import Visualization
+            _report_id = getattr(self, "report_id", None) or (str(self.report.id) if self.report else None)
             result = await self.db.execute(
                 select(Artifact)
                 .options(lazyload("*"))
                 .where(
-                    Artifact.report_id == str(self.report.id),
+                    Artifact.report_id == str(_report_id),
                     Artifact.status == "completed",
                     # Docs (mode='doc') must never occupy the active-artifact slot:
                     # dashboard continuity rules and edit_artifact routing bind to it.
@@ -1310,6 +1394,11 @@ class AgentV2:
                 "version": artifact.version,
                 "generation_prompt": artifact.generation_prompt,
                 "visualizations": visualizations,
+                # The current source: the planner authors artifact code itself
+                # (create_artifact.code / edit_artifact ops), so the code
+                # IS the working context. Rendering caps it; oversize falls
+                # back to read_artifact.
+                "code": (artifact.content.get("code") if isinstance(artifact.content, dict) else None),
             }
         except Exception:
             logger.exception("_get_active_artifact failed")
@@ -1390,7 +1479,7 @@ class AgentV2:
                 image_file_ids = [str(f.id) for f in self.image_files]
                 result = await self.db.execute(
                     select(report_file_association.c.file_id).where(
-                        report_file_association.c.report_id == str(self.report.id),
+                        report_file_association.c.report_id == str(self.report_id),
                         report_file_association.c.file_id.in_(image_file_ids),
                         report_file_association.c.completion_id == current_cid,
                     )
@@ -1508,7 +1597,7 @@ class AgentV2:
         from app.services.file_reference_service import ensure_materialized
 
         refs = (await self.db.execute(
-            select(FileReference).where(FileReference.report_id == str(self.report.id))
+            select(FileReference).where(FileReference.report_id == str(self.report_id))
         )).scalars().all()
         if not refs:
             return
@@ -1669,7 +1758,7 @@ class AgentV2:
             seq_si = await self.project_manager.next_seq(self.db, self.current_execution)
             await self._emit_sse_event(SSEEvent(
                 event="instructions.suggest.started",
-                completion_id=str(self.system_completion.id),
+                completion_id=str(self.system_completion_id),
                 agent_execution_id=str(self.current_execution.id),
                 seq=seq_si,
                 data={}
@@ -1778,7 +1867,7 @@ class AgentV2:
                     user_memory=user_memory,
                     user_profile_attributes=user_profile_attributes,
                     notes_enabled=harness_notes_enabled,
-                    notes_context=(await build_notes_context(self.db, str(self.report.id)) if harness_notes_enabled and self.report else None),
+                    notes_context=(await build_notes_context(self.db, str(self.report_id)) if harness_notes_enabled and self.report else None),
                     project_context=(await self._build_project_context()),
                 )
 
@@ -1832,6 +1921,8 @@ class AgentV2:
                         loop_index=harness_loop_index,
                         planner_decision_model=final_decision,
                         phase="knowledge_harness",
+                        persist_tool_intents=True,
+                        max_tool_intents=4,
                     )
                 except Exception as _pd_exc:
                     logger.warning(f"Knowledge harness: save_plan_decision_from_model failed: {_pd_exc!r}")
@@ -1851,7 +1942,7 @@ class AgentV2:
                                 seq_blk = await self.project_manager.next_seq(self.db, self.current_execution)
                                 await self._emit_sse_event(SSEEvent(
                                     event="block.upsert",
-                                    completion_id=str(self.system_completion.id),
+                                    completion_id=str(self.system_completion_id),
                                     agent_execution_id=str(self.current_execution.id),
                                     seq=seq_blk,
                                     data={"block": block_schema.model_dump()},
@@ -1873,6 +1964,14 @@ class AgentV2:
                     break
                 # Bound a single decision batch.
                 actions_list = actions_list[:4]
+                _harness_intents = {
+                    int(te.action_index): te
+                    for te in (
+                        getattr(harness_plan_decision, "durable_tool_executions", [])
+                        if harness_plan_decision is not None else []
+                    )
+                    if getattr(te, "action_index", None) is not None
+                }
 
                 step_observations: list = []
 
@@ -1891,10 +1990,11 @@ class AgentV2:
                     except Exception:
                         pass
 
-                for action in actions_list:
+                for _h_action_index, action in enumerate(actions_list):
                     tool_name = action.name
                     tool_input = action.arguments or {}
                     observation = None  # per-action; aggregated after the batch
+                    tool_execution = _harness_intents.get(_h_action_index)
 
                     tool = self.registry.get(tool_name)
                     if not tool:
@@ -1903,18 +2003,34 @@ class AgentV2:
                             "summary": f"Unknown tool '{tool_name}'",
                             "error": {"code": "unknown_tool", "message": tool_name},
                         }
+                        if tool_execution is not None:
+                            await self.project_manager.finish_tool_execution(
+                                self.db,
+                                tool_execution=tool_execution,
+                                status="error",
+                                success=False,
+                                result_summary=observation["summary"],
+                                result_json=observation,
+                                error_message=observation["error"]["message"],
+                                observation=observation,
+                            )
                         step_observations.append({"tool": tool_name, **observation})
                         continue
 
                     # === Start tool execution tracking (persisted row + tool.started SSE) ===
-                    tool_execution = await self.project_manager.start_tool_execution_from_models(
-                        self.db,
-                        agent_execution=self.current_execution,
-                        plan_decision_id=(str(harness_plan_decision.id) if harness_plan_decision else None),
-                        tool_name=tool_name,
-                        tool_action=getattr(action, "type", None),
-                        tool_input_model=tool_input,
-                    )
+                    if tool_execution is None:
+                        tool_execution = await self.project_manager.start_tool_execution_from_models(
+                            self.db,
+                            agent_execution=self.current_execution,
+                            plan_decision_id=(str(harness_plan_decision.id) if harness_plan_decision else None),
+                            tool_name=tool_name,
+                            tool_action=getattr(action, "type", None),
+                            tool_input_model=tool_input,
+                            provider_call_id=getattr(action, "id", None),
+                            provider_name=getattr(action, "provider", None),
+                            provider_signature=getattr(action, "signature", None),
+                            action_index=_h_action_index,
+                        )
 
                     runtime_ctx = {
                         "db": self.db,
@@ -1954,7 +2070,7 @@ class AgentV2:
                         seq_ts = await self.project_manager.next_seq(self.db, self.current_execution)
                         await self._emit_sse_event(SSEEvent(
                             event="tool.started",
-                            completion_id=str(self.system_completion.id),
+                            completion_id=str(self.system_completion_id),
                             agent_execution_id=str(self.current_execution.id),
                             seq=seq_ts,
                             data={"tool_name": tool_name, "arguments": tool_input},
@@ -1974,7 +2090,7 @@ class AgentV2:
                                 seq_ev = await self.project_manager.next_seq(self.db, self.current_execution)
                                 await self._emit_sse_event(SSEEvent(
                                     event=ev.get("type", "tool.progress"),
-                                    completion_id=str(self.system_completion.id),
+                                    completion_id=str(self.system_completion_id),
                                     agent_execution_id=str(self.current_execution.id),
                                     seq=seq_ev,
                                     data={"tool_name": _tn, "payload": ev.get("payload", {})},
@@ -2017,6 +2133,7 @@ class AgentV2:
                             summary=observation.get("summary", "") if observation else "",
                             error_message=_observation_error_message(observation),
                             success=bool(observation and not _observation_failed(observation) and not _is_stopped),
+                            observation=observation,
                         )
                     except Exception as _fin_err:
                         logger.warning(f"Knowledge harness: finish_tool_execution failed: {_fin_err!r}")
@@ -2037,7 +2154,7 @@ class AgentV2:
                                 seq_blk = await self.project_manager.next_seq(self.db, self.current_execution)
                                 await self._emit_sse_event(SSEEvent(
                                     event="block.upsert",
-                                    completion_id=str(self.system_completion.id),
+                                    completion_id=str(self.system_completion_id),
                                     agent_execution_id=str(self.current_execution.id),
                                     seq=seq_blk,
                                     data={"block": block_schema.model_dump()},
@@ -2059,7 +2176,7 @@ class AgentV2:
                                 safe_result_json = {"summary": observation.get("summary", "") if observation else ""}
                         await self._emit_sse_event(SSEEvent(
                             event="tool.finished",
-                            completion_id=str(self.system_completion.id),
+                            completion_id=str(self.system_completion_id),
                             agent_execution_id=str(self.current_execution.id),
                             seq=seq_fin,
                             data={
@@ -2146,7 +2263,7 @@ class AgentV2:
                                     seq_p = await self.project_manager.next_seq(self.db, self.current_execution)
                                     await self._emit_sse_event(SSEEvent(
                                         event="instructions.suggest.partial",
-                                        completion_id=str(self.system_completion.id),
+                                        completion_id=str(self.system_completion_id),
                                         agent_execution_id=str(self.current_execution.id),
                                         seq=seq_p,
                                         data={"instruction": draft_payload}
@@ -2216,7 +2333,7 @@ class AgentV2:
                 seq_f = await self.project_manager.next_seq(self.db, self.current_execution)
                 await self._emit_sse_event(SSEEvent(
                     event="instructions.suggest.finished",
-                    completion_id=str(self.system_completion.id),
+                    completion_id=str(self.system_completion_id),
                     agent_execution_id=str(self.current_execution.id),
                     seq=seq_f,
                     data={"instructions": drafts}
@@ -2230,7 +2347,7 @@ class AgentV2:
                 seq_e = await self.project_manager.next_seq(self.db, self.current_execution)
                 await self._emit_sse_event(SSEEvent(
                     event="instructions.suggest.finished",
-                    completion_id=str(self.system_completion.id),
+                    completion_id=str(self.system_completion_id),
                     agent_execution_id=str(self.current_execution.id),
                     seq=seq_e,
                     data={"instructions": drafts, "error": str(e)}
@@ -2364,7 +2481,7 @@ class AgentV2:
                 return
             from app.services.context_compaction_service import context_compaction_service
             from app.models.organization import Organization
-            report_id = str(self.report.id)
+            report_id = str(self.report_id)
             organization_id = str(self.organization.id) if self.organization else None
             SessionLocal = self._session_maker
             async with SessionLocal() as session:
@@ -2397,7 +2514,7 @@ class AgentV2:
                         try:
                             await self.event_queue.put(SSEEvent(
                                 event="context.compacted",
-                                completion_id=str(self.system_completion.id) if self.system_completion else None,
+                                completion_id=str(self.system_completion_id) if self.system_completion else None,
                                 data={
                                     "covers_until_completion_id": result.get("covers_until_completion_id"),
                                     "compacted_turns": result.get("compacted_turns"),
@@ -2499,7 +2616,7 @@ class AgentV2:
             try:
                 await self.event_queue.put(SSEEvent(
                     event="completion.follow_ups",
-                    completion_id=str(self.system_completion.id),
+                    completion_id=str(self.system_completion_id),
                     data={"questions": list(questions)},
                 ))
             except Exception as e:
@@ -2587,7 +2704,7 @@ class AgentV2:
                         await service.record_batch_usage(
                             db=session,
                             org_id=str(self.organization.id),
-                            report_id=str(self.report.id) if self.report else None,
+                            report_id=str(self.report_id) if self.report else None,
                             user_id=user_id,
                             items=items_data,
                             user_role=None,  # Role not easily accessible here
@@ -2604,7 +2721,7 @@ class AgentV2:
             data = json.loads(message)
             if (
                 data.get("event") == "update_completion"
-                and data.get("completion_id") == str(self.system_completion.id)
+                and data.get("completion_id") == str(self.system_completion_id)
                 and data.get("sigkill") is not None
             ):
                 self.sigkill_event.set()
@@ -2613,7 +2730,7 @@ class AgentV2:
             if (
                 data.get("event") in ("insert_completion", "update_completion")
                 and data.get("message_type") == "steering"
-                and str(data.get("parent_id") or "") == str(self.system_completion.id)
+                and str(data.get("parent_id") or "") == str(self.system_completion_id)
             ):
                 cid = str(data.get("completion_id"))
                 prompt = data.get("prompt")
@@ -2645,7 +2762,7 @@ class AgentV2:
                 async with _casf()() as _poll_session:
                     rows = await _poll_session.execute(
                         _select(Completion.id, Completion.prompt).where(
-                            Completion.parent_id == str(self.system_completion.id),
+                            Completion.parent_id == str(self.system_completion_id),
                             Completion.role == 'user',
                             Completion.message_type == 'steering',
                         )
@@ -2674,7 +2791,7 @@ class AgentV2:
             try:
                 await self._emit_sse_event(SSEEvent(
                     event="completion.steering.applied",
-                    completion_id=str(self.system_completion.id),
+                    completion_id=str(self.system_completion_id),
                     data={"count": len(new_texts), "messages": new_texts, "ids": new_ids},
                 ))
             except Exception:
@@ -2748,7 +2865,7 @@ class AgentV2:
             if block is None:
                 block = CompletionBlock(
                     id=block_id,
-                    completion_id=str(self.system_completion.id),
+                    completion_id=str(self.system_completion_id),
                     agent_execution_id=str(self.current_execution.id),
                     source_type='decision',
                     plan_decision_id=None,
@@ -3063,8 +3180,11 @@ class AgentV2:
                 tool_name="route_model",
                 tool_action="fallback",
                 arguments_json={"cause": "fallback", "code": err_payload.get("code")},
+                # The model switch already happened; this is a retrospective
+                # audit marker, so keep its historical single-commit path.
+                persist_before_dispatch=False,
             )
-            await self.project_manager.finish_tool_execution(
+            _fb_te = await self.project_manager.finish_tool_execution(
                 self.db,
                 tool_execution=_fb_te,
                 status="success",
@@ -3094,7 +3214,7 @@ class AgentV2:
             _fb_seq = await self.project_manager.next_seq(self.db, self.current_execution)
             await self._emit_sse_event(SSEEvent(
                 event="block.upsert",
-                completion_id=str(self.system_completion.id),
+                completion_id=str(self.system_completion_id),
                 agent_execution_id=str(self.current_execution.id),
                 seq=_fb_seq,
                 data={"block": _fb_schema.model_dump()},
@@ -3105,7 +3225,7 @@ class AgentV2:
             seq = await self.project_manager.next_seq(self.db, self.current_execution)
             await self._emit_sse_event(SSEEvent(
                 event="llm.fallback",
-                completion_id=str(self.system_completion.id),
+                completion_id=str(self.system_completion_id),
                 agent_execution_id=str(self.current_execution.id),
                 seq=seq,
                 data={
@@ -3295,7 +3415,7 @@ class AgentV2:
         if not self.system_completion or not self.current_execution:
             return
 
-        comp_id = str(self.system_completion.id)
+        comp_id = str(self.system_completion_id)
         exec_id = str(self.current_execution.id)
 
         async def _runner(_loop_index=getattr(self, "_loop_index_marker", None)):
@@ -3345,7 +3465,7 @@ class AgentV2:
             from app.models.agent_execution import AgentExecution as _AE
             from app.models.completion import Completion as _Comp
             sw_exec = await self._writes.get(_AE, str(self.current_execution.id))
-            sw_comp = await self._writes.get(_Comp, str(self.system_completion.id))
+            sw_comp = await self._writes.get(_Comp, str(self.system_completion_id))
             if sw_exec and sw_comp:
                 await self.project_manager.rebuild_completion_from_blocks(
                     self._writes, sw_comp, sw_exec
@@ -3429,7 +3549,7 @@ class AgentV2:
         Best-effort: bookkeeping must never break an otherwise-healthy run.
         """
         try:
-            if not outcome or outcome.get("skipped"):
+            if not outcome:
                 return
             action = outcome.get("action")
             tool_name = outcome.get("tool_name") or getattr(action, "name", "unknown_tool")
@@ -3493,6 +3613,25 @@ class AgentV2:
             _failed = _observation_failed(_o.get("observation"))
             rollup[_tn] = rollup.get(_tn, True) and _failed
         return rollup
+
+    @staticmethod
+    def _outcome_ends_run(outcome: dict) -> bool:
+        """Whether an action outcome carries a terminal policy decision.
+
+        A skipped outcome means the requested tool did not execute.  It does
+        not mean the outcome itself is disposable: a policy may refuse the
+        action *and* end the planner loop by setting analysis_complete.
+        (The artifact-call budget used to do this; it now returns a plain
+        refusal observation instead, so the planner sees it via the batch
+        aggregate / <last_observation> and closes the turn in its own words.)
+        """
+        if not isinstance(outcome, dict):
+            return False
+        observation = outcome.get("observation")
+        return bool(
+            isinstance(observation, dict)
+            and observation.get("analysis_complete")
+        )
 
     @staticmethod
     def _carry_substantive_observation(prev, new, outcomes: list):
@@ -3766,7 +3905,7 @@ class AgentV2:
         # and the worker-thread judge (asyncio.to_thread copies the context).
         _attr_org = str(getattr(self.organization, "id", "") or "") or None
         _attr_user = str(getattr(self.head_completion, "user_id", "") or "") or None
-        _attr_report = str(self.report.id) if self.report else None
+        _attr_report = str(self.report_id) if self.report else None
         _single_ds = self.data_sources[0] if len(self.data_sources) == 1 else None
         _attr_ds = str(getattr(_single_ds, "id", "")) if _single_ds is not None else None
         # When the run started under the Auto router, stamp every LLM usage
@@ -3784,20 +3923,73 @@ class AgentV2:
                 "baseline_model_id": str(_attr_baseline) if _attr_baseline else None,
             }
         )
+        # Stamp the caller's identity for LLM header injection: providers with
+        # header_injection rules (additional_config) resolve user.email /
+        # membership.attr:* against this when their clients are constructed, so
+        # gateways can attribute cost per user. Same ambient-contextvar approach
+        # as usage attribution — LLM() is called from ~20 sites that never see
+        # the user object.
+        _identity_token = None
+        _id_user = getattr(self.head_completion, "user", None) if self.head_completion else None
+        if _id_user is not None:
+            _id_role, _id_attrs = "", {}
+            try:
+                from app.models.membership import Membership
+                _id_row = (await self.db.execute(
+                    select(Membership.role, Membership.profile_attributes).where(
+                        Membership.user_id == _id_user.id,
+                        Membership.organization_id == self.organization.id,
+                    )
+                )).first()
+                if _id_row is not None:
+                    _id_role = _id_row[0] or ""
+                    _id_attrs = dict(_id_row[1] or {})
+            except Exception:
+                logger.warning("[headers] membership lookup for identity stamp failed", exc_info=True)
+            _identity_token = set_llm_identity(IdentityContext(
+                email=getattr(_id_user, "email", "") or "",
+                name=getattr(_id_user, "name", "") or "",
+                user_id=str(getattr(_id_user, "id", "") or ""),
+                role=_id_role,
+                attributes=_id_attrs,
+            ))
+            # The planner's LLM was constructed in __init__ under the
+            # user-only identity stamp, so membership-based header rules
+            # (membership.role / membership.attr:*) resolved empty in its
+            # baked default_headers. Rebuild it under the enriched identity
+            # when the provider forwards membership fields — same cheap
+            # rebuild the model router uses on escalation.
+            try:
+                _prov_cfg = getattr(getattr(self.model, "provider", None), "additional_config", None) or {}
+                _needs_membership = any(
+                    str((r or {}).get("source", "")).startswith(("membership.", "static:"))
+                    for r in (_prov_cfg.get("header_injection") or [])
+                    if isinstance(r, dict)
+                )
+                logger.debug("[headers] identity stamped (role=%r attrs=%d membership_rules=%s)", _id_role, len(_id_attrs), _needs_membership)
+                if _needs_membership:
+                    from app.ai.llm.llm import LLM
+                    self.planner.llm = LLM(
+                        self.model,
+                        usage_session_maker=async_session_maker,
+                        usage_context=self.usage_limit_context,
+                    )
+            except Exception:
+                logger.warning("[headers] failed to rebuild planner LLM with membership identity", exc_info=True)
         try:
             import time as _time
             _t0 = _time.monotonic()
-            _rid = str(self.report.id)[:8] if self.report else "?"
+            _rid = str(self.report_id)[:8] if self.report else "?"
             def _mlog(label):
                 logger.info(f"[agent:{_rid}] {label} +{(_time.monotonic()-_t0)*1000:.0f}ms")
 
             # Start agent execution tracking
             self.current_execution = await self.project_manager.start_agent_execution(
                 self.db,
-                completion_id=str(self.system_completion.id),
+                completion_id=str(self.system_completion_id),
                 organization_id=str(self.organization.id),
                 user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
-                report_id=str(self.report.id) if self.report else None,
+                report_id=str(self.report_id) if self.report else None,
                 build_id=self.build_id,
                 is_eval_run=self.is_eval_run,
             )
@@ -3816,7 +4008,7 @@ class AgentV2:
                 "agent_execution_started",
                 {
                     "agent_execution_id": str(self.current_execution.id),
-                    "report_id": str(self.report.id) if self.report else None,
+                    "report_id": str(self.report_id) if self.report else None,
                     "model_id": self.model.model_id if self.model else None,
                 },
             ))
@@ -3871,15 +4063,38 @@ class AgentV2:
 
             # Prime static and refresh warm in parallel for faster startup
             # Pass prompt_text to enable intelligent instruction search
+            try:
+                self.context_hub.message_builder.use_durable_transcript = True
+            except Exception:
+                pass
             with tracer.start_as_current_span("agent.context_initial_load") as span:
                 span.set_attribute("agent.context.phase", "initial_prime_and_refresh")
                 if self.report is not None:
-                    span.set_attribute("report.id", str(self.report.id))
+                    span.set_attribute("report.id", str(self.report_id))
                 await asyncio.gather(
                     self.context_hub.prime_static(query=prompt_text),
                     self.context_hub.refresh_warm(),
                 )
             _mlog("context_primed")
+            # MessageContextBuilder already fetched the detailed window's
+            # blocks and bounded tool projections. Adopt the native turns it
+            # assembled from that same query before the first planner call;
+            # this is the cross-completion/process handoff and adds no query or
+            # commit to startup.
+            try:
+                durable_transcript = (
+                    self.context_hub.message_builder.get_durable_transcript()
+                )
+                if durable_transcript is not None and durable_transcript.turns:
+                    self.transcript.turns.extend(durable_transcript.turns)
+                    self.transcript.history_turn_count = len(self.transcript.turns)
+                    logger.info(
+                        "[transcript] rehydrated %d durable turn(s) before execution=%s",
+                        len(durable_transcript.turns),
+                        self.current_execution.id,
+                    )
+            except Exception:
+                logger.exception("durable transcript rehydration failed; using legacy context")
             view = self.context_hub.get_view()
             # Token metadata update in background (non-blocking)
             asyncio.create_task(self._update_context_token_metadata_background(view))
@@ -3895,7 +4110,7 @@ class AgentV2:
                     seq_inst = await self.project_manager.next_seq(self.db, self.current_execution)
                     await self._emit_sse_event(SSEEvent(
                         event="instructions.context",
-                        completion_id=str(self.system_completion.id),
+                        completion_id=str(self.system_completion_id),
                         agent_execution_id=str(self.current_execution.id),
                         seq=seq_inst,
                         data={
@@ -3973,7 +4188,7 @@ class AgentV2:
             # Compute previous tool call before this user message (DB-based, robust)
             prev_tool_name_before_last_user = None
             try:
-                report_id = str(self.report.id) if self.report else None
+                report_id = str(self.report_id) if self.report else None
                 completion_created_at = getattr(self.system_completion, "created_at", None)
                 if report_id:
                     stmt = (
@@ -4015,23 +4230,44 @@ class AgentV2:
             invalid_retry_count = 0
             max_invalid_retries = 2
             
-            # Circuit breaker for repeated tool failures
-            failed_tool_count = {}
-            max_tool_failures = 3
+            # Track exact failed approaches (tool + hashed arguments) only
+            # across adjacent planner rounds. Exhaustion asks the planner to
+            # change strategy; it never completes the whole run.
+            approach_failures = ApproachFailureTracker(threshold=3)
+
+            # Rejected end_turn attempts while a current-run Plan still has
+            # unchecked items. This has its own small liveness bound; the
+            # global step limit must never be the checklist escape hatch.
+            completion_review_count = 0
             
             # Circuit breaker for repeated successful actions (infinite success loop)
             # Training mode needs more headroom — iterative create_data calls are expected
             successful_tool_actions = []
             max_repeated_successes = 10 if self.mode == "training" else 2
 
-            # Circuit breaker for consecutive calls to the same artifact tool (regardless of arguments)
-            consecutive_artifact_tool_count = 0
-            last_artifact_tool_name = None
-            max_consecutive_artifact_calls = 1
-
-            # Circuit breaker for total artifact calls across the entire execution
+            # Cost cap on artifact generations per turn (each create/edit is a
+            # full LLM code generation + validation renders). This is the ONLY
+            # artifact-specific guard: the old consecutive-same-tool breaker
+            # force-ended the turn after two edits with a canned success
+            # message, but two different edits in one turn is a normal,
+            # convergent plan (apply the change, then fix what validation
+            # surfaced) — and identical-args loop detection can't apply here
+            # because edit prompts are free text that never repeats verbatim.
+            # Over-budget calls are refused (see the pre-execution check) with
+            # a nudge→stop escalation modelled on repeated_call_action: the
+            # FIRST refusal is a plain observation so the planner can close the
+            # turn in its own words, but a planner that keeps re-requesting the
+            # refused tool is ended on the next refusal. Sandbox testing showed
+            # a purely non-terminal refusal makes a small model re-issue
+            # edit_artifact ~24 times until the step limit and then narrate the
+            # refused edit as if it had succeeded — so the escalation is what
+            # keeps the turn both honest and bounded.
             total_artifact_calls = 0
-            max_total_artifact_calls = 2
+            max_total_artifact_calls = 4
+            artifact_refusals = {"n": 0}
+            # Last artifact version this turn actually saved, so a budget
+            # refusal can report the real state rather than a bare failure.
+            last_artifact_state: Dict[str, Any] = {}
             
             # Track whether completion.finished has been emitted to avoid duplicates
             completion_finished_emitted = False
@@ -4074,6 +4310,7 @@ class AgentV2:
             _mlog(f"loop_starting step_limit={step_limit}")
 
             for loop_index in range(step_limit):
+                self._iteration_count += 1
                 try:
                     # Test-only fault injection (inert unless BOW_AGENT_LOOP_FAULTS is set):
                     # raises here so the rescue path below is exercisable end-to-end.
@@ -4243,8 +4480,9 @@ class AgentV2:
                             allow_llm_see_data=bool(getattr(self.organization_settings.get_config("allow_llm_see_data"), "value", True)),
                             mcp_tools_enabled=bool(getattr(self.organization_settings.get_config("enable_mcp_tools"), "value", False)),
                             web_fetch_enabled=bool(getattr(self.organization_settings.get_config("enable_web_fetch"), "value", False)),
+                            ml_training_enabled=ml_training_settings(self.organization_settings)[0],
                             notes_enabled=getattr(self, "_notes_enabled", False),
-                            notes_context=(await build_notes_context(self.db, str(self.report.id)) if getattr(self, "_notes_enabled", False) and self.report else None),
+                            notes_context=(await build_notes_context(self.db, str(self.report_id)) if getattr(self, "_notes_enabled", False) and self.report else None),
                             project_context=(await self._build_project_context()),
                             web_search_enabled=self._web_search_enabled(),
                             web_search_domains=self._web_search_domains(),
@@ -4298,7 +4536,7 @@ class AgentV2:
                             seq = await self.project_manager.next_seq(self.db, self.current_execution)
                             await self._emit_sse_event(SSEEvent(
                                 event="planner.retry",
-                                completion_id=str(self.system_completion.id),
+                                completion_id=str(self.system_completion_id),
                                 agent_execution_id=str(self.current_execution.id),
                                 seq=seq,
                                 data={
@@ -4328,7 +4566,7 @@ class AgentV2:
                     try:
                         await self._emit_sse_event(SSEEvent(
                             event="block.upsert",
-                            completion_id=str(self.system_completion.id),
+                            completion_id=str(self.system_completion_id),
                             agent_execution_id=str(self.current_execution.id),
                             seq=pre_seq,
                             data={"block": {
@@ -4372,7 +4610,7 @@ class AgentV2:
                         plan_streamer = PlanningTextStreamer(
                             emit=self._emit_sse_event,
                             seq_fn=_next_seq,
-                            completion_id=str(self.system_completion.id),
+                            completion_id=str(self.system_completion_id),
                             agent_execution_id=str(self.current_execution.id),
                             block_id=current_block_id,
                             persist=_persist_partials,
@@ -4395,7 +4633,7 @@ class AgentV2:
                             )
                             await self._emit_sse_event(SSEEvent(
                                 event="block.upsert",
-                                completion_id=str(self.system_completion.id),
+                                completion_id=str(self.system_completion_id),
                                 agent_execution_id=str(self.current_execution.id),
                                 seq=_c_seq,
                                 data={"block": {
@@ -4475,12 +4713,17 @@ class AgentV2:
                                     tool_name="web_search",
                                     tool_action="search",
                                     arguments_json={"query": _q, "queries": _queries},
+                                    # This event is emitted only after the
+                                    # provider search has completed. Persist it
+                                    # atomically with the result below instead
+                                    # of adding a redundant pre-result commit.
+                                    persist_before_dispatch=False,
                                 )
                                 # The provider reports per-call status; treat anything
                                 # other than 'completed' (e.g. 'failed', 'incomplete')
                                 # as an error so it doesn't render as a silent success.
                                 _ws_ok = (evt.status or "completed") == "completed"
-                                await self.project_manager.finish_tool_execution(
+                                _te = await self.project_manager.finish_tool_execution(
                                     self.db,
                                     tool_execution=_te,
                                     status="success" if _ws_ok else "error",
@@ -4509,7 +4752,7 @@ class AgentV2:
                                 _ws_seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                 await self._emit_sse_event(SSEEvent(
                                     event="block.upsert",
-                                    completion_id=str(self.system_completion.id),
+                                    completion_id=str(self.system_completion_id),
                                     agent_execution_id=str(self.current_execution.id),
                                     seq=_ws_seq,
                                     data={"block": _ws_schema.model_dump()},
@@ -4561,7 +4804,7 @@ class AgentV2:
                                 event_seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                 await self._emit_sse_event(SSEEvent(
                                     event="decision.partial",
-                                    completion_id=str(self.system_completion.id),
+                                    completion_id=str(self.system_completion_id),
                                     agent_execution_id=str(self.current_execution.id),
                                     seq=event_seq,
                                     data={
@@ -4578,6 +4821,92 @@ class AgentV2:
                             self._record_planner_token_metadata_from_decision(decision, view=view)
                             # Track whether analysis is complete
                             analysis_done = bool(getattr(decision, "analysis_complete", False))
+
+                            # ``end_turn`` is a request to finish, not proof
+                            # that a multi-step task is done. A current-run
+                            # Plan note with pending items forces another
+                            # planner iteration before anything is persisted as
+                            # a successful final decision.
+                            _gate_actions = list(getattr(decision, "actions", None) or [])
+                            if not _gate_actions and getattr(decision, "action", None) is not None:
+                                _gate_actions = [decision.action]
+                            if (
+                                analysis_done
+                                and not _gate_actions
+                                and getattr(self, "_notes_enabled", False)
+                                and self.current_execution is not None
+                            ):
+                                _checklist = await load_run_completion_checklist(
+                                    self.db,
+                                    execution_id=str(self.current_execution.id),
+                                )
+                                _completion_gate = evaluate_completion_gate(
+                                    _checklist,
+                                    plan_required=False,
+                                )
+                                if should_reject_completion(
+                                    _completion_gate,
+                                    prior_rejections=completion_review_count,
+                                ):
+                                    completion_review_count += 1
+                                    analysis_done = False
+                                    decision.analysis_complete = False
+                                    # Do not replay the provisional final answer
+                                    # as accepted assistant transcript context.
+                                    self._last_assistant_text = ""
+                                    observation = {
+                                        "summary": (
+                                            "Completion was not accepted because the current Plan "
+                                            "note still has unchecked required items."
+                                        ),
+                                        "completion_review": {
+                                            "status": "incomplete",
+                                            "reason": _completion_gate.reason,
+                                            "attempt": completion_review_count,
+                                            "unchecked_items": list(_checklist.pending_items),
+                                        },
+                                        "instruction": (
+                                            "Continue the task. Complete the pending work and use "
+                                            "edit_note to check off each item only when supported by "
+                                            "the evidence already gathered."
+                                        ),
+                                    }
+                                    # Keep rejected completion candidates in the
+                                    # DB even though their UI skeleton is
+                                    # cancelled. Without this, repeated reviews
+                                    # disappear and a 100-step loop looks like a
+                                    # handful of ordinary actions over SSH.
+                                    try:
+                                        if decision_seq is None:
+                                            decision_seq = await self.project_manager.next_seq(
+                                                self.db, self.current_execution
+                                            )
+                                        await self.project_manager.save_plan_decision_from_model(
+                                            self.db,
+                                            agent_execution=self.current_execution,
+                                            seq=decision_seq,
+                                            loop_index=loop_index,
+                                            planner_decision_model=decision,
+                                            phase="completion_review",
+                                        )
+                                    except Exception as _review_persist_exc:
+                                        logger.warning(
+                                            "[agent] completion review persistence failed "
+                                            "(loop=%s): %r",
+                                            loop_index,
+                                            _review_persist_exc,
+                                        )
+                                    await _cancel_skeleton_block("unfinished_plan_checklist")
+                                    break
+                                if not _completion_gate.accepted:
+                                    logger.warning(
+                                        "[agent] accepting completion after %d checklist "
+                                        "rejections to preserve run liveness "
+                                        "(execution=%s, pending=%d)",
+                                        completion_review_count,
+                                        getattr(self.current_execution, "id", None),
+                                        len(_checklist.pending_items),
+                                    )
                         
                             # Retry flow: invalid planner output OR underlying LLM error
                             if getattr(decision, "error", None):
@@ -4656,7 +4985,7 @@ class AgentV2:
                                         seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                         await self._emit_sse_event(SSEEvent(
                                             event="llm.error",
-                                            completion_id=str(self.system_completion.id),
+                                            completion_id=str(self.system_completion_id),
                                             agent_execution_id=str(self.current_execution.id),
                                             seq=seq,
                                             data={**llm_err_payload, "context": "planner", "attempt": invalid_retry_count + 1},
@@ -4718,7 +5047,7 @@ class AgentV2:
                                             if self.event_queue:
                                                 await self.event_queue.put(SSEEvent(
                                                     event="completion.finished",
-                                                    completion_id=str(self.system_completion.id),
+                                                    completion_id=str(self.system_completion_id),
                                                     data={
                                                         "status": "error",
                                                         "error": {**(llm_err_payload or {"code": "validation_error", "summary": _final_msg, "provider_message": err_msg or ""}), "message": _final_msg},
@@ -4731,7 +5060,7 @@ class AgentV2:
                                                 if self.event_queue:
                                                     await self.event_queue.put(SSEEvent(
                                                         event="completion.finished",
-                                                        completion_id=str(self.system_completion.id) if self.system_completion else None,
+                                                        completion_id=str(self.system_completion_id) if self.system_completion else None,
                                                         data={
                                                             "status": "error",
                                                             "error": {**(llm_err_payload or {}), "message": err_msg or "Planner failed"},
@@ -4753,7 +5082,7 @@ class AgentV2:
                                     seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                     await self._emit_sse_event(SSEEvent(
                                         event="planner.retry",
-                                        completion_id=str(self.system_completion.id),
+                                        completion_id=str(self.system_completion_id),
                                         agent_execution_id=str(self.current_execution.id),
                                         seq=seq,
                                         data={
@@ -4784,6 +5113,8 @@ class AgentV2:
                                     seq=decision_seq,
                                     loop_index=loop_index,
                                     planner_decision_model=decision,
+                                    persist_tool_intents=True,
+                                    max_tool_intents=self._max_actions_per_decision(),
                                 )
                             except Exception as _pd_exc:
                                 logger.error(
@@ -4795,7 +5126,7 @@ class AgentV2:
                             # Emit decision.final FIRST — UI renders immediately, no DB wait.
                             await self._emit_sse_event(SSEEvent(
                                 event="decision.final",
-                                completion_id=str(self.system_completion.id),
+                                completion_id=str(self.system_completion_id),
                                 agent_execution_id=str(self.current_execution.id),
                                 seq=event_seq,
                                 data={
@@ -4833,7 +5164,7 @@ class AgentV2:
                                         )
                                         await self._emit_sse_event(SSEEvent(
                                             event="block.upsert",
-                                            completion_id=str(self.system_completion.id),
+                                            completion_id=str(self.system_completion_id),
                                             agent_execution_id=str(self.current_execution.id),
                                             seq=_blk_seq,
                                             data={"block": block_schema.model_dump()}
@@ -4870,7 +5201,7 @@ class AgentV2:
                                         _bseq = await self.project_manager.next_seq(self.db, self.current_execution)
                                         await self._emit_sse_event(SSEEvent(
                                             event="block.upsert",
-                                            completion_id=str(self.system_completion.id),
+                                            completion_id=str(self.system_completion_id),
                                             agent_execution_id=str(self.current_execution.id),
                                             seq=_bseq,
                                             data={"block": _bs.model_dump()},
@@ -4891,7 +5222,7 @@ class AgentV2:
                                     )
                                     await self._emit_sse_event(SSEEvent(
                                         event="agent.warning",
-                                        completion_id=str(self.system_completion.id),
+                                        completion_id=str(self.system_completion_id),
                                         agent_execution_id=str(self.current_execution.id),
                                         seq=_warn_seq,
                                         data={"message": "Planning state could not be persisted; retrying may help"},
@@ -4927,6 +5258,14 @@ class AgentV2:
                             # `action` keeps its name for back-compat with downstream branches
                             # below that haven't been moved into the dispatch path.
                             action = actions_list[0] if actions_list else None
+                            _prestarted_tool_executions = {
+                                int(te.action_index): te
+                                for te in (
+                                    getattr(current_plan_decision, "durable_tool_executions", [])
+                                    if current_plan_decision is not None else []
+                                )
+                                if getattr(te, "action_index", None) is not None
+                            }
 
                             # Only treat analysis_complete as terminal if there's NO action
                             if decision.analysis_complete and not action:
@@ -4967,7 +5306,7 @@ class AgentV2:
                                     if self.event_queue:
                                         await self.event_queue.put(SSEEvent(
                                             event="completion.finished",
-                                            completion_id=str(self.system_completion.id),
+                                            completion_id=str(self.system_completion_id),
                                             data={"status": "success"}
                                         ))
                                     completion_finished_emitted = True
@@ -5024,7 +5363,7 @@ class AgentV2:
                                             if self.event_queue:
                                                 await self.event_queue.put(SSEEvent(
                                                     event="completion.finished",
-                                                    completion_id=str(self.system_completion.id),
+                                                    completion_id=str(self.system_completion_id),
                                                     data={"status": "error",
                                                           "error": {**_np_err, "message": _np_msg}},
                                                 ))
@@ -5041,7 +5380,7 @@ class AgentV2:
                                     seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                     await self._emit_sse_event(SSEEvent(
                                         event="planner.retry",
-                                        completion_id=str(self.system_completion.id),
+                                        completion_id=str(self.system_completion_id),
                                         agent_execution_id=str(self.current_execution.id),
                                         seq=seq,
                                         data={
@@ -5078,7 +5417,7 @@ class AgentV2:
                                             _eb_seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                             await self._emit_sse_event(SSEEvent(
                                                 event="block.upsert",
-                                                completion_id=str(self.system_completion.id),
+                                                completion_id=str(self.system_completion_id),
                                                 agent_execution_id=str(self.current_execution.id),
                                                 seq=_eb_seq,
                                                 data={"block": _eb_schema.model_dump()},
@@ -5104,6 +5443,7 @@ class AgentV2:
                                 """
                                 tool_name = action.name
                                 tool_input = action.arguments
+                                tool_execution = _prestarted_tool_executions.get(tool_index)
 
                                 # A natively-registered MCP tool is rewritten into the
                                 # equivalent execute_mcp call before anything else runs.
@@ -5113,69 +5453,161 @@ class AgentV2:
                                 # the gateway path, so native registration changes how
                                 # the model SEES the tool, not how we execute it.
                                 tool_name, tool_input = self._rewrite_native_mcp_action(tool_name, tool_input)
+                                if tool_execution is not None:
+                                    # Keep the durable row aligned with the actual
+                                    # gateway call while retaining the provider's
+                                    # own id/signature on the dedicated columns.
+                                    tool_execution.tool_name = tool_name
+                                    tool_execution.arguments_json = tool_input
+
+                                async def _refuse_before_dispatch(_observation: dict):
+                                    """Close a staged intent that policy/validation refused."""
+                                    if tool_execution is not None:
+                                        async with self._tool_db_lock:
+                                            self.project_manager._configure_finished_tool_execution(
+                                                tool_execution,
+                                                result_model=_observation,
+                                                summary=_observation.get("summary", "Tool was not executed"),
+                                                error_message=(
+                                                    (_observation.get("error") or {}).get("message")
+                                                    if isinstance(_observation.get("error"), dict)
+                                                    else None
+                                                ),
+                                                success=False,
+                                                observation=_observation,
+                                            )
+                                            await self.project_manager.commit_tool_and_attach_block(
+                                                self.db,
+                                                self.system_completion,
+                                                self.current_execution,
+                                                tool_execution,
+                                                block_id=_block_id_for_action,
+                                            )
+                                    return {
+                                        "index": tool_index,
+                                        "tool_name": tool_name,
+                                        "tool_input": tool_input,
+                                        "action": action,
+                                        "skipped": True,
+                                        "inv": _inv,
+                                        "tool_execution": tool_execution,
+                                        "observation": _observation,
+                                    }
 
                                 # Validate tool availability for chosen plan_type
                                 if not self._validate_tool_for_plan_type(tool_name, decision.plan_type):
-                                    return {
-                                        "index": tool_index, "tool_name": tool_name, "tool_input": tool_input,
-                                        "action": action, "skipped": True, "inv": _inv,
-                                        "observation": {
+                                    return await _refuse_before_dispatch({
                                             "summary": f"Tool '{tool_name}' not available for plan_type '{decision.plan_type}'",
                                             "error": {"code": "resolve_error", "message": "tool/plan_type mismatch"},
-                                        },
-                                    }
+                                        })
 
                                 tool = self.registry.get(tool_name)
                                 if not tool:
-                                    return {
-                                        "index": tool_index, "tool_name": tool_name, "tool_input": tool_input,
-                                        "action": action, "skipped": True, "inv": _inv,
-                                        "observation": {
+                                    return await _refuse_before_dispatch({
                                             "summary": f"Tool '{tool_name}' unavailable",
                                             "error": {"code": "resolve_error", "message": "not registered"},
-                                        },
-                                    }
+                                        })
 
-                                # Artifact budget is enforced BEFORE execution: the old
-                                # post-hoc check let an over-budget call run to completion
-                                # (a full artifact LLM generation) before ending the turn.
+                                # Artifact budget is enforced BEFORE execution: an
+                                # over-budget call must not run (each one is a full
+                                # artifact LLM generation). Refusals escalate like
+                                # repeated_call_action: the FIRST is a plain
+                                # observation so the planner can close the turn in
+                                # its own words; if it re-requests an artifact tool
+                                # anyway, the next refusal ends the turn with an
+                                # honest, non-fabricated answer. Without the
+                                # escalation a small model loops on the refusal to
+                                # the step limit and then claims the refused edit
+                                # succeeded.
                                 if tool_name in ("create_artifact", "edit_artifact") and total_artifact_calls >= max_total_artifact_calls:
-                                    return {
-                                        "index": tool_index, "tool_name": tool_name, "tool_input": tool_input,
-                                        "action": action, "skipped": True, "inv": _inv,
-                                        "observation": {
-                                            "summary": (
-                                                f"Artifact call budget reached ({max_total_artifact_calls} per turn); "
-                                                f"'{tool_name}' was not executed. The latest artifact version is preserved."
-                                            ),
-                                            "error": {"code": "artifact_budget_exhausted", "message": "artifact call budget reached"},
-                                            "analysis_complete": True,
-                                            "final_answer": (
-                                                "I've reached the artifact-update limit for this turn. "
-                                                "The latest dashboard version is preserved — ask me to continue if further changes are needed."
+                                    artifact_refusals["n"] += 1
+                                    # Name the state that DID save. A refusal is a
+                                    # deferral, not a broken artifact: without the
+                                    # saved version in the message the planner
+                                    # narrates the whole turn as a failure and the
+                                    # user reads a working dashboard as broken.
+                                    _saved_version = last_artifact_state.get("version")
+                                    _saved_txt = (
+                                        f"v{_saved_version} is saved and working with all {total_artifact_calls} "
+                                        "of this turn's applied change(s)"
+                                        if _saved_version is not None else
+                                        f"all {total_artifact_calls} change(s) that ran this turn are saved"
+                                    )
+                                    _refusal_obs: Dict[str, Any] = {
+                                        "summary": (
+                                            f"Artifact call budget reached ({max_total_artifact_calls} per turn); "
+                                            f"'{tool_name}' was NOT executed and every further create/edit_artifact "
+                                            f"call this turn will also be refused. NOTHING IS BROKEN: {_saved_txt}. "
+                                            "Only this one further change was deferred — it was not applied. Do NOT "
+                                            "request artifact tools again. Write your final answer now: lead with what "
+                                            "IS done and saved, then name the single deferred change and tell the user "
+                                            "to ask again to continue it. Never describe a refused edit as completed, "
+                                            "and never describe the artifact as failed or broken — it is intact."
+                                        ),
+                                        "error": {
+                                            "code": "artifact_budget_exhausted",
+                                            "message": (
+                                                f"Edit limit for this turn reached ({max_total_artifact_calls} artifact "
+                                                f"updates). This change was not applied and the dashboard is unchanged "
+                                                f"— {_saved_txt}. Ask again to continue with the rest."
                                             ),
                                         },
+                                        "artifact_deferred": True,
                                     }
+                                    if _saved_version is not None:
+                                        _refusal_obs["saved_version"] = _saved_version
+                                    if artifact_refusals["n"] > 1:
+                                        # The planner ignored the first refusal — end the
+                                        # turn rather than let it loop to the step limit
+                                        # (and then narrate the refused edit as done).
+                                        _refusal_obs["analysis_complete"] = True
+                                        _refusal_obs["final_answer"] = (
+                                            f"I applied {total_artifact_calls} change(s) to the dashboard"
+                                            + (
+                                                f" — it's saved and working at v{_saved_version} — and then hit"
+                                                if _saved_version is not None else ", then hit"
+                                            )
+                                            + f" this turn's limit of {max_total_artifact_calls} artifact "
+                                            "updates, so the remaining requested change was deferred rather than "
+                                            "applied. Nothing is broken and nothing was lost. Ask me to continue and "
+                                            "I'll pick up the rest."
+                                        )
+                                    return await _refuse_before_dispatch(_refusal_obs)
 
                                 async with self._tool_db_lock:
                                     # Start tool execution tracking
-                                    tool_execution = await self.project_manager.start_tool_execution_from_models(
-                                        self.db,
-                                        agent_execution=self.current_execution,
-                                        plan_decision_id=current_plan_decision.id if current_plan_decision else None,
-                                        tool_name=tool_name,
-                                        tool_action=action.type,
-                                        tool_input_model=tool_input,
-                                    )
+                                    if tool_execution is None:
+                                        tool_execution = await self.project_manager.start_tool_execution_from_models(
+                                            self.db,
+                                            agent_execution=self.current_execution,
+                                            plan_decision_id=current_plan_decision.id if current_plan_decision else None,
+                                            tool_name=tool_name,
+                                            tool_action=action.type,
+                                            tool_input_model=tool_input,
+                                            provider_call_id=getattr(action, "id", None),
+                                            provider_name=getattr(action, "provider", None),
+                                            provider_signature=getattr(action, "signature", None),
+                                            action_index=tool_index,
+                                        )
                                     # Telemetry: tool started
                                     try:
+                                        _start_props = {
+                                            "agent_execution_id": str(self.current_execution.id),
+                                            "tool_name": tool_name,
+                                            "tool_action": action.type,
+                                            "platform": self.platform,
+                                        }
+                                        # MCP calls are dispatched through one meta-tool
+                                        # (execute_mcp); the actual downstream tool/server
+                                        # lives in the call's own arguments, not the outer
+                                        # tool_name, so surface it here instead of adding a
+                                        # separate per-MCP-tool event.
+                                        if tool_name == "execute_mcp" and isinstance(tool_input, dict):
+                                            _start_props["mcp_tool_name"] = tool_input.get("tool_name")
+                                            _start_props["mcp_connection_id"] = tool_input.get("connection_id")
                                         await telemetry.capture(
                                             "agent_tool_started",
-                                            {
-                                                "agent_execution_id": str(self.current_execution.id),
-                                                "tool_name": tool_name,
-                                                "tool_action": action.type,
-                                            },
+                                            _start_props,
                                             user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
                                             org_id=str(self.organization.id) if self.organization else None,
                                         )
@@ -5186,7 +5618,7 @@ class AgentV2:
                                     seq = await self.project_manager.next_seq(self.db, self.current_execution)
                                     await self._emit_sse_event(SSEEvent(
                                         event="tool.started",
-                                        completion_id=str(self.system_completion.id),
+                                        completion_id=str(self.system_completion_id),
                                         agent_execution_id=str(self.current_execution.id),
                                         seq=seq,
                                         data={
@@ -5260,6 +5692,8 @@ class AgentV2:
                                         "platform_context": self.platform_context,
                                         "tool_call_id": str(tool_execution.id) if tool_execution else None,
                                         "usage_limit_context": self.usage_limit_context,
+                                        "planner_phase": "main",
+                                        "planner_round_index": loop_index,
                                         "pending_officejs_registry": pending_officejs_registry,
                                     }
 
@@ -5281,7 +5715,7 @@ class AgentV2:
                                         seq_ev = await self.project_manager.next_seq(self.db, self.current_execution)
                                         await self._emit_sse_event(SSEEvent(
                                             event=ev.get("type", "tool.progress"),
-                                            completion_id=str(self.system_completion.id),
+                                            completion_id=str(self.system_completion_id),
                                             agent_execution_id=str(self.current_execution.id),
                                             seq=seq_ev,
                                             data={
@@ -5302,7 +5736,7 @@ class AgentV2:
                                     span.set_attribute("tool.name", tool_name)
                                     span.set_attribute("agent.loop_index", loop_index)
                                     if self.report is not None:
-                                        span.set_attribute("report.id", str(self.report.id))
+                                        span.set_attribute("report.id", str(self.report_id))
                                     if tool_execution is not None:
                                         span.set_attribute("tool_execution.id", str(tool_execution.id))
                                     tool_result = await self.tool_runner.run(tool, tool_input, runtime_ctx, emit)
@@ -5388,6 +5822,7 @@ class AgentV2:
                                             error_message=_error_msg,
                                             success=_success_flag,
                                             sub_timings_json=tool_sub_timings,
+                                            observation=observation,
                                         )
                                     except AttributeError:
                                         # Fallback if helper isn't wired yet — keep behavior
@@ -5403,6 +5838,7 @@ class AgentV2:
                                             context_snapshot_id=None,
                                             success=_success_flag,
                                             sub_timings_json=tool_sub_timings,
+                                            observation=observation,
                                         )
 
                                     # Save post-tool context snapshot in background (not user-facing, not needed for next loop).
@@ -5435,16 +5871,36 @@ class AgentV2:
                                     else:
                                         asyncio.create_task(_bg_post_snap())
 
-                                    # Telemetry: tool finished
+                                    # Telemetry: tool finished (in-memory counters — no IO)
+                                    self._tool_call_counts[tool_name] += 1
+                                    if tool_name == "execute_mcp" and isinstance(tool_input, dict):
+                                        _mcp_name = tool_input.get("tool_name")
+                                        if _mcp_name:
+                                            self._mcp_tool_call_counts[_mcp_name] += 1
                                     try:
+                                        _tool_props = {
+                                            "agent_execution_id": str(self.current_execution.id),
+                                            "tool_name": tool_name,
+                                            "status": "error" if _observation_failed(observation) else "success",
+                                            "duration_ms": getattr(tool_execution, "duration_ms", None),
+                                            "platform": self.platform,
+                                        }
+                                        # Model-routing detail: route_model's own observation already
+                                        # carries from/to model + reason, so surface it on this same
+                                        # event instead of adding a dedicated routing event.
+                                        if tool_name == "route_model" and isinstance(observation, dict):
+                                            _tool_props["routed"] = observation.get("routed")
+                                            _tool_props["from_model"] = observation.get("from_model")
+                                            _tool_props["to_model"] = observation.get("model")
+                                            _tool_props["routing_reason"] = observation.get("reason")
+                                        # Same idea for MCP: surface the actual downstream
+                                        # tool/server, mirroring the agent_tool_started event.
+                                        if tool_name == "execute_mcp" and isinstance(tool_input, dict):
+                                            _tool_props["mcp_tool_name"] = tool_input.get("tool_name")
+                                            _tool_props["mcp_connection_id"] = tool_input.get("connection_id")
                                         await telemetry.capture(
                                             "agent_tool_finished",
-                                            {
-                                                "agent_execution_id": str(self.current_execution.id),
-                                                "tool_name": tool_name,
-                                                "status": "error" if _observation_failed(observation) else "success",
-                                                "duration_ms": getattr(tool_execution, "duration_ms", None),
-                                            },
+                                            _tool_props,
                                             user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
                                             org_id=str(self.organization.id) if self.organization else None,
                                         )
@@ -5458,7 +5914,7 @@ class AgentV2:
                                     # bg session so they share a transaction-ish boundary.
                                     # The block.upsert SSE moves into the bg task too —
                                     # serialize_block_v2 needs the block in DB.
-                                    _bg_comp_id = str(self.system_completion.id)
+                                    _bg_comp_id = str(self.system_completion_id)
                                     _bg_exec_id = str(self.current_execution.id)
                                     _bg_tool_exec = tool_execution  # in-memory, configured
 
@@ -5573,7 +6029,7 @@ class AgentV2:
                                             safe_result_json = {"summary": observation.get("summary", "") if observation else ""}
                                     await self._emit_sse_event(SSEEvent(
                                         event="tool.finished",
-                                        completion_id=str(self.system_completion.id),
+                                        completion_id=str(self.system_completion_id),
                                         agent_execution_id=str(self.current_execution.id),
                                         seq=seq_fin,
                                         data={
@@ -5609,7 +6065,7 @@ class AgentV2:
                                             seq_ti = await self.project_manager.next_seq(self.db, self.current_execution)
                                             await self._emit_sse_event(SSEEvent(
                                                 event="instructions.context",
-                                                completion_id=str(self.system_completion.id),
+                                                completion_id=str(self.system_completion_id),
                                                 agent_execution_id=str(self.current_execution.id),
                                                 seq=seq_ti,
                                                 data={
@@ -5661,34 +6117,29 @@ class AgentV2:
                             )
 
                             # ---- Aggregate outcomes (in action order, matching serial semantics) ----
-                            # Failure circuit breaker counts PER BATCH, not per action:
-                            # the 3-strike threshold means "consecutive failed planner
-                            # iterations". Counting each batch member would let a single
-                            # 5-action batch (e.g. the model guessed a wrong table name
-                            # in all five) trip the breaker and end the turn before the
-                            # planner ever sees the errors and corrects course. A tool
-                            # counts one failed round only when ALL its actions in the
-                            # batch failed; any success resets it (serial parity: one
-                            # action behaves exactly as before).
-                            for _tn, _fails in self._batch_failure_rollup(outcomes).items():
-                                if _fails:
-                                    failed_tool_count[_tn] = failed_tool_count.get(_tn, 0) + 1
-                                else:
-                                    failed_tool_count.pop(_tn, None)
+                            apply_failure_strategy_policy(
+                                approach_failures,
+                                round_index=loop_index,
+                                outcomes=outcomes,
+                            )
                             for _o in outcomes:
-                                if _o.get("skipped"):
+                                # Most skipped actions are non-events for breaker
+                                # accounting.  A policy may, however, reject an
+                                # action with a terminal answer (artifact budget is
+                                # one example).  That outcome must reach the normal
+                                # analysis_complete finalizer or the planner will
+                                # request the refused action until the step limit.
+                                if _o.get("skipped") and not self._outcome_ends_run(_o):
+                                    # The provider emitted this call even though
+                                    # local policy refused to dispatch it. Pair it
+                                    # with the explicit error result so the native
+                                    # transcript remains structurally valid.
+                                    self._buffer_transcript_part(_o)
                                     continue
                                 _obs = _o.get("observation")
                                 _tn = _o.get("tool_name")
                                 _ti_args = _o.get("tool_input")
-                                if _observation_failed(_obs):
-                                    if failed_tool_count.get(_tn, 0) >= max_tool_failures:
-                                        analysis_done = True
-                                        _obs.update({
-                                            "analysis_complete": True,
-                                            "final_answer": f"Unable to complete the task. The {_tn} tool failed {failed_tool_count[_tn]} times with errors. Please check the tool configuration or try a different approach."
-                                        })
-                                else:
+                                if not _observation_failed(_obs):
                                     action_signature = f"{_tn}:{json.dumps(_ti_args, sort_keys=True)}"
                                     successful_tool_actions.append(action_signature)
                                     # Escalate identical repeats gently: first
@@ -5709,36 +6160,31 @@ class AgentV2:
                                             "final_answer": repeated_call_final_answer(_tn, max_repeated_successes)
                                         })
 
-                                    # Circuit breaker: consecutive calls to the same artifact tool (even with different args)
+                                    # Count executed artifact generations toward the
+                                    # per-turn cost cap (enforced pre-execution above).
+                                    # The old consecutive-same-tool breaker that lived
+                                    # here force-ended the turn after two edits with a
+                                    # canned "created and rendered successfully" — but
+                                    # two different edits in one turn is a normal,
+                                    # convergent plan, and free-text edit prompts never
+                                    # repeat verbatim, so "same tool twice" was noise,
+                                    # not a loop signal. Loops are covered by the
+                                    # identical-args repeat guard above, the failure
+                                    # breaker, the step limit, and the budget cap.
                                     if _tn in ("create_artifact", "edit_artifact"):
                                         total_artifact_calls += 1
-                                        if _tn == last_artifact_tool_name:
-                                            consecutive_artifact_tool_count += 1
-                                        else:
-                                            consecutive_artifact_tool_count = 1
-                                            last_artifact_tool_name = _tn
-                                        if consecutive_artifact_tool_count > max_consecutive_artifact_calls or total_artifact_calls > max_total_artifact_calls:
-                                            analysis_done = True
-                                            # The forced final answer must reflect what actually
-                                            # happened — claiming success over a version that
-                                            # reported render errors misleads the user.
-                                            _render_errs = (_obs or {}).get("render_errors") or []
-                                            if _render_errs:
-                                                _forced_answer = (
-                                                    f"The dashboard was updated, but the latest version reported "
-                                                    f"{len(_render_errs)} render error(s) that were not fully resolved "
-                                                    f"(first: {str(_render_errs[0])[:200]}). "
-                                                    "Ask me to fix it to continue."
-                                                )
-                                            else:
-                                                _forced_answer = "The dashboard has been created and rendered successfully."
-                                            _obs.update({
-                                                "analysis_complete": True,
-                                                "final_answer": _forced_answer
-                                            })
-                                    else:
-                                        consecutive_artifact_tool_count = 0
-                                        last_artifact_tool_name = None
+                                        # Remember what actually landed: a budget
+                                        # refusal must be able to name the saved
+                                        # state ("v8 is saved") instead of
+                                        # reporting a bare failure, which reads
+                                        # to the user as a broken dashboard.
+                                        if isinstance(_obs, dict):
+                                            _v = _obs.get("version")
+                                            if _v is not None:
+                                                last_artifact_state["version"] = _v
+                                            _aid = _obs.get("artifact_id")
+                                            if _aid:
+                                                last_artifact_state["artifact_id"] = _aid
 
                                 if _obs and _obs.get("analysis_complete"):
                                     analysis_done = True
@@ -5767,7 +6213,7 @@ class AgentV2:
                                                     seq_blk = await self.project_manager.next_seq(self.db, self.current_execution)
                                                     await self._emit_sse_event(SSEEvent(
                                                         event="block.upsert",
-                                                        completion_id=str(self.system_completion.id),
+                                                        completion_id=str(self.system_completion_id),
                                                         agent_execution_id=str(self.current_execution.id),
                                                         seq=seq_blk,
                                                         data={"block": block_schema.model_dump()}
@@ -5791,7 +6237,7 @@ class AgentV2:
                                         if self.event_queue:
                                             await self.event_queue.put(SSEEvent(
                                                 event="completion.finished",
-                                                completion_id=str(self.system_completion.id),
+                                                completion_id=str(self.system_completion_id),
                                                 data={"status": "success"}
                                             ))
                                         completion_finished_emitted = True
@@ -5933,7 +6379,7 @@ class AgentV2:
                             seq = await self.project_manager.next_seq(self.db, self.current_execution)
                             await self._emit_sse_event(SSEEvent(
                                 event="planner.retry",
-                                completion_id=str(self.system_completion.id),
+                                completion_id=str(self.system_completion_id),
                                 agent_execution_id=str(self.current_execution.id),
                                 seq=seq,
                                 data={
@@ -6077,10 +6523,10 @@ class AgentV2:
 
                     # Capture the report id as a plain string NOW, while self.db is
                     # still open. _generate_title_background re-fetches by this id in
-                    # its own session, so reading self.report.id later (after the
+                    # its own session, so reading self.report_id later (after the
                     # session closes) can't raise "Instance is not bound to a Session"
                     # (the bug that silently skipped title generation, esp. on Postgres).
-                    report_id_for_title = str(self.report.id)
+                    report_id_for_title = str(self.report_id)
 
                     await self._generate_title_background(messages_context, plan_info, report_id_for_title)
             except Exception as e:
@@ -6138,20 +6584,34 @@ class AgentV2:
                 if self.report is not None:
                     await self.db.execute(
                         sa_update(Report)
-                        .where(Report.id == str(self.report.id))
+                        .where(Report.id == str(self.report_id))
                         .values(last_activity_at=datetime.utcnow())
                     )
                     await self.db.commit()
             except Exception as e:
                 logger.warning(f"Failed to bump report last_activity_at: {e}")
-            # Telemetry: agent execution completed
+            # Telemetry: agent execution completed. Token totals come from
+            # token_usage_json, already computed by finish_agent_execution()
+            # just above — no extra query/IO here, just reading the field.
             try:
+                _exec_props = {
+                    "agent_execution_id": str(self.current_execution.id),
+                    "status": status,
+                    "model_id": getattr(self.model, "model_id", None),
+                    "platform": self.platform,
+                    "iterations": self._iteration_count,
+                    "tool_call_counts": dict(self._tool_call_counts),
+                    "total_tool_calls": sum(self._tool_call_counts.values()),
+                    "mcp_tool_call_counts": dict(self._mcp_tool_call_counts),
+                }
+                _token_usage = getattr(self.current_execution, "token_usage_json", None) or {}
+                if _token_usage:
+                    _exec_props["prompt_tokens"] = _token_usage.get("prompt_tokens")
+                    _exec_props["completion_tokens"] = _token_usage.get("completion_tokens")
+                    _exec_props["total_tokens"] = _token_usage.get("total_tokens")
                 await telemetry.capture(
                     "agent_execution_completed",
-                    {
-                        "agent_execution_id": str(self.current_execution.id),
-                        "status": status,
-                    },
+                    _exec_props,
                     user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
                     org_id=str(self.organization.id) if self.organization else None,
                 )
@@ -6197,7 +6657,7 @@ class AgentV2:
                 if self.event_queue:
                     finished_event = SSEEvent(
                         event="completion.finished",
-                        completion_id=str(self.system_completion.id),
+                        completion_id=str(self.system_completion_id),
                         data=(
                             {"status": completion_status, "error": _finished_error}
                             if _finished_error else {"status": completion_status}
@@ -6274,7 +6734,7 @@ class AgentV2:
                 if self.event_queue:
                     await self.event_queue.put(SSEEvent(
                         event="completion.finished",
-                        completion_id=str(self.system_completion.id) if self.system_completion else None,
+                        completion_id=str(self.system_completion_id) if self.system_completion else None,
                         data={
                             "status": "error",
                             "error": error_payload,
@@ -6286,6 +6746,8 @@ class AgentV2:
         finally:
             # Drop the ambient LLM usage attribution set at run start.
             reset_usage_attribution(_attribution_token)
+            if _identity_token is not None:
+                reset_llm_identity(_identity_token)
             # Single-writer mode: drop the self._writes alias. self.db's
             # lifecycle is owned by the caller (FastAPI dependency); we
             # only ever aliased to it, never opened/owned a separate
@@ -6385,8 +6847,9 @@ class AgentV2:
             allow_llm_see_data=bool(getattr(self.organization_settings.get_config("allow_llm_see_data"), "value", True)),
             mcp_tools_enabled=bool(getattr(self.organization_settings.get_config("enable_mcp_tools"), "value", False)),
             web_fetch_enabled=bool(getattr(self.organization_settings.get_config("enable_web_fetch"), "value", False)),
+            ml_training_enabled=ml_training_settings(self.organization_settings)[0],
             notes_enabled=_notes_on,
-            notes_context=(await build_notes_context(self.db, str(self.report.id)) if _notes_on and self.report else None),
+            notes_context=(await build_notes_context(self.db, str(self.report_id)) if _notes_on and self.report else None),
             project_context=(await self._build_project_context()),
             web_search_enabled=self._web_search_enabled(),
             web_search_domains=self._web_search_domains(),
@@ -6455,7 +6918,7 @@ class AgentV2:
             if loop_index is not None:
                 span.set_attribute("agent.loop_index", loop_index)
             if self.report is not None:
-                span.set_attribute("report.id", str(self.report.id))
+                span.set_attribute("report.id", str(self.report_id))
             await self.context_hub.refresh_warm()
             view = self.context_hub.get_view()
             # Compaction rides on context assembly: every agent-path warm build
@@ -6499,7 +6962,7 @@ class AgentV2:
             if loop_index is not None:
                 span.set_attribute("agent.loop_index", loop_index)
             if self.report is not None:
-                span.set_attribute("report.id", str(self.report.id))
+                span.set_attribute("report.id", str(self.report_id))
             return await self.context_hub.build_context()
 
     async def _iter_planner_events_with_span(self, planner_input: PlannerInput, loop_index: int):
@@ -6513,7 +6976,7 @@ class AgentV2:
         span.set_attribute("agent.mode", self.mode or "")
         span.set_attribute("agent.tool_catalog.size", len(self.planner.tool_catalog or []))
         if self.report is not None:
-            span.set_attribute("report.id", str(self.report.id))
+            span.set_attribute("report.id", str(self.report_id))
         if self.model is not None:
             span.set_attribute("llm.model_id", getattr(self.model, "model_id", "") or "")
         counts: dict[str, int] = {}
@@ -6581,7 +7044,7 @@ class AgentV2:
                 try:
                     await self.event_queue.put(SSEEvent(
                         event="training.build_finalized",
-                        completion_id=str(self.system_completion.id) if self.system_completion else None,
+                        completion_id=str(self.system_completion_id) if self.system_completion else None,
                         data={
                             "build_id": self.training_build_id,
                             "status": build.status if build else "draft",
@@ -6598,7 +7061,7 @@ class AgentV2:
                 try:
                     await self.event_queue.put(SSEEvent(
                         event="training.build_error",
-                        completion_id=str(self.system_completion.id) if self.system_completion else None,
+                        completion_id=str(self.system_completion_id) if self.system_completion else None,
                         data={
                             "build_id": self.training_build_id,
                             "error": str(e),
@@ -6622,11 +7085,11 @@ class AgentV2:
             evaluator = InstructionTriggerEvaluator(
                 db=self.db,
                 organization_settings=self.organization_settings,
-                report_id=str(self.report.id) if self.report else None,
+                report_id=str(self.report_id) if self.report else None,
                 current_execution_id=str(self.current_execution.id) if self.current_execution else None,
                 user_message=user_message,
                 mode=self.mode,
-                completion_id=str(self.system_completion.id) if self.system_completion else None,
+                completion_id=str(self.system_completion_id) if self.system_completion else None,
             )
             return await evaluator.evaluate(prev_tool_name_before_last_user)
         except Exception:
@@ -6836,8 +7299,8 @@ class AgentV2:
         cur_viz_id = str(inv.current_visualization.id) if getattr(inv, 'current_visualization', None) else None
         cur_query_id = str(inv.current_query.id) if getattr(inv, 'current_query', None) else None
         exec_id = str(self.current_execution.id) if getattr(self, 'current_execution', None) else None
-        report_id = str(self.report.id) if self.report else None
-        sys_completion_id = str(self.system_completion.id) if self.system_completion else None
+        report_id = str(self.report_id) if self.report else None
+        sys_completion_id = str(self.system_completion_id) if self.system_completion else None
         widget_id_for_artifact = str(inv.current_widget.id) if getattr(inv, 'current_widget', None) else None
 
         try:
@@ -7172,8 +7635,8 @@ class AgentV2:
         step_id = inv.current_step_id
         viz_id = str(inv.current_visualization.id) if getattr(inv, 'current_visualization', None) else None
         exec_id = str(self.current_execution.id) if getattr(self, 'current_execution', None) else None
-        report_id = str(self.report.id) if self.report else None
-        sys_completion_id = str(self.system_completion.id) if self.system_completion else None
+        report_id = str(self.report_id) if self.report else None
+        sys_completion_id = str(self.system_completion_id) if self.system_completion else None
         head_user_id = str(getattr(self.head_completion, 'user_id', None)) if (
             self.head_completion and getattr(self.head_completion, 'user_id', None)
         ) else None
@@ -7263,6 +7726,18 @@ class AgentV2:
                             fresh_db, step_obj, widget_data
                         )
 
+                        # Persist declared parameters onto the Query (the stable
+                        # identity) and the run's resolved values onto the Step.
+                        try:
+                            _tool_params = tool_output.get("parameters")
+                            _tool_applied = tool_output.get("applied_params")
+                            if _tool_params:
+                                await self.project_manager.update_query_parameters(
+                                    fresh_db, step_obj, _tool_params, _tool_applied
+                                )
+                        except Exception:
+                            pass
+
                         # Update step status
                         await self.project_manager.update_step_status(
                             fresh_db, step_obj, "success"
@@ -7281,13 +7756,12 @@ class AgentV2:
                         except Exception:
                             pass
 
-                        # Fallback for create_data: if no columns in data_model, emit usage from tool_input.tables_by_source
+                        # `tables_by_source` records every source table passed to create_data.
+                        # It complements the data model, whose columns can describe only
+                        # the resulting dataset and otherwise omit joined tables.
                         try:
                             if tool_name == "create_data":
-                                dm = getattr(step_obj, "data_model", {}) or {}
-                                cols = dm.get("columns") if isinstance(dm, dict) else None
-                                has_columns = isinstance(cols, list) and len(cols) > 0
-                                if not has_columns and isinstance(tool_input, dict):
+                                if isinstance(tool_input, dict):
                                     tbs = tool_input.get("tables_by_source")
                                     if tbs:
                                         await self.project_manager.emit_table_usage_from_tables_by_source(

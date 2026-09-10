@@ -94,10 +94,10 @@
     "connect": "Connetti",
     "manageConnections": "Gestisci connessioni",
     "loadingFiles": "Caricamento dei file dalla sorgente…",
-    "countTables": "{n} tabelle",
-    "countTools": "{n} strumenti",
-    "countFiles": "{n} file",
-    "countInstructions": "{n} istruzioni",
+    "countTables": "{n} tabella | {n} tabelle",
+    "countTools": "{n} strumento | {n} strumenti",
+    "countFiles": "{n} file | {n} file",
+    "countInstructions": "{n} istruzione | {n} istruzioni",
     "untitled": "Senza titolo",
     "primaryPlaceholder": "Scrivi l’istruzione primaria dell’agente in markdown… (digita {'@'} per menzionare una tabella o un’istruzione)",
     "change": "Modifica",
@@ -230,6 +230,8 @@
     "toastSaveDescFailed": "Impossibile salvare la descrizione",
     "toastTablesReloaded": "Tabelle ricaricate",
     "toastToolsReloaded": "Strumenti ricaricati",
+    "connectionLinked": "Connessione aggiunta all'agente",
+    "connectionLinkFailed": "Impossibile aggiungere la connessione all'agente",
     "toastUploaded": "Caricato/i {n} file",
     "toastUploadFailed": "Caricamento non riuscito",
     "uploadTooLarge": "Il file supera il limite di caricamento del server",
@@ -274,7 +276,9 @@
     "toastSuiteDeleted": "Suite deleted",
     "tipDeleteSuite": "Delete suite",
     "tipRunSuite": "Esegui questa suite",
-    "runSuiteFailed": "Impossibile eseguire la suite"
+    "runSuiteFailed": "Impossibile eseguire la suite",
+    "exportInstructions": "Esporta il pacchetto dell'agente — istruzioni, configurazione ed eval (.zip)",
+    "sharedManagedElsewhere": "Condivisa con agenti che non gestisci — modificabile solo da chi ha autorità su tutti."
   },
   "smoke": {
     "hello": "Ciao",
@@ -344,7 +348,10 @@
     "starOnGithub": "Star our GitHub",
     "admin": "Amministrazione",
     "notifications": "Notifiche",
-    "automations": "Automazioni"
+    "automations": "Automazioni",
+    "agent": "Agente",
+    "agents": "Agenti",
+    "viewAllAgents": "Vedi tutti gli agenti →"
   },
   "notifications": {
     "title": "Notifiche",
@@ -416,7 +423,7 @@
     "newPassword": "Nuova password",
     "confirmPassword": "Conferma nuova password",
     "forgotPassword": "Hai dimenticato la password?",
-    "newToBow": "Nuovo su Bag of words?",
+    "newToBow": "Nuovo su BOW?",
     "alreadyHaveAccount": "Hai già un account?",
     "rememberPassword": "Ti ricordi la password?",
     "resetPassword": "Reimposta password",
@@ -440,11 +447,18 @@
     "signingUp": "Registrazione in corso…",
     "redirecting": "Reindirizzamento…",
     "orContinueWith": "Oppure continua con",
+    "orContinueWithEmail": "Oppure continua con l'email",
+    "signInSubtitle": "Accedi al tuo account",
+    "welcomeTitle": "Benvenuto in BOW",
+    "signUpSubtitle": "Crea il tuo account per iniziare",
+    "setupSubtitle": "Crea il primo account per configurare BOW",
+    "or": "o",
     "signInWithGoogle": "Accedi con Google",
     "signUpWithGoogle": "Registrati con Google",
     "signInWithProvider": "Accedi con {provider}",
     "continueWithProvider": "Continua con {provider}",
     "invalidCredentials": "Credenziali non valide",
+    "signInFailed": "Accesso non riuscito. Riprova.",
     "registrationError": "Si è verificato un errore durante la registrazione.",
     "googleInitError": "Impossibile inizializzare l'accesso con Google",
     "providerInitError": "Impossibile inizializzare l'accesso con {provider}",
@@ -596,7 +610,14 @@
       "schedule": "Pianificazione",
       "type": "Tipo",
       "dataSource": "Origine dati",
-      "artifacts": "Artefatti"
+      "artifacts": "Artefatti",
+      "artifactsLabel": "Dashboard",
+      "clear": "Cancella tutto",
+      "dataSourceLabel": "Agente",
+      "scheduleLabel": "Pianificazione",
+      "statusLabel": "Stato",
+      "title": "Tipo",
+      "typeLabel": "Tipo"
     },
     "visibility": {
       "public": "Chiunque abbia il link",
@@ -628,10 +649,14 @@
       "chat": "Chat",
       "createdViaMcp": "Creato tramite MCP",
       "createdViaExcel": "Creato tramite Excel",
-      "runningOnSchedule": "In esecuzione su pianificazione"
+      "runningOnSchedule": "In esecuzione su pianificazione",
+      "createdBySchedule": "Creato da un'attività pianificata",
+      "createdByTrigger": "Creato da un trigger"
     },
     "pagination": {
-      "showing": "Visualizzati da {from} a {to} di {total} report"
+      "showing": "Visualizzati da {from} a {to} di {total} report",
+      "page": "Pagina {page}",
+      "rowsPerPage": "Righe per pagina"
     },
     "toasts": {
       "starFailed": "Impossibile aggiornare il preferito",
@@ -678,7 +703,34 @@
       "running": "In esecuzione",
       "newActivity": "Nuova attività",
       "errorNew": "Terminato con un errore"
-    }
+    },
+    "type": {
+      "training": "Addestramento",
+      "chat": "Chat",
+      "dashboard": "Dashboard",
+      "slides": "Diapositive"
+    },
+    "inProject": "In {name}",
+    "filtersButton": "Filtri",
+    "sharedEmpty": "Nessun report condiviso",
+    "sharedEmptyHint": "I report che altri condividono con te compariranno qui.",
+    "trainingEmptyBody": "Fai domande e rivedi le risposte dell'AI. Approva o modifica le risposte per insegnare all'analista AI come gestire richieste simili in futuro.",
+    "trainingEmptyTipLabel": "Come funziona:",
+    "trainingEmptyTitle": "Sessione di addestramento avviata.",
+    "trainingStarters": [
+      {
+        "title": "Trova conflitti tra le istruzioni",
+        "prompt": "Individua contraddizioni o lacune tra le istruzioni di addestramento esistenti che possono rendere incoerenti le risposte dell'AI."
+      },
+      {
+        "title": "Mostra risposte a bassa confidenza",
+        "prompt": "Elenca le risposte recenti dell'AI in cui il modello ha espresso incertezza o ha prodotto risposte di bassa qualità da rivedere."
+      },
+      {
+        "title": "Mostra risposte con feedback negativo",
+        "prompt": "Esamina le risposte che hanno ricevuto feedback negativi dagli utenti per individuare schemi e aree di miglioramento."
+      }
+    ]
   },
   "projects": {
     "title": "Progetti",
@@ -759,7 +811,30 @@
       "noAutomations": "Ancora nessuna automazione in questo progetto.",
       "fromProject": "Da {name}"
     },
-    "rowActions": "Azioni del progetto"
+    "rowActions": "Azioni del progetto",
+    "myProjects": "I miei progetti",
+    "sharedWithMe": "Condivisi con me",
+    "searchPlaceholder": "Cerca progetti…",
+    "filtersButton": "Filtri",
+    "emptyTitle": "Ancora nessun progetto",
+    "noResults": "Nessun progetto trovato",
+    "noResultsHint": "Prova un’altra ricerca o cancella i filtri.",
+    "sharedEmpty": "Non è stato ancora condiviso nulla con te",
+    "sharedEmptyHint": "I progetti che i colleghi condividono con te compariranno qui.",
+    "filters": {
+      "accessLabel": "Accesso",
+      "allAccess": "Tutti gli accessi",
+      "private": "Privato",
+      "orgShared": "Condiviso con l’organizzazione",
+      "reportsLabel": "Report",
+      "allReports": "Tutti i progetti",
+      "withReports": "Con report",
+      "emptyReports": "Vuoti",
+      "clear": "Cancella tutto"
+    },
+    "pagination": {
+      "rowsPerPage": "Righe per pagina"
+    }
   },
   "traceModal": {
     "title": "Esecuzione dell'agente",
@@ -847,7 +922,8 @@
     "steerQueuedFallback": "L'esecuzione è appena terminata — il tuo messaggio è stato messo in coda",
     "steerFailed": "Impossibile orientare il completamento in corso",
     "instructionUnavailableTitle": "Istruzione non disponibile",
-    "instructionUnavailableBody": "Potrebbe essere stata eliminata oppure non hai accesso ad essa."
+    "instructionUnavailableBody": "Potrebbe essere stata eliminata oppure non hai accesso ad essa.",
+    "loopRetryNotice": "Errore interno — nuovo tentativo dal contesto più recente (tentativo {attempt}/{max})"
   },
   "tools": {
     "common": {
@@ -1027,7 +1103,9 @@
       "toastFailedPublish": "Impossibile pubblicare l'istruzione",
       "toastDeletedDesc": "Istruzione eliminata",
       "toastFailedDelete": "Impossibile eliminare l'istruzione",
-      "toastSaved": "Istruzione salvata"
+      "toastSaved": "Istruzione salvata",
+      "editCount": "{n} modifiche",
+      "editLabel": "Modifica istruzione"
     },
     "inspectData": {
       "inspecting": "Ispezione",
@@ -1095,8 +1173,9 @@
       "untitled": "Senza titolo"
     },
     "readInstruction": {
-      "reading": "Lettura dell'istruzione…",
+      "reading": "Lettura…",
       "read": "Istruzione letta",
+      "readSkill": "Competenza letta",
       "failed": "Impossibile leggere l'istruzione"
     },
     "createEval": {
@@ -1362,7 +1441,9 @@
     "routeModel": {
       "routedTo": "Instradato a",
       "choosing": "Scelta del modello…",
-      "routing": "Instradamento del modello"
+      "routing": "Instradamento del modello",
+      "fallbackReason": "{from} non era disponibile",
+      "fellBackTo": "Passato a"
     },
     "grepFiles": {
       "grepping": "Ricerca nei file di {pattern}…",
@@ -1375,6 +1456,59 @@
       "moreShown": "+{count} altri mostrati all'agente",
       "filesSkippedSingular": "{count} file saltato ({reasons})",
       "filesSkippedPlural": "{count} file saltati ({reasons})"
+    },
+    "listAgentExecutions": {
+      "empty": "Nessuna esecuzione trovata",
+      "failed": "Caricamento delle esecuzioni dell'agente non riuscito",
+      "found": "{count} esecuzion(i) · {total} in totale",
+      "loading": "Caricamento delle esecuzioni dell'agente…",
+      "noMatch": "Nessuna esecuzione corrisponde a questo filtro",
+      "tabAll": "Tutte",
+      "tabFailed": "Fallite",
+      "tabLowConfidence": "Bassa confidenza",
+      "tabLowCoverage": "Bassa copertura",
+      "tabNegative": "Feedback negativo",
+      "title": "Elenca le esecuzioni dell'agente"
+    },
+    "sendEmail": {
+      "failed": "Invio dell'email non riuscito",
+      "sending": "Invio dell'email...",
+      "sentPrefix": "Inviata: {subject}",
+      "subject": "Oggetto",
+      "to": "A"
+    },
+    "webFetch": {
+      "errorOccurred": "Si è verificato un errore",
+      "failed": "Recupero non riuscito",
+      "fetched": "Recuperato",
+      "fetching": "Recupero in corso"
+    },
+    "browser": {
+      "acted": "Interazione eseguita",
+      "acting": "Interazione in corso",
+      "capturing": "Acquisizione screenshot",
+      "done": "Navigazione completata",
+      "extracted": "Testo letto",
+      "extracting": "Lettura del testo",
+      "failed": "Azione del browser non riuscita",
+      "navigated": "Pagina aperta",
+      "navigating": "Apertura della pagina",
+      "screenshot": "Screenshot",
+      "snapshot": "Struttura della pagina",
+      "snapshotted": "Pagina letta",
+      "snapshotting": "Lettura della pagina",
+      "working": "Navigazione"
+    },
+    "readFile": {
+      "reading": "Lettura di {name}…",
+      "read": "Letto {name}",
+      "rowsCols": "{rows} righe × {cols} colonne",
+      "truncated": "troncato",
+      "pages": "pagine {shown}",
+      "pagesOfTotal": "pagine {shown} / {total}",
+      "pathLabel": "Percorso:",
+      "attachedAsSessionFile": "Allegato a questa conversazione come file di sessione",
+      "showPagePreviews": "Mostra anteprime delle pagine ({n})"
     }
   },
   "entityCreate": {
@@ -1393,7 +1527,9 @@
     "saveEntity": "Salva entità",
     "suggestEntity": "Suggerisci entità",
     "saveFailed": "Impossibile salvare l'entità",
-    "stepRequired": "Passaggio richiesto per salvare"
+    "stepRequired": "Passaggio richiesto per salvare",
+    "publishedToast": "Query pubblicata nel catalogo",
+    "suggestedToast": "Suggerimento inviato per la revisione"
   },
   "mentionInput": {
     "placeholder": "Digita {'@'} per menzionare...",
@@ -1415,7 +1551,8 @@
       "tables": "Tabelle",
       "prompts": "Prompt",
       "instructions": "Istruzioni",
-      "skills": "Competenze"
+      "skills": "Competenze",
+      "tools": "Strumenti"
     },
     "time": {
       "justNow": "proprio ora",
@@ -1475,12 +1612,24 @@
       "view": "Visualizza",
       "view_schema": "Visualizza schema",
       "create_entities": "Crea entità",
-      "manage": "Gestione delle impostazioni"
+      "manage": "Gestione delle impostazioni",
+      "create_data_sources": "Creare agenti",
+      "manage_connection": "Gestire la connessione",
+      "manage_data_sources": "Gestire gli agenti",
+      "manage_service_accounts": "Gestire gli account di servizio"
     },
     "addAgent": "+ Aggiungi agente...",
+    "advancedPermissions": "Autorizzazioni avanzate",
+    "tiers": {
+      "query": "Può interrogare",
+      "queryHint": "Fare domande a questo agente",
+      "manage": "Può gestire",
+      "manageHint": "Modificare istruzioni, entità, valutazioni, impostazioni e membri"
+    },
     "modelAccess": "Accesso ai modelli",
     "modelAccessHint": "Modelli con restrizioni",
-    "noRestrictedModels": "Nessun modello con restrizioni"
+    "noRestrictedModels": "Nessun modello con restrizioni",
+    "connection": "Connessione"
   },
   "groupsManager": {
     "searchPlaceholder": "Cerca gruppi...",
@@ -1612,7 +1761,59 @@
       "unknown": "Sconosciuto",
       "lastSyncDetail": "— {gCreated} creati, {gUpdated} aggiornati, {gRemoved} rimossi · {mAdded} membri aggiunti, {mRemoved} rimossi",
       "errorCount": "{n} errore/i: {first}",
-      "ldapServerLine": "{server}{vendor}{users}{groups}"
+      "ldapServerLine": "{server}{vendor}{users}{groups}",
+      "entraAdd": "Aggiungi",
+      "entraAddPlaceholder": "Aggiungi attributo…",
+      "entraContextTitle": "Dal tuo profilo della directory",
+      "entraEnable": "Sincronizza i dati del profilo da Entra ID",
+      "entraEnableHint": "All'accesso legge il profilo Microsoft Graph dell'utente connesso e lo salva come contesto per l'AI. Usa lo scope User.Read concesso per impostazione predefinita — non serve il consenso dell'amministratore.",
+      "entraFieldsLabel": "Attributi da includere nel contesto",
+      "entraNoFields": "Nessun attributo selezionato",
+      "entraNoLogin": "Accedi con Entra ID per vedere in anteprima i valori reali del tuo profilo.",
+      "entraNotSet": "non impostato",
+      "entraPreviewError": "Impossibile caricare i valori da Microsoft Graph.",
+      "entraReauth": "La tua sessione Entra ID è scaduta — accedi di nuovo con Entra ID per caricare i valori.",
+      "entraRemove": "Rimuovi",
+      "entraSaveFailed": "Salvataggio non riuscito",
+      "entraSaved": "Salvato",
+      "entraSaving": "Salvataggio...",
+      "entraSubtitle": "Sincronizza ruolo, reparto e altri dati del profilo da Microsoft Entra ID all'accesso",
+      "entraTitle": "Sincronizzazione profilo Entra ID",
+      "field_city": "Città",
+      "field_companyName": "Azienda",
+      "field_country": "Paese",
+      "field_department": "Reparto",
+      "field_displayName": "Nome",
+      "field_employeeHireDate": "Data di assunzione",
+      "field_employeeId": "Matricola",
+      "field_employeeOrgData": "Divisione e centro di costo",
+      "field_employeeType": "Tipo di contratto",
+      "field_hostedDomain": "Dominio dello spazio di lavoro",
+      "field_jobTitle": "Ruolo",
+      "field_locale": "Impostazioni locali",
+      "field_location": "Sede",
+      "field_mobilePhone": "Cellulare",
+      "field_officeLocation": "Ufficio",
+      "field_organization": "Organizzazione",
+      "field_preferredLanguage": "Lingua preferita",
+      "field_state": "Provincia",
+      "field_usageLocation": "Paese di utilizzo",
+      "googleAdd": "Aggiungi",
+      "googleAddPlaceholder": "Aggiungi attributo…",
+      "googleEnable": "Sincronizza i dati del profilo da Google",
+      "googleEnableHint": "All'accesso legge il profilo Google dell'utente connesso (userinfo + People API) e lo salva come contesto per l'AI. Usa solo gli scope openid/profile/email già concessi all'accesso.",
+      "googleFieldsLabel": "Attributi da includere nel contesto",
+      "googleNoFields": "Nessun attributo selezionato",
+      "googleNoLogin": "Accedi con Google per vedere in anteprima i valori reali del tuo profilo.",
+      "googleNotSet": "non impostato",
+      "googlePreviewError": "Impossibile caricare i valori da Google.",
+      "googleReauth": "La tua sessione Google è scaduta — accedi di nuovo con Google per caricare i valori.",
+      "googleRemove": "Rimuovi",
+      "googleSaveFailed": "Salvataggio non riuscito",
+      "googleSaved": "Salvato",
+      "googleSaving": "Salvataggio...",
+      "googleSubtitle": "Sincronizza nome, ruolo, reparto e altri dati del profilo da Google all'accesso",
+      "googleTitle": "Sincronizzazione profilo Google"
     },
     "auditLogs": "Registri di audit",
     "integrations": {
@@ -1654,7 +1855,12 @@
           "sessionStalenessTitle": "Sessione di conversazione",
           "hoursSuffix": "ore",
           "sessionStalenessSaved": "Finestra di sessione aggiornata",
-          "sessionStalenessInvalid": "Inserisci un numero intero tra 1 e 720 ore"
+          "sessionStalenessInvalid": "Inserisci un numero intero tra 1 e 720 ore",
+          "announceNewReportTitle": "Annuncio di nuova conversazione",
+          "announceNewReportLabel": "Annuncia i nuovi report di conversazione",
+          "announceNewReportDesc": "Quando un messaggio avvia un nuovo report di conversazione, il bot risponde con un messaggio \"Ho avviato un nuovo report di conversazione\" con un link. Disattiva per saltare questo messaggio.",
+          "announceNewReportEnabled": "Annuncio dei nuovi report attivato",
+          "announceNewReportDisabled": "Annuncio dei nuovi report disattivato"
         },
         "slack": {
           "title": "Integrazione Slack",
@@ -1676,7 +1882,21 @@
           "failedConnect": "Impossibile connettere Slack",
           "disconnectedToast": "Slack disconnesso",
           "disconnectedToastDesc": "Integrazione Slack disconnessa",
-          "failedDisconnect": "Impossibile disconnettere Slack"
+          "failedDisconnect": "Impossibile disconnettere Slack",
+          "appToken": "Token a livello di app",
+          "connectionModeLabel": "Modalità di connessione",
+          "modeEventsApi": "Events API (webhook)",
+          "modeEventsApiHint": "Slack invia gli eventi in POST al tuo URL webhook pubblico — richiede il signing secret e una Request URL raggiungibile.",
+          "modeSocket": "Socket Mode",
+          "modeSocketHint": "Il backend si collega a Slack tramite WebSocket — non servono URL pubblici né signing secret, e abilita l'esperienza Agent.",
+          "modeSocketRecommended": "Socket Mode (consigliata)",
+          "socketSetupIntro": "Nella tua app Slack (api.slack.com/apps):",
+          "socketStep1": "Socket Mode → abilitala e crea un token a livello di app con lo scope connections:write (xapp-…)",
+          "socketStep2": "OAuth & Permissions → scope del bot: chat:write, im:history, im:write, app_mentions:read, reactions:write, files:write, users:read, users:read.email, assistant:write",
+          "socketStep3": "Event Subscriptions → abilita gli eventi (senza Request URL) e iscriviti a: message.im, app_mention, assistant_thread_started, assistant_thread_context_changed",
+          "socketStep4": "Agents → attiva \"Agent experience\" per il pannello assistente nativo, la denominazione dei thread e i prompt suggeriti",
+          "socketStep5": "App Home → abilita la scheda Messages e consenti agli utenti di inviare messaggi",
+          "socketStep6": "Install App → installala nel tuo spazio di lavoro e copia il Bot User OAuth Token (xoxb-…)"
         },
         "teams": {
           "title": "Integrazione Teams",
@@ -1807,9 +2027,9 @@
           "failedDisconnect": "Impossibile disconnettere l'email"
         },
         "oauth": {
-          "title": "Client OAuth",
-          "subtitle": "Registra app esterne che si connettono a questo workspace tramite OAuth 2.1 (ad es. il connettore MCP di Claude Web).",
-          "noneYet": "Nessun client OAuth ancora registrato",
+          "title": "App OAuth",
+          "subtitle": "Consenti alle tue app di creare report, eseguire l’analista IA o connettersi tramite MCP per conto degli utenti autenticati.",
+          "noneYet": "Nessuna app OAuth registrata",
           "copyClientId": "Copia Client ID",
           "editRedirectUris": "Modifica URI di reindirizzamento",
           "rotateSecret": "Ruota il secret",
@@ -1824,7 +2044,7 @@
           "add": "Aggiungi",
           "customRedirectUris": "URI di reindirizzamento personalizzati (facoltativo)",
           "customRedirectUrisHint": "Un URI per riga. Lascia vuoto per usare i valori predefiniti (Claude Web e l'inspector MCP locale).",
-          "setupInstructions": "Istruzioni di configurazione di Claude Web",
+          "setupInstructions": "Istruzioni di configurazione",
           "setupStep1": "In Claude Web, vai su Impostazioni → Connettori → Aggiungi",
           "setupStep2": "Inserisci l'URL del server MCP sopra",
           "setupStep3": "Fai clic su Impostazioni avanzate",
@@ -1839,7 +2059,61 @@
           "failedRotate": "Impossibile ruotare il secret",
           "deletedToast": "Client OAuth eliminato",
           "failedDelete": "Impossibile eliminare il client",
-          "confirmDelete": "Eliminare il client OAuth \"{name}\"?"
+          "confirmDelete": "Eliminare il client OAuth \"{name}\"?",
+          "registerApp": "Register app",
+          "createTitle": "Register a new app",
+          "createHelp": "Use Authorization Code with PKCE. Add only exact callback URLs that your app controls.",
+          "appName": "App name",
+          "appNamePlaceholder": "e.g. Acme Insights",
+          "scopes": "Access surfaces",
+          "appScope": "BOW app",
+          "appScopeDesc": "Reports, completions, artifacts, and the rest of the BOW API.",
+          "mcpScope": "MCP tools",
+          "mcpScopeDesc": "The MCP endpoint for AI assistants and tool clients.",
+          "scopesRequired": "Select at least one access surface.",
+          "scopeChangeRevokes": "Changing access surfaces immediately revokes this app's existing tokens.",
+          "trusted": "Trusted",
+          "internalOnly": "Internal only",
+          "trustedHelp": "Trusted apps skip the consent screen after sign-in. Enable this only for apps operated by your organization.",
+          "searchPlaceholder": "Search apps, client IDs, or redirect URLs",
+          "endpointReference": "OAuth endpoint reference",
+          "copy": "Copy",
+          "clientIdLabel": "Client ID",
+          "authorizationEndpoint": "Authorize",
+          "tokenEndpoint": "Token",
+          "discoveryEndpoint": "Discovery",
+          "emptyHelp": "Register your first app, choose the surfaces it can reach, and add its exact callback URL.",
+          "noMatches": "No apps match this search.",
+          "totalApps": "Registered apps",
+          "activeTokens": "Active tokens",
+          "trustedApps": "Trusted apps",
+          "activeTokenCount": "1 active token | {count} active tokens",
+          "lastUsed": "Used {date}",
+          "issued": "Issued {date}",
+          "neverUsed": "Never used",
+          "editApp": "Edit app",
+          "actions": "Azioni",
+          "secretHelp": "Store this secret now. It cannot be shown again.",
+          "updatedToast": "OAuth app updated",
+          "failedUpdate": "Failed to update OAuth app",
+          "deleteImpact": "Its authorization codes and tokens were revoked.",
+          "trustedConnecting": "Connecting to your trusted app…",
+          "authorizationLoading": "Checking the authorization request…",
+          "authorizationError": "Unable to authorize",
+          "goBack": "Go back to Bag of Words",
+          "authorizationTitle": "Authorize access",
+          "wantsAccess": "{name} wants to access your Bag of Words account.",
+          "permissionsRequested": "Permissions requested",
+          "appPermission": "Create and read reports, run completions, and use artifacts under your existing BOW permissions.",
+          "mcpPermission": "Use the MCP tool surface under your existing BOW permissions.",
+          "deny": "Deny",
+          "approve": "Approve",
+          "authorizing": "Authorizing…",
+          "redirectNotice": "You will return to {name} after approval.",
+          "invalidAuthorizationRequest": "This authorization request is missing required information.",
+          "unsupportedAuthorizationRequest": "This app must use Authorization Code with PKCE S256.",
+          "unknownAuthorizationClient": "The app or callback URL is not registered.",
+          "authorizationFailed": "Authorization failed. Try again or contact your workspace administrator."
         },
         "excel": {
           "title": "Componente aggiuntivo Excel",
@@ -1860,6 +2134,37 @@
           "tenantWide": "Distribuzione a livello di tenant",
           "tenantWideDesc": "Per una distribuzione a livello di organizzazione, il tuo amministratore Microsoft 365 può caricare questo manifest tramite Admin Center → Impostazioni → App integrate.",
           "failedLoadManifest": "Impossibile caricare il manifest"
+        },
+        "googleChat": {
+          "autoLinkDescConnected": "Se attivo, gli utenti di Google Chat vengono collegati automaticamente agli account BOW la cui email coincide con il loro profilo Google Workspace (senza link di verifica). Poiché l'email proviene dalla directory del tuo Workspace, in genere è sicuro — ma attivalo solo per domini di cui ti fidi completamente.",
+          "autoLinkDescSetup": "Gli utenti che scrivono al bot vengono collegati agli account BOW la cui email coincide con il loro profilo Google Workspace — senza link di verifica. Consigliato.",
+          "autoLinkTitle": "Collega automaticamente gli utenti tramite l'email di Workspace",
+          "connectedNotice": "Google Chat è attualmente connesso.",
+          "connectedToast": "Google Chat connesso",
+          "connectedToastDesc": "Integrazione con Google Chat riuscita",
+          "disconnectedToast": "Google Chat disconnesso",
+          "disconnectedToastDesc": "Integrazione con Google Chat disconnessa",
+          "failedConnect": "Impossibile connettere Google Chat",
+          "failedDisconnect": "Impossibile disconnettere Google Chat",
+          "noteChannels": "Negli spazi vengono interrogate solo le sorgenti dati pubbliche",
+          "noteChats": "Nei messaggi diretti vengono interrogate le sorgenti dati pubbliche e private (a cui l'utente ha accesso)",
+          "noteNoInbound": "Gli eventi arrivano via Pub/Sub — non servono URL pubblici né accessi in ingresso al firewall",
+          "noteRegistered": "Solo gli utenti registrati possono scrivere al bot o menzionarlo con {'@'}",
+          "serviceAccount": "Account di servizio:",
+          "serviceAccountJsonLabel": "Chiave dell'account di servizio (JSON)",
+          "serviceAccountJsonPlaceholder": "Incolla la chiave JSON completa dell'account di servizio",
+          "sessionStalenessDesc": "Per quanto tempo un messaggio diretto continua nello stesso report di conversazione. I messaggi successivi a questa finestra avviano un nuovo report (inviando \"new\" ne parte uno subito). Predefinito: 120 ore (5 giorni).",
+          "setupIntro": "In un progetto Google Cloud dedicato (importante — riutilizzare un vecchio progetto può lasciare l'app Chat in uno stato inutilizzabile):",
+          "setupStep1": "Abilita la Google Chat API e la Cloud Pub/Sub API",
+          "setupStep2": "Crea un account di servizio (senza ruoli) e scarica la sua chiave JSON",
+          "setupStep3": "Crea un topic Pub/Sub; assegna a chat-api-push{'@'}system.gserviceaccount.com il ruolo Pub/Sub Publisher su di esso",
+          "setupStep4": "Crea una sottoscrizione di tipo pull sul topic; assegna al tuo account di servizio il ruolo Pub/Sub Subscriber su di essa",
+          "setupStep5": "Nella pagina Chat API Configuration: lascia DESELEZIONATO \"Build this Chat app as a Workspace add-on\", imposta nome e avatar dell'app, abilita la ricezione dei messaggi 1:1, seleziona Cloud Pub/Sub con il tuo topic, abilita \"Log errors to Logging\" e salva",
+          "subscription": "Sottoscrizione:",
+          "subscriptionLabel": "Sottoscrizione Pub/Sub",
+          "subscriptionPlaceholder": "projects/<project>/subscriptions/<name>",
+          "subtitle": "Configura e gestisci l'integrazione con Google Chat per la tua organizzazione",
+          "title": "Integrazione con Google Chat"
         }
       },
       "emptyTitle": "Fai funzionare Bag of Words con i tuoi strumenti",
@@ -1870,8 +2175,8 @@
       "whatsappDescription": "Raggiungi l'analista IA tramite WhatsApp Business.",
       "emailName": "Casella di posta IA",
       "emailDescription": "Una casella di posta da cui l'analista IA invia risposte e (facoltativamente) riceve domande.",
-      "oauthName": "Client OAuth",
-      "oauthDescription": "Registra app esterne che accedono a questo workspace tramite OAuth 2.1 (ad es. Claude Web).",
+      "oauthName": "App OAuth",
+      "oauthDescription": "Registra app per l’API BOW, gli strumenti MCP o entrambi.",
       "manage": "Gestisci",
       "add": "Aggiungi"
     },
@@ -1906,6 +2211,7 @@
       "verified": "Verificato",
       "unverified": "Non verificato",
       "confirmRemove": "Sei sicuro di voler rimuovere {name} da questa organizzazione?",
+      "confirmRemoveAndDeactivate": "Vuoi davvero rimuovere {name} da questa organizzazione? Non potrà più accedere. I suoi report e la cronologia vengono conservati e invitandola di nuovo si ripristina l'accesso.",
       "failedToRemove": "Impossibile rimuovere il membro",
       "successRemoved": "{name} rimosso correttamente",
       "failedToInvite": "Impossibile invitare il membro",
@@ -1928,7 +2234,8 @@
       "copyLink": "Copia link",
       "linkCopied": "Link d'invito copiato",
       "failedToCopyLink": "Impossibile copiare il link",
-      "linkRegenerated": "Link d'invito aggiornato e copiato"
+      "linkRegenerated": "Link d'invito aggiornato e copiato",
+      "moreGroups": "gruppi"
     },
     "organizationName": "Nome dell'organizzazione",
     "organizationIcon": "Icona dell'organizzazione",
@@ -1960,7 +2267,9 @@
       "members": "Membri",
       "roles": "Ruoli",
       "groups": "Gruppi",
-      "signup": "Registrazione"
+      "signup": "Registrazione",
+      "quotas": "Quote",
+      "serviceAccounts": "Account di servizio"
     },
     "audit": {
       "title": "Registri di audit",
@@ -2016,7 +2325,165 @@
       "toastConfirmRequiredTitle": "Conferma richiesta",
       "toastConfirmRequiredBody": "Digita \"SONO SICURO\" per confermare questa modifica.",
       "fetchErrorGeneric": "Si è verificato un errore durante il caricamento delle impostazioni",
-      "updateErrorGeneric": "Si è verificato un errore durante l'aggiornamento delle impostazioni"
+      "updateErrorGeneric": "Si è verificato un errore durante l'aggiornamento delle impostazioni",
+      "features": {
+        "allow_llm_see_data": {
+          "name": "Consenti all'LLM di vedere i dati",
+          "description": "Consente all'LLM di vedere i dati nell'ambito dell'analisi e delle richieste degli utenti"
+        },
+        "enable_training_mode": {
+          "name": "Modalità addestramento",
+          "description": "Attiva la modalità addestramento in cui gli amministratori lavorano con l'agente per costruire documentazione, istruzioni, semantica e linee guida"
+        },
+        "enable_file_upload": {
+          "name": "Consenti il caricamento di file",
+          "description": "Consente agli utenti di caricare fogli di calcolo e documenti (xls/pdf) e di trasmetterne il contenuto all'LLM"
+        },
+        "enable_code_editing": {
+          "name": "Consenti agli utenti di modificare ed eseguire il codice generato dall'LLM",
+          "description": "Consente agli utenti di modificare ed eseguire il codice generato dall'LLM"
+        },
+        "enable_llm_judgement": {
+          "name": "Attiva il giudice LLM",
+          "description": "Consente all'LLM di valutare la qualità dell'analisi e delle richieste degli utenti"
+        },
+        "suggest_instructions": {
+          "name": "Genera automaticamente le istruzioni",
+          "description": "Genera automaticamente istruzioni a partire dai chiarimenti forniti dall'utente"
+        },
+        "enable_follow_ups": {
+          "name": "Suggerimenti di approfondimento",
+          "description": "Dopo ogni risposta nell'app web, propone alcune domande di approfondimento che l'utente può porre successivamente. Generate sul modello piccolo o predefinito."
+        },
+        "auto_suggest_evals": {
+          "name": "Suggerisci valutazioni automaticamente",
+          "description": "Quando un utente con il permesso di gestire le valutazioni approva una risposta che ha prodotto dati, il sistema di conoscenza redige un caso di test di valutazione (giudice + chiamate agli strumenti) nella raccolta di bozze dell'organizzazione, per la revisione."
+        },
+        "limit_row_count": {
+          "name": "Limita il numero di righe",
+          "description": "Limita quante righe possono essere mostrate nelle tabelle e nelle anteprime dei dati. Imposta 0 per nessun limite."
+        },
+        "ai_tool_concurrency": {
+          "name": "Chiamate agli strumenti in parallelo",
+          "description": "Quante chiamate agli strumenti provenienti da un unico passo di pianificazione possono essere eseguite contemporaneamente (ad esempio create_data / inspect_data su agenti diversi). Imposta 1 per eseguirle una dopo l'altra; fino a 8. Le chiamate sullo stesso agente vengono sempre eseguite una alla volta."
+        },
+        "agent_max_steps": {
+          "name": "Numero massimo di passi dell'agente",
+          "description": "Numero massimo di passi di pianificazione (decisioni o chiamate agli strumenti) che l'agente può compiere in una singola richiesta prima di fermarsi. Vale sia per la modalità normale sia per quella di addestramento. Limitato a 1-500."
+        },
+        "agent_loop_retries": {
+          "name": "Tentativi del ciclo dell'agente",
+          "description": "Quante volte l'agente può riprendersi da un errore imprevisto durante un'esecuzione e riprovare dal suo contesto più recente, invece di far fallire l'intera esecuzione. Esauriti i tentativi, se il ripiego LLM è attivo l'esecuzione passa al modello successivo nell'ordine di ripiego prima di arrendersi. Limitato a 0-10."
+        },
+        "limit_code_retries": {
+          "name": "Limita i tentativi di generazione del codice",
+          "description": "Quanti tentativi ha l'LLM per generare codice funzionante per una richiesta di dati (tentativo iniziale più i tentativi in caso di errore). Limitato a 1-10."
+        },
+        "query_timeout_seconds": {
+          "name": "Timeout della query (secondi)",
+          "description": "Timeout predefinito per singola query quando l'agente esegue SQL tramite create_data / inspect_data. La configurazione di una connessione può sovrascriverlo con il proprio valore 'query_timeout_seconds'."
+        },
+        "max_concurrent_queries_per_connection": {
+          "name": "Query contemporanee per connessione",
+          "description": "Quante query dell'agente possono essere eseguite contemporaneamente su una stessa connessione, per replica. Ciò che eccede attende un posto libero invece di fallire. Conviene abbassarlo per sorgenti on-premise delicate (Oracle, SQL Server) che non reggono scansioni parallele. La configurazione di una connessione può sovrascriverlo con il proprio valore 'max_concurrent_queries'."
+        },
+        "top_k_schema": {
+          "name": "Top K degli schemi",
+          "description": "Numero di schemi che l'agente campiona dalla sorgente dati"
+        },
+        "top_k_metadata_resources": {
+          "name": "Top K delle risorse di metadati",
+          "description": "Numero di risorse di metadati che l'agente campiona dalla sorgente dati"
+        },
+        "agent_roster_top_k": {
+          "name": "Top K dell'elenco agenti",
+          "description": "Quando un report ha molti agenti, quanti compaiono come righe complete nel contesto dell'IA (ordinati per l'uso recente di chi pone la domanda; gli altri sono elencati solo per nome in una coda more_agents). Limitato a 1-100."
+        },
+        "allow_forks": {
+          "name": "Consenti i fork",
+          "description": "Consente agli utenti di duplicare i report pubblicati nel proprio spazio di lavoro"
+        },
+        "mcp_enabled": {
+          "name": "MCP",
+          "description": "Attiva l'endpoint Model Context Protocol (MCP) per l'integrazione con assistenti IA come Cursor, Claude e altri"
+        },
+        "enable_mcp_tools": {
+          "name": "Strumenti MCP e API personalizzate",
+          "description": "Consente di collegare server MCP esterni ed endpoint API personalizzati alle sorgenti dati come fornitori di strumenti"
+        },
+        "enable_mcp_native_tools": {
+          "name": "Registrazione nativa degli strumenti MCP",
+          "description": "Registra ogni strumento MCP o API personalizzata come strumento dell'agente a sé stante, richiamabile direttamente, anziché instradare ogni chiamata attraverso lo strumento generico execute_mcp. Ha effetto solo quando il catalogo di strumenti di un report raggiunge la soglia indicata sotto."
+        },
+        "mcp_native_tools_threshold": {
+          "name": "Soglia per gli strumenti MCP nativi",
+          "description": "Quanti strumenti MCP o API personalizzate attivi servono a un report prima di usare la registrazione nativa. Al di sotto, la registrazione nativa risulta equivalente al percorso generico, quindi viene mantenuto quest'ultimo. Imposta 0 per registrare sempre in modo nativo."
+        },
+        "mcp_native_tools_max": {
+          "name": "Numero massimo di strumenti MCP nativi",
+          "description": "Limite superiore al numero di strumenti registrati in modo nativo per un report. Gli strumenti oltre il tetto restano sul percorso generico execute_mcp, così un catalogo molto ampio non riempie ogni richiesta con definizioni di strumenti permanenti."
+        },
+        "mcp_result_inline_chars": {
+          "name": "Dimensione inline del risultato MCP",
+          "description": "Quanta parte del risultato di uno strumento MCP o API personalizzata l'agente vede direttamente nel proprio contesto, in caratteri. La risposta completa viene sempre salvata su file qualunque sia questo valore; l'impostazione decide solo quanto il modello può leggere senza aprire quel file. Aumentalo perché l'agente risponda a partire da un intero insieme di risultati anziché da un campione; riducilo per consumare meno token per chiamata. Imposta 0 per un campione di 3 record. Limitato a 0-500000."
+        },
+        "enable_web_fetch": {
+          "name": "Recupero dal web",
+          "description": "Consente all'agente di recuperare il contenuto di URL pubblici HTTP e HTTPS. Vengono restituite solo risposte di tipo testuale e i contenuti di grandi dimensioni vengono troncati."
+        },
+        "enable_load_step": {
+          "name": "Riutilizza i passi precedenti (load_step)",
+          "description": "Consente al codice generato di riutilizzare i risultati di un passo precedente di questo report tramite load_step invece di rieseguire la query. Quando è disattivato, load_step non viene proposto all'agente né è disponibile in fase di esecuzione."
+        },
+        "enable_ml_training": {
+          "name": "Machine learning (scikit-learn)",
+          "description": "Consente al codice generato di addestrare modelli scikit-learn (classificazione, regressione, clustering, importanza delle variabili) su risultati di query e file caricati. L'addestramento gira nel processo del server; disattiva per limitare il codice generato all'analisi con pandas/numpy."
+        },
+        "ml_training_row_limit": {
+          "name": "Limite di righe per l'addestramento ML",
+          "description": "Numero massimo di righe su cui il codice generato deve addestrare un modello. Le sorgenti più grandi vengono campionate a questa dimensione prima dell'addestramento. Minimo 1000."
+        },
+        "enable_custom_queries": {
+          "name": "Query personalizzate (beta)",
+          "description": "Consente agli amministratori delle connessioni di definire SQL che BOW materializza in una copia locale cifrata secondo una pianificazione, così gli agenti rispondono dal risultato memorizzato anziché interrogare la sorgente a ogni turno. Beta: disattivato per impostazione predefinita."
+        },
+        "enable_agent_notes": {
+          "name": "Note dell'agente",
+          "description": "Consente all'agente di tenere note di lavoro per ogni report (un blocco appunti) che scrive e rilegge mentre risponde: piani, riscontri e cose da fare. Le note sono mostrate nel report ma non sono conoscenza condivisa. Quando è disattivato, gli strumenti per le note sono nascosti e le note non vengono inserite nel contesto."
+        },
+        "max_instructions_in_context": {
+          "name": "Numero massimo di istruzioni nel contesto",
+          "description": "Numero massimo di istruzioni da includere nel contesto dell'IA. Le istruzioni di tipo 'sempre' vengono caricate per prime, poi quelle 'intelligenti' occupano i posti rimanenti."
+        },
+        "allow_report_webhooks": {
+          "name": "Webhook dei report",
+          "description": "Consente a sistemi esterni (GitHub, Jira, servizi generici) di inviare eventi ai report tramite webhook in ingresso. Interruttore principale dell'intera funzionalità."
+        },
+        "max_webhooks": {
+          "name": "Numero massimo di webhook",
+          "description": "Numero massimo di webhook in ingresso attivi per organizzazione."
+        },
+        "webhook_rate_limit_per_min": {
+          "name": "Limite di frequenza dei webhook (al minuto)",
+          "description": "Numero massimo di consegne di webhook in ingresso accettate al minuto per organizzazione. Le consegne in eccesso vengono rifiutate con un 429."
+        },
+        "step_retention_days": {
+          "name": "Giorni di conservazione dei dati dei widget",
+          "description": "Numero di giorni per cui i dati dei widget vengono conservati prima dell'eliminazione."
+        },
+        "enable_excel_addin": {
+          "name": "Componente aggiuntivo di Excel",
+          "description": "Attiva il componente aggiuntivo di Excel integrato, così gli utenti possono caricare il manifest direttamente da questa istanza"
+        },
+        "model_routing": {
+          "name": "Router automatico dei modelli",
+          "description": "Enterprise. Quando l'utente non sceglie un modello specifico, ogni richiesta parte dal modello piccolo e l'agente passa a uno più potente solo se il compito lo richiede. Nella pagina LLM si possono aggiungere indicazioni di routing per singolo modello per guidare la scelta. Disattivato per impostazione predefinita; l'attivazione richiede una licenza enterprise."
+        },
+        "llm_fallback": {
+          "name": "Ripiego LLM",
+          "description": "Enterprise. Quando il modello attivo fallisce per un limite di frequenza, un sovraccarico del fornitore o un errore di rete, la richiesta viene automaticamente ritentata sul modello successivo nell'ordine di ripiego (configurato nella pagina LLM) per il resto dell'esecuzione. La sostituzione viene sempre dichiarata nella chat. Disattivato per impostazione predefinita; l'attivazione richiede una licenza enterprise."
+        }
+      }
     },
     "llms": {
       "searchPlaceholder": "Cerca LLM...",
@@ -2040,7 +2507,23 @@
       "contextTooltip": "Numero massimo di token (input + output) che l'app prevede per questo modello. Riducilo per rispettare i limiti del provider, ad esempio i deployment Bedrock limitati a 100k.",
       "contextPlaceholder": "es. 100000",
       "contextResetTooltip": "Ripristina il valore predefinito del catalogo",
+      "colTemperature": "Temperatura",
+      "temperatureTooltip": "Temperatura di campionamento esplicita (0–2) inviata con ogni richiesta a questo modello. Lascia vuoto per usare il valore predefinito del provider — consigliato, poiché alcuni modelli rifiutano qualsiasi temperatura non predefinita.",
+      "temperaturePlaceholder": "Predefinito",
+      "temperatureResetTooltip": "Ripristina il valore predefinito del provider (nessuna temperatura inviata)",
       "modelIdLabel": "ID modello",
+      "modelIdEditTooltip": "L'identificatore di deployment o di modello inviato al provider. Modificabile per i modelli personalizzati su provider Azure, AWS Bedrock e personalizzati (compatibili con OpenAI), dove l'ID indica qualcosa creato da te e non una voce del catalogo.",
+      "displayNameLabel": "Nome visualizzato",
+      "displayNamePlaceholder": "Uguale all’ID del modello",
+      "displayNameShort": "Nome",
+      "displayNameTooltip": "L’etichetta mostrata nel selettore dei modelli. Solo per i modelli personalizzati: i nomi dei modelli preimpostati provengono dal catalogo dei modelli. Lascia vuoto per usare l’ID del modello.",
+      "displayNameHint": "Etichetta facoltativa mostrata nel selettore dei modelli. Lascia vuoto per usare l’ID del modello.",
+      "displayNameError": "Impossibile aggiornare il nome visualizzato",
+      "modelIdError": "Impossibile aggiornare l’ID del modello",
+      "azureEndpointPlaceholder": "es. https://[risorsa].openai.azure.com o https://[risorsa].services.ai.azure.com",
+      "azureFoundryHint": "Sono supportati sia Azure OpenAI sia Azure AI Foundry. L'ID del modello è il nome del tuo deployment.",
+      "responsesApiHint": "Usa l'API Responses invece di Chat Completions. Necessaria per la ricerca web e disponibile solo nelle regioni che supportano l'API Responses.",
+      "responsesApiFoundryHint": "Su Foundry si applica solo ai deployment OpenAI.",
       "colCost": "Costo ($/M)",
       "colRouting": "Instradamento",
       "autoRouter": "Router automatico",
@@ -2061,7 +2544,43 @@
       "routingHintSeedSmall": "Domande di base, metriche singole e ricerche rapide.",
       "routingHintSeedDefault": "Dashboard, artefatti, analisi di file e analisi avanzata in più passaggi.",
       "autoRouterEnterprise": "Enterprise",
-      "autoRouterEnterpriseTooltip": "Il router automatico dei modelli è una funzionalità enterprise. Aggiorna la licenza per abilitarlo."
+      "autoRouterEnterpriseTooltip": "Il router automatico dei modelli è una funzionalità enterprise. Aggiorna la licenza per abilitarlo.",
+      "addModel": "Aggiungi modello",
+      "addModelCustomPlaceholder": "ID del modello (es. gpt-5.6-luna)",
+      "addModelSubmit": "Aggiungi",
+      "addModelTitle": "Aggiungi modello",
+      "addProvider": "Aggiungi provider",
+      "cancel": "Annulla",
+      "colFallback": "Fallback",
+      "colImageGen": "Generazione immagini",
+      "dangerZone": "Zona pericolosa",
+      "deleteModel": "Elimina",
+      "deleteModelBlockedDefault": "I modelli predefiniti non possono essere eliminati. Imposta prima un altro modello come predefinito.",
+      "deleteModelConfirm": "Eliminare “{name}”? L'operazione non può essere annullata.",
+      "deleteModelTitle": "Elimina modello",
+      "enabledLabel": "Attivo",
+      "fallback": "Fallback LLM",
+      "fallbackColTooltip": "Priorità nella catena di fallback — provati in ordine crescente quando il modello attivo fallisce.",
+      "fallbackEmpty": "nessun modello di fallback — imposta le priorità nella colonna Fallback",
+      "fallbackEnterpriseTooltip": "Il fallback LLM è una funzione enterprise. Aggiorna la tua licenza per abilitarlo.",
+      "fallbackHow1": "Quando il modello attivo fallisce per limite di richieste, sovraccarico del provider o errore di rete, la richiesta viene ritentata sul modello successivo nell'ordine qui sotto.",
+      "fallbackHow2": "I modelli vengono provati dall'alto verso il basso; un modello il cui provider non è raggiungibile viene saltato finché non torna disponibile.",
+      "fallbackHow3": "Il passaggio viene sempre indicato nella chat e la risposta riporta il modello che l'ha effettivamente generata.",
+      "fallbackHowTitle": "Come funziona il fallback LLM",
+      "fallbackInactive": "inattivo",
+      "fallbackOff": "Fallback LLM disattivato",
+      "fallbackOn": "Fallback LLM attivo",
+      "fallbackPrimary": "principale",
+      "imageGenDefaultBlocked": "I modelli predefiniti non possono essere modelli di generazione immagini. Imposta prima un altro modello come predefinito.",
+      "imageGenTooltip": "Indica se questo modello genera immagini (es. gpt-image-1). Lo abilita per lo strumento generate_image e per incorporare immagini generate negli artefatti. I modelli di immagini sono esclusi dal selettore dei modelli in chat e non possono essere predefiniti.",
+      "modelAdded": "Modello aggiunto",
+      "modelCardHint": "Clicca sulla riga di un modello per aprirne le impostazioni",
+      "modelDeleted": "Modello eliminato",
+      "modelSettings": "Impostazioni del modello",
+      "modelsCount": "{count} modelli",
+      "providerLabel": "Provider",
+      "providerSettingsTooltip": "Impostazioni del provider",
+      "save": "Salva"
     },
     "licensePage": {
       "title": "Licenza",
@@ -2088,7 +2607,30 @@
       "inDays": "{days} giorni rimanenti",
       "expiredNotice": "La tua licenza enterprise è scaduta. Le funzionalità enterprise sono disattivate fino al rinnovo.",
       "enterpriseTitle": "Edizione enterprise",
-      "renewInfo": "Rinnova la licenza per ripristinare le funzionalità enterprise come i log di audit, il controllo degli accessi avanzato e le policy di conservazione dei dati."
+      "renewInfo": "Rinnova la licenza per ripristinare le funzionalità enterprise come i log di audit, il controllo degli accessi avanzato e le policy di conservazione dei dati.",
+      "activate": "Attiva",
+      "activateDesc": "Incolla la chiave di licenza ricevuta da BOW.",
+      "activateTitle": "Chiave di licenza",
+      "activating": "Attivazione…",
+      "activeKey": "Chiave attiva",
+      "cancel": "Annulla",
+      "envActive": "Questa istanza sta usando {envvar} dal suo ambiente. Salvare una chiave qui la sovrascrive.",
+      "keyLabel": "Chiave di licenza",
+      "keyPlaceholder": "bow_lic_…",
+      "lastUpdated": "Aggiornata",
+      "noKey": "Nessuna chiave di licenza configurata. Incollane una qui sotto per abilitare le funzioni enterprise.",
+      "overridesEnv": "Questa chiave sovrascrive {envvar} configurato per questo deployment. Rimuovila per tornare a quella chiave.",
+      "remove": "Rimuovi",
+      "removeConfirm": "Rimuovere la chiave di licenza salvata? Questa istanza tornerà alla chiave del suo ambiente, se ne è impostata una.",
+      "removedToast": "Chiave di licenza rimossa",
+      "removing": "Rimozione…",
+      "saveFailed": "Impossibile attivare la licenza",
+      "savedToast": "Licenza attivata",
+      "sourceConfig": "Dall'ambiente",
+      "sourceDatabase": "Impostata qui",
+      "sourceLabel": "Origine",
+      "sourceNone": "Non impostata",
+      "update": "Aggiorna chiave"
     },
     "mcpModal": {
       "editTitle": "Modifica connessione MCP",
@@ -2118,7 +2660,10 @@
       "updated": "Connessione aggiornata",
       "connected": "Server MCP connesso",
       "failedUpdate": "Aggiornamento non riuscito",
-      "failedConnect": "Connessione non riuscita"
+      "failedConnect": "Connessione non riuscita",
+      "orCreateNew": "— oppure creane una nuova —",
+      "selectExistingPlaceholder": "Seleziona una esistente…",
+      "useExistingLabel": "Usa una connessione esistente"
     },
     "weekStart": {
       "label": "Inizio della settimana lavorativa",
@@ -2130,7 +2675,56 @@
         "monday": "Lunedì",
         "saturday": "Sabato"
       }
-    }
+    },
+    "smtpTab": "SMTP",
+    "timezone": {
+      "description": "Usato per interpretare i job pianificati (es. gli orari di reindicizzazione) e per mostrare i timestamp. I dati sono sempre memorizzati in UTC.",
+      "label": "Fuso orario dell'organizzazione",
+      "saveError": "Impossibile aggiornare il fuso orario",
+      "systemDefault": "Usa il valore predefinito di sistema (UTC)"
+    },
+    "pii": {
+      "action": "Azione",
+      "actionBlock": "Blocca",
+      "actionReplace": "Sostituisci",
+      "addPattern": "Aggiungi pattern",
+      "addRule": "Aggiungi regola",
+      "blocksRequest": "Blocca la richiesta",
+      "builtinDesc": "Rilevatori predefiniti per i dati personali più comuni. Attivali singolarmente e personalizza il token sostitutivo.",
+      "builtinTitle": "Regole integrate",
+      "customDesc": "Definisci i tuoi rilevatori. Una regola può contenere più pattern (espressioni regolari): basta una corrispondenza per attivarla.",
+      "customTitle": "Regole personalizzate",
+      "enterpriseBody": "La protezione dei dati personali è disponibile nel piano Enterprise. Contatta il tuo amministratore per abilitarla.",
+      "enterpriseTitle": "Funzione enterprise",
+      "masterDesc": "Quando è attiva, il testo corrispondente viene oscurato in ogni prompt inviato a un LLM da questo spazio di lavoro.",
+      "masterLabel": "Abilita la protezione dei dati personali",
+      "modeBlock": "Blocca la richiesta",
+      "modeBlockDesc": "Non inviare il prompt se vengono rilevati dati personali. Sovrascrivibile per singola regola qui sotto.",
+      "modeLabel": "Azione predefinita quando vengono rilevati dati personali",
+      "modeReplace": "Sostituisci con un token",
+      "modeReplaceDesc": "Sostituisci ogni corrispondenza con il suo token e prosegui. Sovrascrivibile per singola regola qui sotto.",
+      "noCustomRules": "Ancora nessuna regola personalizzata.",
+      "patternPlaceholder": "es. \\bEMP-\\d+\\b",
+      "patternRequired": "Ogni regola richiede almeno un pattern.",
+      "patterns": "Pattern (regex)",
+      "removeRule": "Rimuovi",
+      "replacement": "Sostituzione",
+      "ruleName": "Nome della regola",
+      "ruleNamePlaceholder": "es. Matricola",
+      "saveError": "Salvataggio delle impostazioni dei dati personali non riuscito",
+      "saved": "Impostazioni dei dati personali salvate",
+      "subtitle": "Oscura i dati personali nei prompt prima che vengano inviati a qualsiasi provider LLM. Le regole agiscono sul prompt completo: messaggio dell'utente, campioni di schema, anteprime dei dati e testo dei file caricati.",
+      "testBlocked": "Questo prompt verrebbe BLOCCATO (dati personali rilevati).",
+      "testButton": "Anteprima dell'oscuramento",
+      "testDesc": "Incolla un testo di esempio per vedere come verrà oscurato con le regole attuali.",
+      "testMatches": "Corrispondenze: {rules}",
+      "testNoMatches": "Nessun dato personale rilevato nell'esempio.",
+      "testPlaceholder": "Incolla un testo con dati personali di esempio…",
+      "testResult": "Risultato",
+      "testTitle": "Prova le tue regole",
+      "title": "Protezione dei dati personali"
+    },
+    "piiTab": "Dati personali"
   },
   "data": {
     "title": "Connessioni",
@@ -2368,7 +2962,98 @@
     "mcpModeAiTip": "L'IA può impostarlo; il server lo compila se vuoto",
     "mcpModeLockedTip": "Il valore dell'admin prevale sempre; nascosto all'IA",
     "mcpAddMetaField": "+ Aggiungi campo metadati",
-    "verify": "Verifica"
+    "verify": "Verifica",
+    "autoReindex": "Reindicizzazione automatica dello schema",
+    "autoReindexAt": "Reindicizza ogni giorno alle",
+    "autoReindexEnterprise": "La reindicizzazione pianificata è una funzione enterprise.",
+    "autoReindexEvery": "Reindicizza ogni",
+    "autoReindexHint": "Reindicizza periodicamente questa connessione così le tabelle restano aggiornate.",
+    "autoReindexLastError": "Ultimo errore",
+    "autoReindexMinInterval": "L'intervallo minimo è di {n} minuti.",
+    "autoReindexModeInterval": "Intervallo",
+    "autoReindexModeTime": "A un orario",
+    "autoReindexSaveFailed": "Salvataggio delle impostazioni di reindicizzazione non riuscito",
+    "autoReindexSchedule": "Pianificazione",
+    "autoReindexTimeHint": "Ogni giorno, nel fuso orario dell'organizzazione.",
+    "browserForm": {
+      "allowDownloads": "Consenti i download",
+      "cancel": "Annulla",
+      "name": "Nome",
+      "namePlaceholder": "es. Portale fornitori",
+      "save": "Crea",
+      "test": "Convalida URL",
+      "urls": "URL consentiti",
+      "urlsHelp": "Un pattern per riga, es. https://portal.vendor.com/**. L'agente potrà visitare solo gli URL corrispondenti."
+    },
+    "catAll": "Tutti",
+    "catBi": "BI e analytics",
+    "catDatabases": "Database e warehouse",
+    "catFiles": "File e object storage",
+    "catInfra": "Infrastruttura",
+    "catServices": "Servizi",
+    "collectionsAccessible": "{n} collezioni accessibili",
+    "collectionsLabel": "Collezioni",
+    "connectToQueryAsYou": "Collega il tuo account per interrogare i dati a tuo nome.",
+    "connectorDcrNote": "Nessuna configurazione admin richiesta — questo connettore si registra automaticamente (DCR). Lo stai aggiungendo per la tua organizzazione; ogni utente accede con il proprio account al primo utilizzo.",
+    "connectorsSection": "Connettori",
+    "customSection": "Connettori personalizzati",
+    "customSectionHint": "Collega qualsiasi server MCP o API REST",
+    "dataSourcesSection": "Sorgenti dati",
+    "disconnect": "Disconnetti",
+    "disconnecting": "Disconnessione…",
+    "everyNHours": "Ogni {n} ore",
+    "filesAccessible": "{n} file accessibili",
+    "filesLabel": "File",
+    "impactAgentsMany": "Questo avrà impatto su {count} agenti",
+    "impactAgentsOne": "Questo avrà impatto su {count} agente",
+    "lastRefreshed": "Ultimo aggiornamento",
+    "mcpBadge": "MCP",
+    "me": "Io",
+    "rateLimit": "Limite di richieste",
+    "rateLimitEnterprise": "Il limite di richieste per connessione è una funzione enterprise.",
+    "rateLimitHint": "Limita quante richieste accetta questa connessione per finestra temporale. È condiviso tra tutti gli utenti; le query oltre il limite vengono bloccate.",
+    "rateLimitNoLimit": "Nessun limite",
+    "rateLimitPerDay": "Al giorno",
+    "rateLimitPerHour": "All'ora",
+    "rateLimitPerMinute": "Al minuto",
+    "rateLimitReqDay": "req/giorno",
+    "rateLimitReqHour": "req/ora",
+    "rateLimitReqMin": "req/min",
+    "rateLimitSaveFailed": "Salvataggio delle impostazioni del limite di richieste non riuscito",
+    "refreshing": "Aggiornamento…",
+    "reloadMyTables": "Ricarica le mie tabelle",
+    "runQueriesAs": "Esegui le query come",
+    "sampleSection": "Database di esempio",
+    "serviceAccountNote": "Le query vengono eseguite con l'account di servizio della connessione.",
+    "stopIndexingFailed": "Impossibile interrompere l'indicizzazione",
+    "switchIdentityFailed": "Impossibile cambiare l'identità di esecuzione",
+    "tablesAccessible": "{n} tabelle accessibili",
+    "toolsAccessible": "{n} strumenti accessibili",
+    "toolsLabel": "Strumenti",
+    "unitHours": "ore",
+    "unitMinutes": "minuti",
+    "catPopular": "Popolari",
+    "catCustom": "Personalizzato",
+    "setupGuideTitle": "Passaggi di configurazione",
+    "setupGuideCopy": "Copia",
+    "setupGuideCopied": "Copiato",
+    "setupGuides": {
+      "kubernetes": [
+        {
+          "title": "Concedi l'accesso in lettura sul cluster",
+          "body": "Controlla il manifest, poi eseguilo con i permessi cluster-admin. Crea il namespace bagofwords, un service account, un ruolo di sola lettura a livello di cluster, il relativo binding e un token a lunga durata."
+        },
+        {
+          "title": "Stampa il file di accesso",
+          "body": "Salvalo come print_access_file.sh ed eseguilo. Attende il token e poi stampa un unico file autonomo (URL del server API, CA del cluster, token). Verificalo con: kubectl --kubeconfig access.yaml get nodes. Se l'URL del server è privato della tua rete, modificalo con l'indirizzo che questa istanza di Bag of Words può raggiungere."
+        },
+        {
+          "title": "Incollalo qui sotto e testa la connessione",
+          "body": "Incolla tutto l'output nel campo File di accesso al cluster, poi fai clic su Testa connessione."
+        }
+      ]
+    },
+    "setupGuideCopyFailed": "Copia non riuscita — seleziona il testo"
   },
   "share": {
     "shareDashboard": "Condividi dashboard",
@@ -2398,7 +3083,9 @@
     "sharingDisabled": "Condivisione disabilitata",
     "sharingFailed": "Impossibile aggiornare la condivisione",
     "userNotFound": "Utente non trovato nell'organizzazione",
-    "copyFailed": "Impossibile copiare"
+    "copyFailed": "Impossibile copiare",
+    "includeDataTab": "Includi la scheda Dati",
+    "includeDataTabDesc": "I destinatari vedranno la cronologia completa dei dati e il processo utilizzato per generare questo report"
   },
   "publish": {
     "published": "Pubblicato",
@@ -2425,6 +3112,7 @@
     "validation": "Verifica il modulo e riprova.",
     "artifact.not_found": "Artefatto non trovato",
     "access.denied": "Accesso negato",
+    "account.disabled": "Il tuo account è stato disattivato. Contatta il tuo amministratore.",
     "connection.not_found": "Connessione non trovata",
     "data_source.not_found": "Origine dati non trovata",
     "file.not_found": "File non trovato",
@@ -2450,7 +3138,15 @@
     "integration.not_found": "Integrazione non trovata",
     "resource.conflict": "La risorsa esiste già o è in conflitto con lo stato attuale",
     "resource.duplicate": "Risorsa duplicata",
-    "setting.update_failed": "Impossibile aggiornare l'impostazione"
+    "setting.update_failed": "Impossibile aggiornare l'impostazione",
+    "query": {
+      "failed_silently": "Una query è fallita ma il codice generato ha restituito un risultato vuoto invece di segnalarlo"
+    },
+    "llm": {
+      "model_id_required": "L'ID del modello non può essere vuoto",
+      "model_id_not_editable": "Solo i modelli personalizzati su provider Azure, AWS Bedrock o personalizzati (compatibili con OpenAI) possono avere l'ID modello modificato",
+      "model_id_duplicate": "Il modello «{model_id}» esiste già su questo provider"
+    }
   },
   "email": {
     "dashboardShare": {
@@ -2628,13 +3324,63 @@
     "polishDashboard": "Rifinisci dashboard"
   },
   "artifactFrame": {
+    "dataAddQuery": "Aggiungi query",
+    "dataNoQueriesToAdd": "Nessuna query da aggiungere",
+    "dataAddFailed": "Impossibile aggiungere la query alla dashboard",
+    "dataUntitledQuery": "Query senza titolo",
+    "dataNeverRun": "Mai eseguita",
+    "dataRemove": "Rimuovi dalla dashboard",
+    "dataRemoveConfirm": "Rimuovere questa query dalla dashboard? La query resta nel report e può essere riaggiunta.",
+    "dataRemoveFailed": "Impossibile rimuovere la query",
+    "dataNoResult": "Ancora nessun risultato — esegui la query per vedere i dati",
+    "dataLastRun": "Ultima esecuzione {time}",
+    "dataInUse": "In uso",
+    "dataNotUsed": "Non usato",
+    "dataInUseHint": "Renderizzato dal codice della dashboard",
+    "dataNotUsedHint": "È nella dashboard, ma il codice non lo renderizza",
+    "viewData": "Visualizza dati",
+    "dataTitle": "Dati",
+    "dataEmpty": "Nessun dato disponibile",
     "loading": "Caricamento…",
     "loadingArtifact": "Caricamento dell'artefatto…",
     "refreshed": "Dashboard aggiornata",
     "refreshPartial": "Dashboard parzialmente aggiornata",
     "refreshFailed": "Aggiornamento della dashboard non riuscito",
     "refreshNothing": "Niente da aggiornare",
-    "refreshSummary": "{succeeded} query su {total} aggiornate"
+    "refreshSummary": "{succeeded} query su {total} aggiornate",
+    "exportHtml": "Scarica come HTML autonomo",
+    "exportComplete": "Esportazione completata",
+    "exportHtmlDone": "File HTML autonomo scaricato: funziona offline.",
+    "exportFailed": "Esportazione non riuscita",
+    "exportHtmlFailed": "Impossibile esportare questa dashboard come HTML.",
+    "backToChat": "Torna alla chat",
+    "selectArtifact": "Seleziona artefatto...",
+    "useThisVersion": "Usa questa versione",
+    "refreshData": "Aggiorna i dati",
+    "refreshDisabledViewAs": "Esci dalla modalità «visualizza come» per aggiornare: l'aggiornamento viene eseguito come te, non come il membro in anteprima.",
+    "fullScreen": "Schermo intero",
+    "openInNewTab": "Apri in una nuova scheda",
+    "searchMembers": "Cerca membri per nome o e-mail...",
+    "viewAsTooltip": "«Visualizza come» mostra in anteprima solo i parametri di identità. Le sorgenti che si autenticano per singolo utente (ad esempio Power BI) continuano a essere eseguite con le tue credenziali.",
+    "apply": "Applica",
+    "copied": "Copiato",
+    "artifactIdCopied": "ID dell'artefatto copiato negli appunti",
+    "copyFailed": "Copia non riuscita",
+    "error": "Errore",
+    "refreshDashboardFailed": "Aggiornamento della dashboard non riuscito. {error}",
+    "exportPptxDone": "File PowerPoint scaricato correttamente.",
+    "exportPptxFailed": "Esportazione del file PowerPoint non riuscita.",
+    "viewAs": "Visualizza come",
+    "anonymousUser": "Utente anonimo",
+    "versionSetDefault": "Versione impostata come predefinita",
+    "versionSetDefaultFailed": "Impossibile impostare la versione come predefinita.",
+    "rename": "Rinomina dashboard",
+    "renamePlaceholder": "Nome della dashboard",
+    "renamed": "Dashboard rinominata",
+    "renameFailed": "Impossibile rinominare la dashboard.",
+    "more": "Altro",
+    "schedule": "Pianifica aggiornamento",
+    "exportAs": "Esporta come {format}"
   },
   "filter": {
     "addFilters": "Aggiungi filtri",
@@ -2712,7 +3458,8 @@
     "global": "Globale",
     "tablesLoadFailed": "Impossibile caricare le tabelle",
     "instructionsLoadFailed": "Impossibile caricare le istruzioni",
-    "queriesLoadFailed": "Impossibile caricare le query"
+    "queriesLoadFailed": "Impossibile caricare le query",
+    "connectToPreview": "Accedi per vedere in anteprima tabelle e istruzioni e per fare domande."
   },
   "allInstructions": {
     "title": "Tutte le istruzioni",
@@ -2813,7 +3560,9 @@
       "enterprise": "Enterprise",
       "sample": "esempio",
       "orTry": "Oppure prova un database di esempio:",
-      "errorAvailable": "Impossibile recuperare le origini dati disponibili"
+      "errorAvailable": "Impossibile recuperare le origini dati disponibili",
+      "searchPlaceholder": "Cerca origini dati...",
+      "noResults": "Nessuna origine dati corrisponde a “{query}”"
     },
     "schema": {
       "save": "Salva e continua"
@@ -2849,7 +3598,7 @@
       "awsSecretAccessKey": "AWS Secret Access Key",
       "awsSecretAccessKeyPlaceholder": "Inserisci la secret access key",
       "endpointUrl": "URL dell'endpoint",
-      "endpointPlaceholder": "es. https://[risorsa].openai.azure.com",
+      "endpointPlaceholder": "es. https://[risorsa].openai.azure.com o https://[risorsa].services.ai.azure.com",
       "useDefaultBaseUrl": "Usa URL base predefinito",
       "setCustomBaseUrl": "Imposta URL base personalizzato",
       "baseUrl": "URL base (opzionale)",
@@ -2903,7 +3652,8 @@
       "toastDeleted": "Caso di test eliminato",
       "toastCreated": "Caso di test creato",
       "toastDeleteFailed": "Impossibile eliminare il caso di test",
-      "saveFailed": "Impossibile salvare il caso di test"
+      "saveFailed": "Impossibile salvare il caso di test",
+      "emptyDescription": "I test valutano come i tuoi agenti rispondono a prompt e regole."
     },
     "filter": {
       "allSuites": "Tutte le suite",
@@ -2998,6 +3748,18 @@
       "listContains": "l'elenco contiene il valore",
       "listContainsAny": "l'elenco contiene almeno uno",
       "listContainsAll": "l'elenco contiene tutti"
+    },
+    "strip": {
+      "default": "predefinita",
+      "emptyShelf": "Ancora nessuna eval archiviata qui",
+      "fromChat": "in questa chat",
+      "noneResolved": "Ancora nessuna eval risolta per questo agente",
+      "orgWide": "Tutta l'organizzazione",
+      "pinned": "collegata a questa modifica",
+      "runAll": "Esegui tutte",
+      "runSuite": "Esegui {name}",
+      "runningCount": "In esecuzione {done}/{total}",
+      "title": "Eval per questa modifica"
     }
   },
   "monitoring": {
@@ -3038,7 +3800,15 @@
       "next": "Successivo",
       "periodAllTime": "Sempre",
       "filterUsersAll": "Tutti gli utenti",
-      "searchPlaceholder": "Cerca prompt…"
+      "searchPlaceholder": "Cerca prompt…",
+      "activityChartEmpty": "Nessuna attività nel periodo selezionato.",
+      "activityChartError": "Errore",
+      "activityChartLoading": "Caricamento attività…",
+      "activityChartSubtitle": "Esecuzioni giornaliere degli agenti per stato",
+      "activityChartSuccess": "Riuscite",
+      "activityChartTitle": "Attività di esecuzione degli agenti",
+      "activityChartTotal": "Totale",
+      "dayFilterLabel": "Visualizzazione del {date}"
     },
     "title": "Monitoraggio",
     "tabExplore": "Esplora",
@@ -3077,7 +3847,9 @@
       "loading": "Caricamento dati di costo...",
       "lockedTitle": "Il costo è una funzionalità enterprise",
       "lockedBody": "Esegui l'upgrade a una licenza enterprise per monitorare il consumo di token e il costo degli LLM per utente, agente e gruppo nel tempo.",
-      "fanoutNote": "La spesa dei report multi-origine viene conteggiata per ciascuna delle loro origini dati, quindi i totali per riga possono superare il totale complessivo."
+      "fanoutNote": "La spesa dei report multi-origine viene conteggiata per ciascuna delle loro origini dati, quindi i totali per riga possono superare il totale complessivo.",
+      "kpiSaved": "Risparmiato con l'instradamento automatico",
+      "kpiSavedSub": "chiamate instradate"
     },
     "cards": {
       "messages": "Messaggi",
@@ -3169,7 +3941,10 @@
     "tabEvals": "Valutazioni",
     "loadFailInstructions": "Impossibile caricare le istruzioni",
     "loadFailQueries": "Impossibile caricare le query",
-    "loadFailEvals": "Impossibile caricare le valutazioni"
+    "loadFailEvals": "Impossibile caricare le valutazioni",
+    "noInstruction": "Nessuna istruzione principale",
+    "noStarters": "Nessuno spunto di conversazione",
+    "primaryInstruction": "Istruzione principale"
   },
   "instructionModal": {
     "newTitle": "Nuova istruzione",
@@ -3305,7 +4080,33 @@
       "createFailed": "Impossibile creare l'istruzione",
       "updateFailed": "Impossibile aggiornare l'istruzione",
       "deleteFailed": "Impossibile eliminare l'istruzione",
-      "enhanceFailed": "Impossibile migliorare l'istruzione"
+      "enhanceFailed": "Impossibile migliorare l'istruzione",
+      "revertFailed": "Ripristino dell'istruzione non riuscito",
+      "revertSuccess": "Ripristinata alla v{n}"
+    },
+    "sidebar": {
+      "approvedBy": "Approvata da",
+      "category": "Categoria",
+      "createdBy": "Creata da",
+      "dataSources": "Sorgenti dati",
+      "details": "Dettagli",
+      "labels": "Etichette",
+      "loading": "Caricamento del contesto AI",
+      "references": "Riferimenti",
+      "scope": "Ambito",
+      "status": "Stato",
+      "visibility": "Visibilità"
+    },
+    "versions": {
+      "compareLabel": "Rispetto alla versione attuale",
+      "confirmRevert": "Ripristinare questa istruzione alla v{n}? Verrà creata una nuova build.",
+      "current": "attuale",
+      "fieldChanges": "Modifiche ai campi",
+      "label": "Versione",
+      "loadFailed": "Caricamento delle versioni non riuscito",
+      "noChanges": "Nessuna differenza di contenuto rispetto alla versione attuale",
+      "revert": "Ripristina questa versione",
+      "reverting": "Ripristino in corso..."
     }
   },
   "mcpServerModal": {
@@ -3487,7 +4288,9 @@
       "defaultModelSubtitle": "Il modello usato per impostazione predefinita quando avvii una nuova chat. Sono elencati solo i modelli a cui hai accesso.",
       "orgDefault": "Predefinito dell'organizzazione",
       "defaultModelSaved": "Modello predefinito aggiornato",
-      "defaultModelFailed": "Impossibile aggiornare il modello predefinito"
+      "defaultModelFailed": "Impossibile aggiornare il modello predefinito",
+      "directorySubtitle": "Informazioni professionali sincronizzate dal provider di identità della tua organizzazione. Visibili all'AI come contesto.",
+      "directoryTitle": "Profilo della directory"
     },
     "instructions": {
       "title": "Istruzioni personalizzate",
@@ -3544,7 +4347,21 @@
     }
   },
   "commandPalette": {
-    "prompts": "Prompt"
+    "prompts": "Prompt",
+    "actions": "Azioni",
+    "agents": "Agenti",
+    "emptyLabel": "Inizia a digitare per cercare",
+    "emptyQueryLabel": "Nessun risultato",
+    "instructions": "Istruzioni",
+    "newInstruction": "Nuova istruzione",
+    "newInstructionWithQuery": "Nuova istruzione “{query}”",
+    "newReport": "Nuovo report",
+    "newReportWithQuery": "Nuovo report “{query}”",
+    "placeholder": "Cerca report, agenti, istruzioni…",
+    "reports": "Report recenti",
+    "suggestInstruction": "Suggerisci istruzione",
+    "suggestInstructionWithQuery": "Suggerisci l'istruzione “{query}”",
+    "suggestionHint": "inviata per revisione"
   },
   "promptParams": {
     "title": "Compila i parametri — {title}",
@@ -3643,7 +4460,12 @@
     "allAgentsHint": "All agents",
     "nAgentsSelected": "{n} selected",
     "selectAgentsPlaceholder": "Select agents…",
-    "modelDefaultAuto": "Auto · instrada per difficoltà"
+    "modelDefaultAuto": "Auto · instrada per difficoltà",
+    "deliverEmail": "Email",
+    "deliverEmailHint": "A ogni membro viene inviato via email un link al report.",
+    "deliverLabel": "Invia i risultati anche a",
+    "deliverTeams": "Teams",
+    "deliverTeamsHint": "Inviato nella chat Teams di ogni membro (i membri senza Teams vengono saltati)."
   },
   "automations": {
     "title": "Automazioni",
@@ -3745,7 +4567,8 @@
     "cancel": "Annulla",
     "saved": "Documento salvato",
     "saveFailed": "Impossibile salvare il documento",
-    "editDiagramSource": "Fai clic per modificare il codice del diagramma"
+    "editDiagramSource": "Fai clic per modificare il codice del diagramma",
+    "unsavedForExport": "Salva il documento prima di esportarlo in PDF"
   },
   "notes": {
     "heading": "Note",
@@ -3810,5 +4633,314 @@
     "continueOnboarding": "Continua la configurazione",
     "configureLlm": "Configura il tuo LLM",
     "connectFirstDataSource": "Collega la tua prima origine dati"
+  },
+  "agentPage": {
+    "tables": {
+      "addFiles": "Carica file",
+      "fileRemoveFailed": "Rimozione del file non riuscita",
+      "fileUploadFailed": "Caricamento del file non riuscito",
+      "filesUploading": "Caricamento…",
+      "manageConnections": "Gestisci connessioni",
+      "manageFiles": "Carica file",
+      "removeFile": "Rimuovi file",
+      "save": "Salva",
+      "schemaRefreshing": "Lo schema è in aggiornamento — le tabelle compariranno a breve.",
+      "selectTables": "Seleziona le tabelle",
+      "selectTablesSubtitle": "Scegli quali tabelle abilitare"
+    }
+  },
+  "changelog": {
+    "changeCount": "{count} modifica | {count} modifiche",
+    "emptyTitle": "Ancora nessuna nota di rilascio",
+    "errorBody": "Si è verificato un errore nel recupero delle note di rilascio.",
+    "errorTitle": "Impossibile caricare il changelog",
+    "latest": "Ultima",
+    "menuItem": "Changelog",
+    "retry": "Riprova",
+    "subtitle": "Ultimi aggiornamenti e miglioramenti",
+    "title": "Novità",
+    "viewOnGithub": "Vedi tutte le release"
+  },
+  "exports": {
+    "complete": "Esportazione completata",
+    "failed": "Esportazione non riuscita",
+    "html": "HTML",
+    "label": "Esporta",
+    "pdf": "PDF",
+    "pdfDone": "PDF scaricato.",
+    "pptx": "PowerPoint"
+  },
+  "quotaPolicies": {
+    "add": "Aggiungi",
+    "assignmentCounts": {
+      "group": "{n} gruppi",
+      "role": "{n} ruoli",
+      "user": "{n} utenti"
+    },
+    "assignments": "Assegnazioni",
+    "cancel": "Annulla",
+    "cancelEdit": "Annulla modifica",
+    "colActions": "Azioni",
+    "colAssignments": "Assegnazioni",
+    "colLimits": "Limiti",
+    "colOverrides": "Eccezioni per connessione",
+    "colPolicy": "Criterio",
+    "colQuota": "Quota",
+    "colStatus": "Stato",
+    "confirmDelete": "Eliminare la quota “{name}”?",
+    "connection": "Connessione",
+    "connectionOverrides": "Eccezioni per connessione",
+    "create": "Crea",
+    "createQuota": "Crea quota",
+    "dataMb": "Dati MB",
+    "dataShort": "Dati",
+    "descriptionLabel": "Descrizione",
+    "descriptionPlaceholder": "Facoltativo",
+    "disabled": "Disattivata",
+    "editQuota": "Modifica quota",
+    "enabled": "Attiva",
+    "failedToDelete": "Eliminazione della quota non riuscita",
+    "failedToLoad": "Caricamento delle quote non riuscito",
+    "failedToSave": "Salvataggio della quota non riuscito",
+    "groups": "Gruppi",
+    "inherited": "Ereditata",
+    "loading": "Caricamento...",
+    "monthlyDataLimitMb": "Limite mensile di dati (MB)",
+    "monthlyQueryLimit": "Limite mensile di query",
+    "monthlySpendLimitUsd": "Limite mensile di spesa (USD)",
+    "monthlyTokenLimit": "Limite mensile di token",
+    "nameLabel": "Nome",
+    "namePlaceholder": "es. Quota analisti",
+    "newQuota": "Nuova quota",
+    "noDirectQuota": "Predefinita",
+    "noPoliciesFound": "Nessun criterio di quota trovato",
+    "noPoliciesHint": "Crea una quota per limitare l'uso mensile di AI e dati.",
+    "none": "Nessuna",
+    "principalTypes": {
+      "group": "Gruppo",
+      "role": "Ruolo",
+      "user": "Utente"
+    },
+    "queries": "Query",
+    "queriesShort": "Query",
+    "roles": "Ruoli",
+    "save": "Salva",
+    "searchPlaceholder": "Cerca quote...",
+    "selectConnection": "Seleziona una connessione...",
+    "selectPrincipal": "Seleziona un principal...",
+    "spendShort": "Spesa",
+    "toastAssignmentUpdated": "Assegnazione della quota aggiornata",
+    "toastCreated": "Quota creata",
+    "toastDeleted": "Quota eliminata",
+    "toastUpdated": "Quota aggiornata",
+    "tokensShort": "Token",
+    "unlimited": "Illimitata",
+    "update": "Aggiorna",
+    "users": "Utenti"
+  },
+  "serviceAccounts": {
+    "active": "Attivo",
+    "apiKeys": "Chiavi API",
+    "colKeys": "Chiavi",
+    "colName": "Nome",
+    "colRole": "Ruolo",
+    "colStatus": "Stato",
+    "copied": "Copiato negli appunti",
+    "copy": "Copia",
+    "copyManual": "Seleziona la chiave e copiala manualmente",
+    "create": "Crea",
+    "createFailed": "Impossibile creare l'account di servizio",
+    "created": "Account di servizio creato",
+    "delete": "Elimina",
+    "deleted": "Account di servizio eliminato",
+    "description": "Descrizione",
+    "disable": "Disattiva",
+    "disabled": "Disattivato",
+    "empty": "Ancora nessun account di servizio.",
+    "enable": "Attiva",
+    "keyFailed": "Impossibile creare la chiave",
+    "keyLastUsed": "Ultimo utilizzo",
+    "keyName": "Nome",
+    "keyOnce": "Copia subito questa chiave — non verrà più mostrata.",
+    "keyPrefix": "Prefisso",
+    "manageKeys": "Gestisci chiavi",
+    "never": "Mai",
+    "newAccount": "Nuovo account di servizio",
+    "newKey": "Crea chiave",
+    "noKeys": "Ancora nessuna chiave.",
+    "noRole": "Nessun ruolo",
+    "roleHint": "Puoi concedere solo un ruolo di cui possiedi già i permessi.",
+    "selectRole": "Seleziona un ruolo",
+    "subtitle": "Identità API non umane per automazioni e integrazioni. Ciascuna ha il proprio ruolo e le proprie chiavi API e non è legata a una persona.",
+    "title": "Account di servizio"
+  },
+  "sessionEvents": {
+    "artifact_schedule_changed": "La pianificazione di aggiornamento di “{title}” è stata modificata",
+    "artifact_schedule_removed": "La pianificazione di aggiornamento di “{title}” è stata rimossa",
+    "artifact_schedule_set": "È stato pianificato un aggiornamento per “{title}”",
+    "artifact_shared": "“{title}” è stato condiviso con {who}",
+    "artifact_shared_generic": "“{title}” è stato condiviso",
+    "artifact_unshared": "“{title}” è tornato privato",
+    "artifact_version_reverted": "“{title}” è stato ripristinato alla versione {v}",
+    "artifact_version_reverted_generic": "“{title}” è stato ripristinato a una versione precedente",
+    "conversation_share_off": "La condivisione della conversazione è stata disattivata",
+    "eval_run_started": "{actor} ha avviato una serie di eval · {n} casi",
+    "eval_run_started_by": "{actor} ha avviato una serie di eval",
+    "eval_run_started_generic": "È stata avviata una serie di eval",
+    "eval_run_started_generic_n": "È stata avviata una serie di eval · {n} casi",
+    "file_removed": "{name} è stato rimosso",
+    "file_uploaded": "{name} è stato caricato",
+    "instruction_accepted": "La modifica proposta a “{title}” è stata accettata",
+    "instruction_accepted_generic": "Una modifica proposta a un'istruzione è stata accettata",
+    "instruction_accepted_versioned": "La modifica proposta a “{title}” (v{v}) è stata accettata",
+    "instruction_rejected": "La modifica proposta a “{title}” è stata rifiutata",
+    "instruction_rejected_generic": "Una modifica proposta a un'istruzione è stata rifiutata",
+    "instruction_rejected_versioned": "La modifica proposta a “{title}” (v{v}) è stata rifiutata",
+    "llm_changed": "Il modello è stato cambiato in {to}",
+    "llm_reset": "Il modello è stato riportato a quello predefinito",
+    "report_published": "Questo report è stato pubblicato",
+    "report_shared": "Questa conversazione è stata condivisa con {who}",
+    "report_shared_generic": "Questa conversazione è stata condivisa",
+    "report_unpublished": "La pubblicazione di questo report è stata annullata",
+    "run_stopped": "L'esecuzione è stata interrotta",
+    "scope_added": "Ambito dell'agente modificato — aggiunti {added}",
+    "scope_changed": "Ambito dell'agente modificato — aggiunti {added}; rimossi {removed}",
+    "scope_generic": "Ambito dell'agente modificato",
+    "scope_removed": "Ambito dell'agente modificato — rimossi {removed}"
+  },
+  "reportWebhooks": {
+    "title": "Webhooks",
+    "subtitle": "Invia eventi esterni a questo report.",
+    "active": "Attivi",
+    "rotate": "Rigenera la chiave di firma",
+    "delete": "Elimina",
+    "copyOnce": "Copialo ora: viene mostrato una sola volta",
+    "secretKey": "Chiave",
+    "newWebhook": "Nuovo webhook",
+    "name": "Nome",
+    "namePlaceholder": "Triage delle PR",
+    "source": "Origine",
+    "auth": "Autenticazione",
+    "authToken": "Intestazione token",
+    "authHmac": "HMAC (firmato)",
+    "authUrlToken": "Token nell'URL",
+    "authTokenShort": "token",
+    "authHmacShort": "hmac",
+    "authUrlTokenShort": "url token",
+    "letAiDecide": "Lascia decidere all'IA se rispondere",
+    "guidance": "Indicazioni (facoltativo)",
+    "guidancePlaceholder": "Rispondi solo alle PR che riguardano la fatturazione; ignora dependabot.",
+    "createButton": "Crea webhook",
+    "defaultName": "Webhook",
+    "sourceGeneric": "Generico"
+  },
+  "filePreview": {
+    "unavailable": "Anteprima non disponibile",
+    "document": "Documento",
+    "pageN": "Pagina {n}",
+    "ofTotalPages": "{n} di {total} pagine",
+    "showingRows": "Visualizzate {n} di {total} righe",
+    "openInPanel": "Apri nel pannello laterale",
+    "closeFilePanel": "Chiudi file"
+  },
+  "skillCatalog": {
+    "subtitle": "Guide curate che l’agente carica quando servono. Attiva quelle utili al tuo team.",
+    "searchPlaceholder": "Cerca competenze…",
+    "loading": "Caricamento competenze…",
+    "loadFailed": "Impossibile caricare il catalogo delle competenze.",
+    "noResults": "Nessuna competenza corrisponde alla ricerca.",
+    "enable": "Attiva",
+    "disable": "Disattiva",
+    "update": "Aggiorna",
+    "updateAvailable": "Aggiornamento disponibile",
+    "customized": "Modificata",
+    "customizedHint": "Questa competenza è stata modificata per la tua organizzazione. L’aggiornamento la sostituirà con la versione originale.",
+    "modeScoped": "Solo {modes}",
+    "modeScopedHint": "Questa competenza viene offerta all’agente solo in queste modalità.",
+    "adminOnly": "Solo un amministratore può attivare una competenza per l’organizzazione.",
+    "enabledToast": "«{name}» attivata",
+    "disabledToast": "«{name}» disattivata",
+    "updatedToast": "«{name}» aggiornata",
+    "actionFailed": "Non ha funzionato. Riprova.",
+    "confirmOverwrite": "«{name}» è stata modificata per la tua organizzazione. L’aggiornamento sostituirà la tua versione con quella originale. Continuare?",
+    "reset": "Ripristina",
+    "custom": "Personalizzata",
+    "browse": "Sfoglia il catalogo",
+    "enabledEmpty": "Nessuna competenza attiva",
+    "tabCatalog": "Catalogo",
+    "enabledSubtitle": "Competenze attivate da questa organizzazione. Aprine una per leggerla o modificarla.",
+    "tabEnabled": "Attive",
+    "default": "Predefinita",
+    "defaultHint": "Attivata per ogni nuova organizzazione. Un amministratore può disattivarla."
+  },
+  "tableErd": {
+    "recentPrompts": "Richieste recenti",
+    "thisAgentOnly": "Solo utilizzo registrato di questo agente",
+    "promptUnavailable": "Richiesta non disponibile",
+    "promptsError": "Impossibile caricare le richieste.",
+    "noPrompts": "Nessuna richiesta registrata per questa tabella.",
+    "morePrompts": "Mostra altro",
+    "loadingPrompts": "Caricamento richieste…",
+    "selectedCount": "{count} selezionate",
+    "selectTables": "Seleziona tabelle",
+    "customQuery": "Query personalizzata",
+    "customQueriesOff": "Query personalizzate disattivate",
+    "enableCustomQueries": "Attiva nelle impostazioni IA",
+    "reload": "Ricarica",
+    "editQuery": "Modifica {name}",
+    "rowFiltered": "Righe filtrate",
+    "refreshFailed": "Aggiornamento fallito",
+    "successful": "Riuscite",
+    "failed": "Fallite",
+    "lastRefreshed": "Ultimo aggiornamento",
+    "cache": "Cache",
+    "cached": "In cache",
+    "notCached": "Non in cache",
+    "searchTables": "Cerca tabelle…",
+    "suggested": "Suggerita",
+    "suggestedHint": "Suggerita dai nomi delle chiavi · non verificata",
+    "view": "Vista tabelle",
+    "table": "Elenco",
+    "erd": "Visuale",
+    "unsaved": "Modifiche non salvate",
+    "selectTable": "Seleziona {name}",
+    "add": "Aggiungi",
+    "selected": "Selezionata",
+    "notSelected": "Non selezionata",
+    "expand": "+{count} correlate",
+    "noKeys": "Nessuna chiave nota",
+    "addTables": "Aggiungi tabelle",
+    "clearFocus": "Rimuovi focus",
+    "overlay": "Livello",
+    "none": "Nessun livello",
+    "usage": "Utilizzo",
+    "lastUsed": "Ultimo utilizzo",
+    "feedback": "Feedback sulle risposte",
+    "searchHint": "Usa la ricerca e i filtri qui sopra.",
+    "noMatches": "Nessuna tabella corrispondente",
+    "showMore": "Mostra altro",
+    "empty": "Aggiungi una tabella per esplorarne le relazioni.",
+    "outsideFilters": "Mostrata come contesto · fuori dai filtri",
+    "noRelationships": "Nessuna relazione nota",
+    "unresolved": "Alcune destinazioni non sono disponibili o sono ambigue.",
+    "columns": "Colonne ({count})",
+    "visibleCount": "{shown} di {total} visibili",
+    "fit": "Adatta vista",
+    "zoomIn": "Ingrandisci",
+    "zoomOut": "Riduci",
+    "arrange": "Disponi tabelle",
+    "reset": "Reimposta esplorazione",
+    "usageValue": "Utilizzi: {count}",
+    "feedbackValue": "Risposte: +{positive} / −{negative}",
+    "unknown": "Nessun utilizzo registrato",
+    "loading": "Caricamento relazioni…",
+    "loadError": "Impossibile caricare le relazioni.",
+    "retry": "Riprova",
+    "saveError": "Impossibile salvare la selezione.",
+    "fullscreen": "Schermo intero",
+    "exitFullscreen": "Esci da schermo intero",
+    "searchColumns": "Cerca colonne…",
+    "noColumns": "Nessuna colonna corrispondente",
+    "centrality": "Centralità"
   }
 }

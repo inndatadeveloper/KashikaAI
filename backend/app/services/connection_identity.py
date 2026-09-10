@@ -298,21 +298,22 @@ def supports_user_kerberos_sso(connection: Connection) -> bool:
 
 
 def resolve_kerberos_principal(user, row: UserConnectionCredentials | None = None) -> str | None:
-    """The AD principal (UPN) a member's queries impersonate.
+    """Resolve only a server-verified directory binding in the current scope.
 
-    Precedence: an explicit principal the member saved > their login identity.
-    Returns None when neither yields a UPN-shaped value (login isn't an AD UPN
-    and no override saved) — the member must set their principal explicitly.
+    Neither the login email nor a saved member-supplied principal authorizes
+    delegation. The caller must revalidate the directory object before use.
     """
-    if row is not None and row.auth_mode == KERBEROS_SSO_MODE:
-        try:
-            explicit = (row.decrypt_credentials() or {}).get("kerberos_impersonate")
-        except Exception:
-            explicit = None
-        if explicit and "@" in explicit:
-            return explicit.strip()
-    email = (getattr(user, "email", None) or "").strip()
-    return email if "@" in email else None
+    from app.settings.config import settings
+    from app.ee.ldap.connection import LDAPConnectionManager
+    identity = getattr(user, "ldap_identity", None)
+    if not isinstance(identity, dict) or not settings.bow_config.ldap.enabled:
+        return None
+    manager = LDAPConnectionManager(settings.bow_config.ldap)
+    if identity.get("provider") != manager.provider_id or not identity.get("sid_hex"):
+        return None
+    if getattr(user, "ldap_subject", None) != identity["provider"] + ":" + identity.get("guid", ""):
+        return None
+    return identity.get("principal")
 
 
 async def build_kerberos_sso_status(
@@ -321,10 +322,10 @@ async def build_kerberos_sso_status(
 ):
     """Per-user status for a Kerberos-SSO connection (no stored secret).
 
-    A resolvable UPN → the member has delegated access (effective_auth="user"),
+    A verified directory binding → delegated access (effective_auth="user"),
     so their overlay builds by impersonating them. Connection health is "success"
-    once a verify/query has recorded the marker row, else "unknown". No UPN →
-    effective_auth="none" and connection="not_connected" (prompt for principal).
+    once a verify/query has recorded the marker row, else "unknown". No binding →
+    effective_auth="none" and connection="not_connected".
     """
     from app.schemas.data_source_schema import DataSourceUserStatus
 
@@ -344,13 +345,14 @@ async def build_kerberos_sso_status(
             last_checked_at=last_checked,
         )
 
-    verified = bool(marker and marker.last_used_at)
+    last_error = (getattr(marker, "metadata_json", None) or {}).get("last_error") if marker else None
+    verified = bool(marker and marker.last_used_at and not last_error)
     return DataSourceUserStatus(
         has_user_credentials=True,
         auth_mode=KERBEROS_SSO_MODE,
         is_primary=bool(getattr(marker, "is_primary", True)) if marker else True,
         last_used_at=getattr(marker, "last_used_at", None),
-        connection="success" if verified else "unknown",
+        connection="success" if verified else ("offline" if last_error else "unknown"),
         effective_auth="user",
         credentials_id=str(marker.id) if marker and getattr(marker, "id", None) else None,
         last_checked_at=getattr(marker, "last_used_at", None) or last_checked,

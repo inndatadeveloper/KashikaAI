@@ -1,13 +1,16 @@
 <template>
-  <div class="widget-container">
-    <!-- Widget header with title and toggle -->
-    <div class="widget-header" @click="toggleCollapsed">
-      <div class="flex items-center justify-between w-full">
-        <div class="flex items-center">
-          <Icon :name="isCollapsed ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-3.5 h-3.5 me-1.5 text-gray-500 dark:text-gray-400 rtl-flip" />
-          <h3 class="widget-title">{{ widgetTitle }}</h3>
+  <div class="widget-container" :class="{ 'widget-container--expanded': expanded }" :data-testid="expanded ? 'data-panel' : undefined">
+    <!-- Widget header with title and toggle. In the side panel there is
+         nothing to collapse: the header stays pinned at the top as the
+         card's toolbar while the result scrolls beneath it. -->
+    <div class="widget-header" :class="{ 'widget-header--expanded': expanded }" @click="toggleCollapsed">
+      <div class="flex items-center justify-between w-full min-w-0">
+        <div class="flex items-center min-w-0">
+          <Icon v-if="!expanded" :name="isCollapsed ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-3.5 h-3.5 me-1.5 text-gray-500 dark:text-gray-400 rtl-flip" />
+          <Icon v-else :name="showVisual ? 'heroicons:chart-bar' : 'heroicons:table-cells'" class="w-3.5 h-3.5 me-1.5 text-gray-400 flex-shrink-0" />
+          <h3 class="widget-title truncate" :class="{ 'text-sm': expanded }">{{ widgetTitle }}</h3>
           <button
-            v-if="queryId && canEditCode && !readonly"
+            v-if="queryId && canEditCode && (canEdit || !readonly)"
             @click.stop="onEditClick"
             class="text-xs px-2 py-0.5 text-gray-400 rounded transition-colors flex items-center"
             :title="$t('tools.widgetPreview.editQueryCode')"
@@ -26,10 +29,27 @@
               {{ queryId.slice(0, 8) }}
             </button>
           </UTooltip>
-          <div v-if="rowCount" class="text-[11px] text-gray-400 leading-none">
+          <div v-if="rowCount" class="text-[11px] text-gray-400 leading-none flex items-center gap-1 whitespace-nowrap" data-testid="widget-row-count">
+            <Spinner v-if="isHydratingStep" class="w-3 h-3 text-gray-400" :title="$t('tools.widgetPreview.loadingRows')" />
             {{ activeFilterCount > 0 ? $t('tools.widgetPreview.rowsFiltered', { filtered: filteredRowCount, total: rowCount }) : $t('tools.widgetPreview.rows', { count: rowCount }) }}
           </div>
+          <UTooltip v-if="cardParamSpecs.length" text="Parameterized query">
+            <div class="text-[11px] text-gray-400 leading-none flex items-center gap-0.5" data-testid="card-param-chip">
+              <Icon name="heroicons:adjustments-horizontal" class="w-3 h-3" />{{ cardParamSpecs.length }}
+            </div>
+          </UTooltip>
 
+          <UTooltip v-if="canExpand && !expanded" :text="$t('tools.widgetPreview.openInPanel')">
+            <button
+              type="button"
+              @click.stop="openInPanel"
+              class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
+              :aria-label="$t('tools.widgetPreview.openInPanel')"
+              data-testid="widget-open-panel"
+            >
+              <Icon name="heroicons:arrows-pointing-out" class="w-3.5 h-3.5" />
+            </button>
+          </UTooltip>
           <UTooltip v-if="hasChartForDownload" :text="$t('tools.widgetPreview.downloadPng')">
             <button
               @click.stop="downloadChartPNG"
@@ -59,13 +79,17 @@
               <span class="text-xs truncate">{{ item.label }}</span>
             </template>
           </UDropdown>
+          <!-- Extra header controls from the host (e.g. the Data modal's remove) -->
+          <slot name="header-actions" />
         </div>
       </div>
+      <!-- Second header line from the host (e.g. last-run status + error) -->
+      <slot name="header-subtitle" />
     </div>
 
     <!-- Collapsible content -->
     <Transition name="slide-fade">
-      <div v-if="!isCollapsed" class="widget-content">
+      <div v-if="!isCollapsed" class="widget-content" :class="{ 'widget-content--expanded': expanded }">
         <!-- Error / empty state when step has an error -->
         <template v-if="hasStepError">
           <div class="min-h-[80px] flex items-center text-xs text-gray-400">
@@ -73,6 +97,37 @@
           </div>
         </template>
         <template v-else>
+          <!-- Params value bar: what this snapshot ran with + try other
+               values in place. Viewer-mode runs only — the shared snapshot
+               changes through the editor's Save, never from here. -->
+          <div v-if="cardParamSpecs.length" class="mb-2 flex flex-wrap items-center gap-2 text-xs border-b border-gray-50 dark:border-gray-800 pb-2" data-testid="param-value-bar" @click.stop>
+            <label v-for="spec in editableCardSpecs" :key="spec.name" class="flex items-center gap-1 text-gray-500 dark:text-gray-400">
+              <span class="text-[11px]">{{ spec.label || spec.name }}</span>
+              <select v-if="cardParamOptions[spec.name] && spec.type !== 'list'" v-model="cardParamValues[spec.name]"
+                class="px-1.5 py-0.5 border border-gray-200 dark:border-gray-700 rounded text-xs bg-white dark:bg-gray-900" :data-testid="`card-param-${spec.name}`">
+                <option :value="null">All</option>
+                <option v-for="o in cardParamOptions[spec.name]" :key="String(o.value)" :value="o.value">{{ o.label }}</option>
+              </select>
+              <input v-else v-model="cardParamValues[spec.name]"
+                class="w-32 px-1.5 py-0.5 border border-gray-200 dark:border-gray-700 rounded text-xs bg-white dark:bg-gray-900"
+                :placeholder="spec.type === 'list' ? 'a, b, … (empty = All)' : (spec.default != null ? String(spec.default) : 'All')"
+                :data-testid="`card-param-${spec.name}`" />
+            </label>
+            <span v-for="spec in identityCardSpecs" :key="spec.name"
+              class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-200 text-[10px]">
+              {{ spec.label || spec.name }}: scoped to you
+            </span>
+            <button v-if="editableCardSpecs.length && !readonly" @click.stop="runCardParams" :disabled="cardRunLoading"
+              class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 flex items-center gap-1"
+              data-testid="card-param-run">
+              <Icon name="heroicons-play" class="w-3 h-3" />{{ cardRunLoading ? 'Running…' : 'Run' }}
+            </button>
+            <span v-if="cardAppliedParams" class="text-[10px] text-gray-400" data-testid="card-applied">
+              ran with {{ formatAppliedParams(cardAppliedParams) }}
+            </span>
+            <span v-if="cardRunError" class="text-[10px] text-red-500">{{ cardRunError }}</span>
+          </div>
+
           <!-- Tab Navigation -->
           <div v-if="showTabs" class="flex border-b border-gray-100 dark:border-gray-800 mb-2">
             <button
@@ -124,10 +179,10 @@
           </div>
 
           <!-- Tab Content -->
-          <div class="tab-content">
+          <div class="tab-content" :class="{ 'flex-1 min-h-0': expanded }">
             <!-- Chart Content -->
             <Transition name="fade" mode="out-in">
-              <div ref="chartContainerRef" v-if="(showTabs && activeTab === 'chart') || (!showTabs && showVisual)">
+              <div ref="chartContainerRef" v-if="(showTabs && activeTab === 'chart') || (!showTabs && showVisual)" :class="{ 'h-full': expanded && !isMetricCardType }">
                 <div v-if="resolvedCompEl" :class="chartHeightClass" :style="chartHeightStyle">
                   <Suspense>
                     <component
@@ -147,7 +202,7 @@
                     </template>
                   </Suspense>
                 </div>
-                <div v-else-if="chartVisualTypes.has(effectiveStep?.data_model?.type)" class="h-[340px]">
+                <div v-else-if="chartVisualTypes.has(effectiveStep?.data_model?.type)" :class="expanded ? 'h-full' : 'h-[340px]'">
                   <Suspense>
                     <RenderVisual :widget="effectiveWidget" :data="filteredData" :data_model="effectiveStep?.data_model" :view="normalizedView" />
                     <template #fallback>
@@ -174,10 +229,11 @@
             <Transition name="fade" mode="out-in">
               <div
                 v-if="(showTabs && activeTab === 'code') || (!showTabs && hasCode && !showVisual && !hasData)"
+                :class="{ 'h-full flex flex-col': expanded }"
               >
-                <div class="relative">
+                <div class="relative" :class="{ 'flex-1 min-h-0 flex flex-col': expanded }">
                   <!-- Header with toggle and edit button -->
-                  <div class="flex items-center justify-between mb-2">
+                  <div class="flex items-center justify-between mb-2 flex-shrink-0">
                     <!-- Toggle between Queries and Full Code (only when executed_queries available) -->
                     <div v-if="hasExecutedQueries" class="flex items-center space-x-1 bg-gray-100 dark:bg-gray-800 rounded p-0.5">
                       <button
@@ -203,7 +259,7 @@
 
                     <!-- Edit button -->
                     <button
-                      v-if="queryId && canEditCode && !readonly"
+                      v-if="queryId && canEditCode && (canEdit || !readonly)"
                       @click="onEditClick"
                       class="text-xs px-2 py-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors flex items-center"
                       :title="$t('tools.widgetPreview.editCode')"
@@ -220,7 +276,7 @@
                        rendered an empty box for that beat. The local Suspense
                        gives that wait a spinner; ClientOnly's fallback covers
                        the SSR/hydration pass before it. -->
-                  <div class="relative h-[250px] rounded overflow-hidden border border-gray-200 dark:border-gray-700">
+                  <div class="relative rounded overflow-hidden border border-gray-200 dark:border-gray-700" :class="expanded ? 'flex-1 min-h-[250px]' : 'h-[250px]'">
                     <ClientOnly>
                       <Suspense>
                         <MonacoEditor
@@ -259,7 +315,7 @@
                 </div>
 
                 <!-- Execution details -->
-                <div v-if="executionDuration || rowCount" class="mt-2 flex items-center gap-3 text-[11px] text-gray-400">
+                <div v-if="executionDuration || rowCount" class="mt-2 flex items-center gap-3 text-[11px] text-gray-400 flex-shrink-0">
                   <span v-if="executionDuration">
                     <Icon name="heroicons-clock" class="w-3 h-3 inline-block me-1" />
                     {{ executionDuration }}
@@ -271,7 +327,7 @@
                 </div>
 
                 <!-- Attempts section -->
-                <div v-if="attempts.length > 0" class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-3">
+                <div v-if="attempts.length > 0" class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-3 flex-shrink-0">
                   <div
                     class="flex items-center text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
                     @click="attemptsExpanded = !attemptsExpanded"
@@ -296,7 +352,7 @@
         </template>
 
         <!-- Bottom Action Buttons (hidden in readonly mode) -->
-        <div v-if="!readonly" class="mt-2 pt-2 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between">
+        <div v-if="!readonly" class="mt-2 pt-2 border-t border-gray-100 dark:border-gray-800 flex items-center justify-between" :class="{ 'flex-shrink-0': expanded }">
           <div class="flex items-center space-x-2">
             <button
               v-if="isExcel && hasDataForDownload"
@@ -353,6 +409,7 @@
       :dataModel="effectiveStep?.data_model || null"
       :stepId="effectiveStep?.id || null"
       :initialDataSourceIds="reportDataSources"
+      :parameters="cardParamSpecs"
       @close="openEntityModal = false"
       @saved="handleEntitySaved"
     />
@@ -393,8 +450,15 @@ const props = defineProps<{
   toolExecution: ToolExecution
   readonly?: boolean
   initialCollapsed?: boolean
+  /** Host page has a side panel this result can be opened into. */
+  canExpand?: boolean
+  /** Rendering inside that side panel: full width, full height, no collapse. */
+  expanded?: boolean
+  // Show the Edit button even in readonly mode (readonly hides the whole
+  // bottom action bar; hosts like the Data modal want edit without the bar)
+  canEdit?: boolean
 }>()
-const emit = defineEmits(['toggleSplitScreen', 'editQuery'])
+const emit = defineEmits(['toggleSplitScreen', 'editQuery', 'openDataPanel'])
 
 const { canEditCode } = useOrgSettings()
 const { isExcel } = useExcel()
@@ -402,7 +466,7 @@ const { t } = useI18n()
 const toast = useToast()
 
 // Reactive state for collapsible behavior
-const isCollapsed = ref(props.initialCollapsed ?? false)
+const isCollapsed = ref(props.expanded ? false : (props.initialCollapsed ?? false))
 const isAddingToDashboard = ref(false)
 const artifactVizIds = ref<string[]>([])
 const chartContainerRef = ref<HTMLElement | null>(null)
@@ -472,6 +536,123 @@ const step = computed(() => {
 })
 const stepOverride = ref<any | null>(null)
 const effectiveStep = computed(() => stepOverride.value || step.value)
+
+// ── Params value bar ─────────────────────────────────────────────────────────
+// Shows what the snapshot ran with and lets the builder try other values right
+// on the card. Runs are viewer-mode (per-user cached, transient) — the shared
+// snapshot only changes through the editor's Save. Declaration editing stays
+// in the editor modal.
+const hydratedParams = ref<any[] | null>(null)
+const cardParamSpecs = computed<any[]>(() =>
+  hydratedParams.value
+  || (((props.toolExecution as any)?.result_json?.parameters as any[]) || []))
+const editableCardSpecs = computed(() =>
+  cardParamSpecs.value.filter((s: any) => s?.name && s.source !== 'identity'))
+const identityCardSpecs = computed(() =>
+  cardParamSpecs.value.filter((s: any) => s?.name && s.source === 'identity'))
+const cardParamValues = ref<Record<string, any>>({})
+const cardParamOptions = ref<Record<string, Array<{ value: any; label: string }>>>({})
+const cardAppliedParams = computed(() => (effectiveStep.value as any)?.applied_params || null)
+const cardRunLoading = ref(false)
+const cardRunError = ref<string | null>(null)
+
+async function ensureCardParams() {
+  if (cardParamSpecs.value.length || !queryId.value) return
+  try {
+    const { data, error } = await useMyFetch(`/api/queries/${queryId.value}`)
+    if (!error.value && Array.isArray((data.value as any)?.parameters)) {
+      hydratedParams.value = (data.value as any).parameters
+    }
+  } catch { /* no params bar */ }
+}
+
+async function resolveCardOptions() {
+  const out: Record<string, Array<{ value: any; label: string }>> = {}
+  for (const spec of editableCardSpecs.value) {
+    if (Array.isArray(spec.options) && spec.options.length) {
+      out[spec.name] = spec.options.map((v: any) =>
+        (v && typeof v === 'object' && 'value' in v) ? v : { value: v, label: String(v) })
+      continue
+    }
+    const src = spec.options_source
+    if (!src?.query_id) continue
+    try {
+      const { data } = await useMyFetch(`/api/queries/${src.query_id}`)
+      const rows = (data.value as any)?.default_step?.data?.rows || []
+      const seen = new Set<string>()
+      const opts: Array<{ value: any; label: string }> = []
+      for (const r of rows) {
+        const value = r?.[src.value_column]
+        if (value === undefined || value === null) continue
+        const key = String(value)
+        if (seen.has(key)) continue
+        seen.add(key)
+        opts.push({ value, label: String(src.label_column ? (r?.[src.label_column] ?? value) : value) })
+      }
+      if (opts.length) out[spec.name] = opts
+    } catch { /* plain input fallback */ }
+  }
+  cardParamOptions.value = out
+}
+
+async function runCardParams() {
+  if (!queryId.value || cardRunLoading.value) return
+  cardRunLoading.value = true
+  cardRunError.value = null
+  try {
+    const params: Record<string, any> = {}
+    for (const s of editableCardSpecs.value) {
+      let v = cardParamValues.value[s.name]
+      if (v === undefined || v === '' || v === null) continue
+      // list-typed params submit arrays; the input takes comma-separated text
+      if (s.type === 'list' && typeof v === 'string') {
+        const items = v.split(',').map((x: string) => x.trim()).filter(Boolean)
+        if (!items.length) continue
+        v = items
+      }
+      params[s.name] = v
+    }
+    const { data, error } = await useMyFetch(`/api/queries/${queryId.value}/run`, {
+      method: 'POST', body: { mode: 'viewer', params },
+    })
+    if (error.value) throw new Error((error.value as any)?.data?.detail || 'Run failed')
+    const res: any = data.value
+    if (res?.status === 'error') { cardRunError.value = res?.error || 'Run failed'; return }
+    const base = JSON.parse(JSON.stringify(effectiveStep.value || {}))
+    stepOverride.value = { ...base, data: res?.data || {}, applied_params: res?.applied_params || params }
+  } catch (e: any) {
+    cardRunError.value = e?.message || 'Run failed'
+  } finally {
+    cardRunLoading.value = false
+  }
+}
+
+function formatAppliedParams(applied: Record<string, any>): string {
+  return Object.entries(applied)
+    .map(([k, v]) => `${k} = ${v === null || v === undefined ? 'All' : JSON.stringify(v)}`)
+    .join(', ')
+}
+
+function seedCardValuesFromApplied() {
+  // The inputs must agree with the data below them: seed from the snapshot's
+  // applied values so a Rock-filtered snapshot shows Rock selected, not an
+  // empty "All" placeholder contradicting the rows.
+  const applied = cardAppliedParams.value || {}
+  for (const s of editableCardSpecs.value) {
+    if (cardParamValues.value[s.name] !== undefined) continue
+    const av = (applied as any)[s.name]
+    if (av === null || av === undefined) continue
+    cardParamValues.value[s.name] = Array.isArray(av) ? av.join(', ') : av
+  }
+}
+
+onMounted(async () => {
+  await ensureCardParams()
+  if (cardParamSpecs.value.length) {
+    seedCardValuesFromApplied()
+    await resolveCardOptions()
+  }
+})
 const hydratedVisualization = ref<any | null>(null)
 
 const visualization = computed(() => {
@@ -525,24 +706,15 @@ const activeFilterCount = computed(() => {
   return count
 })
 
-// Apply shared filters to get filtered rows
+// Apply shared filters to get filtered rows. The view's defaultFilters are NOT
+// applied directly here: they reach this computed only through the seeded
+// shared-filter state (seedDefaultFiltersFromView), so the filter popover shows
+// them and Clear/removing the condition actually restores the rows. First-paint
+// correctness for single-value cards is preserved because the seed watcher runs
+// synchronously (immediate) during setup, before the first render.
 const filteredRows = computed(() => {
-  let rows = effectiveStep.value?.data?.rows
+  const rows = effectiveStep.value?.data?.rows
   if (!Array.isArray(rows)) return []
-
-  // Apply the view's own defaultFilters directly. The standalone preview has no
-  // dashboard shared-filter pipeline guaranteed to be ready on first paint, so
-  // relying solely on the seeded shared filters races: a single-value card over
-  // a melted/long KPI table (Metric | Value | Format) would otherwise render
-  // row 0 / a sum of every metric instead of the asked-for row. Dashboards do
-  // not use this component (they filter rows upstream), so this is safe and does
-  // not interfere with user-overridable shared filters there.
-  const v = normalizedView.value as any
-  const viewInner = v?.view || v
-  const defaults = Array.isArray(viewInner?.defaultFilters) ? viewInner.defaultFilters : []
-  if (defaults.length) {
-    rows = rows.filter((row: any) => defaults.every((f: any) => matchDefaultFilter(row, f)))
-  }
 
   if (sharedFilters.value.length === 0 || !visualizationId.value) return rows
 
@@ -550,32 +722,6 @@ const filteredRows = computed(() => {
     sharedEvaluateFilters(row, sharedFilters.value, visualizationId.value)
   )
 })
-
-// Lightweight evaluator for a view's plain-column defaultFilters (no vizId
-// prefix). Mirrors the operators in DefaultFilterCondition.
-function matchDefaultFilter(row: any, f: any): boolean {
-  if (!row || !f || !f.column) return true
-  const key = Object.keys(row).find(k => k.toLowerCase() === String(f.column).toLowerCase())
-  if (key === undefined) return true
-  const cell = row[key]
-  const s = (x: any) => (x === null || x === undefined) ? '' : String(x)
-  const op = String(f.operator || 'equals')
-  switch (op) {
-    case 'equals': return s(cell) === s(f.value)
-    case 'not_equals': return s(cell) !== s(f.value)
-    case 'contains': return s(cell).includes(s(f.value))
-    case 'not_contains': return !s(cell).includes(s(f.value))
-    case 'starts_with': return s(cell).startsWith(s(f.value))
-    case 'ends_with': return s(cell).endsWith(s(f.value))
-    case 'greater_than': return Number(cell) > Number(f.value)
-    case 'less_than': return Number(cell) < Number(f.value)
-    case 'gte': return Number(cell) >= Number(f.value)
-    case 'lte': return Number(cell) <= Number(f.value)
-    case 'is_empty': return s(cell) === ''
-    case 'is_not_empty': return s(cell) !== ''
-    default: return true
-  }
-}
 
 // Normalize the view to ensure it's in the v2 format { view: {...}, version: 'v2' }
 const normalizedView = computed(() => {
@@ -595,10 +741,24 @@ const normalizedView = computed(() => {
 // seed once per viz id so clearing filters doesn't re-seed.
 // ------------------------------------------------------------------
 const seededDefaultsFor = ref<Set<string>>(new Set())
+const lastSeededVizId = ref<string | null>(null)
 
 function seedDefaultFiltersFromView() {
   const vizId = visualizationId.value
   if (!vizId || seededDefaultsFor.value.has(vizId)) return
+
+  // The visualization id can change after hydration (synthetic `viz-<id>`
+  // fallback -> real visualization id). Drop the conditions we seeded under the
+  // previous id so they don't linger as ghost state nobody can see or remove.
+  if (lastSeededVizId.value && lastSeededVizId.value !== vizId) {
+    const staleId = lastSeededVizId.value
+    sharedFilters.value = sharedFilters.value
+      .map(g => ({
+        ...g,
+        conditions: g.conditions.filter(c => parseColumnKey(c.column).vizId !== staleId)
+      }))
+      .filter(g => g.conditions.length > 0)
+  }
 
   const v = normalizedView.value as any
   const viewInner = v?.view || v
@@ -638,6 +798,7 @@ function seedDefaultFiltersFromView() {
   const next = [...sharedFilters.value, group]
   sharedFilters.value = next
   seededDefaultsFor.value.add(vizId)
+  lastSeededVizId.value = vizId
 
   // Broadcast so VisualizationFilter/FilterBuilder receive the seeded state
   try {
@@ -723,6 +884,7 @@ async function loadReportSnapshotIfNeeded() {
 }
 
 async function hydrateLatestStep() {
+  isHydratingStep.value = true
   try {
     const qid = queryId.value
     if (qid) {
@@ -741,7 +903,9 @@ async function hydrateLatestStep() {
     if (!error.value && data.value) {
       stepOverride.value = JSON.parse(JSON.stringify(data.value))
     }
-  } catch {}
+  } catch {} finally {
+    isHydratingStep.value = false
+  }
 }
 
 // Summary/fork cards start collapsed and hydrate when the user opens one.
@@ -776,14 +940,20 @@ const widgetTitle = computed(() => {
          'Results'
 })
 
-// Row count for display
+// Row count for display. The inline projection ships only the first
+// PREVIEW_ROWS rows and says so (`truncated` + `total_rows`): report the
+// server's total rather than the preview's length, so the label never reads
+// "20 rows" for a 24-row result while the full set is still on its way.
 const rowCount = computed(() => {
-  const rows = effectiveStep.value?.data?.rows
-  if (Array.isArray(rows)) {
-    return `${rows.length.toLocaleString()}`
-  }
-  return null
+  const data = effectiveStep.value?.data
+  const rows = data?.rows
+  if (!Array.isArray(rows)) return null
+  const total = data?.truncated && typeof data?.total_rows === 'number' ? data.total_rows : rows.length
+  return `${Math.max(total, rows.length).toLocaleString()}`
 })
+
+// True while the full step is being fetched to replace a truncated preview.
+const isHydratingStep = ref(false)
 
 // Execution duration for display
 const executionDuration = computed(() => {
@@ -850,7 +1020,8 @@ const isMetricCardType = computed(() => {
 
 // Adjust height for compact metric cards - dynamically based on content
 const chartHeightClass = computed(() => {
-  return isMetricCardType.value ? 'flex items-start' : 'h-[340px]'
+  if (isMetricCardType.value) return 'flex items-start'
+  return props.expanded ? 'h-full' : 'h-[340px]'
 })
 
 // Dynamic style for metric card height
@@ -947,7 +1118,10 @@ const tableHasRows = computed(() => {
   return Array.isArray(rows) && rows.length > 0
 })
 
-const tableHeightClass = computed(() => (tableHasRows.value ? 'h-[400px]' : 'min-h-[80px]'))
+const tableHeightClass = computed(() => {
+  if (!tableHasRows.value) return 'min-h-[80px]'
+  return props.expanded ? 'h-full' : 'h-[400px]'
+})
 
 // Check if current type is table
 const isTableType = computed(() => {
@@ -968,7 +1142,14 @@ watch([showVisual, hasData, hasCode], () => {
 }, { immediate: true })
 
 function toggleCollapsed() {
+  if (props.expanded) return
   isCollapsed.value = !isCollapsed.value
+}
+
+// Hand the whole execution to the host so the side panel renders this same
+// result at full width — every edit/download/dashboard control included.
+function openInPanel() {
+  emit('openDataPanel', { toolExecution: props.toolExecution, title: widgetTitle.value, visual: showVisual.value })
 }
 
 // Chart PNG download
@@ -1158,17 +1339,38 @@ function broadcastDefaultStep(step: any) {
   } catch {}
 }
 
+// Window listeners registered by THIS instance. Kept per instance (not on a
+// window global) because several previews live on a page at once — the
+// timeline cards plus the side-panel copy — and a shared slot would let the
+// last one mounted remove another instance's listeners on unmount.
+const windowListeners: Array<[string, EventListener]> = []
+function listen(name: string, handler: (ev: any) => void) {
+  window.addEventListener(name, handler as EventListener)
+  windowListeners.push([name, handler as EventListener])
+}
+
 // Keep membership state in sync when dashboard layout changes elsewhere
 onMounted(() => {
   // Listen for shared filter updates from VisualizationFilter and FilterBuilder
   window.addEventListener('filter:updated', handleSharedFilterUpdate as any)
 
+  // Defaults seeded during setup were broadcast before children (the filter
+  // popover) registered their listeners, so that event was lost. Re-broadcast
+  // once now — children have mounted by the time the parent's onMounted runs —
+  // so the popover shows the seeded conditions and can remove them.
+  if (sharedFilters.value.length > 0) {
+    try {
+      window.dispatchEvent(new CustomEvent('filter:updated', {
+        detail: { reportId: reportId.value, filters: sharedFilters.value, source: filterInstanceId }
+      }))
+    } catch {}
+  }
+
   // Track which viz IDs are in the active artifact (for "Added to Dashboard" state)
   function handleArtifactVizIds(ev: Event) {
     artifactVizIds.value = (ev as CustomEvent).detail?.visualization_ids || []
   }
-  window.addEventListener('artifact:viz-ids', handleArtifactVizIds as any)
-  ;(window as any).__tw_preview_artifact_handler__ = handleArtifactVizIds
+  listen('artifact:viz-ids', handleArtifactVizIds)
 
   function handleVizUpdated(ev: CustomEvent) {
     try {
@@ -1182,9 +1384,7 @@ onMounted(() => {
       hydratedVisualization.value = JSON.parse(JSON.stringify({ ...(current || {}), ...(updated || {}) }))
     } catch {}
   }
-  window.addEventListener('visualization:updated', handleVizUpdated as any)
-  // Store removers on instance for cleanup
-  ;(window as any).__tw_preview_handlers__ = { handleVizUpdated }
+  listen('visualization:updated', handleVizUpdated)
   // Live theme updates from dashboard
   function handleThemeChanged(ev: CustomEvent) {
     try {
@@ -1195,8 +1395,7 @@ onMounted(() => {
       reportOverrides.value = detail.overrides ? JSON.parse(JSON.stringify(detail.overrides)) : null
     } catch {}
   }
-  window.addEventListener('dashboard:theme_changed', handleThemeChanged as any)
-  ;(window as any).__tw_preview_handlers__.handleThemeChanged = handleThemeChanged
+  listen('dashboard:theme_changed', handleThemeChanged)
   // Update local step when the editor broadcasts a new default step for this query
   function handleDefaultStepChanged(ev: CustomEvent) {
     try {
@@ -1225,8 +1424,7 @@ onMounted(() => {
       })()
     } catch {}
   }
-  window.addEventListener('query:default_step_changed', handleDefaultStepChanged as any)
-  ;(window as any).__tw_preview_handlers__.handleDefaultStepChanged = handleDefaultStepChanged
+  listen('query:default_step_changed', handleDefaultStepChanged)
   // Allow editor to explicitly rebind this preview to a specific query id
   function handleToolPreviewRebind(ev: CustomEvent) {
     try {
@@ -1250,26 +1448,14 @@ onMounted(() => {
       })()
     } catch {}
   }
-  window.addEventListener('tool_preview:rebind', handleToolPreviewRebind as any)
-  ;(window as any).__tw_preview_handlers__.handleToolPreviewRebind = handleToolPreviewRebind
+  listen('tool_preview:rebind', handleToolPreviewRebind)
 })
 
 onUnmounted(() => {
   // Remove shared filter listener
   try { window.removeEventListener('filter:updated', handleSharedFilterUpdate as any) } catch {}
-
-  const handlers: any = (window as any).__tw_preview_handlers__
-  if (handlers) {
-    try { window.removeEventListener('visualization:updated', handlers.handleVizUpdated as any) } catch {}
-    try { window.removeEventListener('dashboard:theme_changed', handlers.handleThemeChanged as any) } catch {}
-    try { window.removeEventListener('query:default_step_changed', handlers.handleDefaultStepChanged as any) } catch {}
-    try { window.removeEventListener('tool_preview:rebind', handlers.handleToolPreviewRebind as any) } catch {}
-    ;(window as any).__tw_preview_handlers__ = undefined
-  }
-  const artifactHandler = (window as any).__tw_preview_artifact_handler__
-  if (artifactHandler) {
-    try { window.removeEventListener('artifact:viz-ids', artifactHandler as any) } catch {}
-    ;(window as any).__tw_preview_artifact_handler__ = undefined
+  for (const [name, handler] of windowListeners.splice(0)) {
+    try { window.removeEventListener(name, handler) } catch {}
   }
 })
 
@@ -1361,6 +1547,26 @@ onMounted(() => {
 
 .widget-content {
   @apply p-3;
+}
+
+/* Side-panel mode: the same card, sized to the pane the way a document is
+   in the file panel. Height flows down flex-1/min-h-0 so the chart or grid
+   fills what the toolbar, tabs and action bar leave over, instead of the
+   fixed 340/400px an inline card gets. */
+.widget-container--expanded {
+  @apply mt-0 mb-0 h-full flex flex-col min-h-0;
+}
+
+.widget-header--expanded {
+  @apply cursor-default flex-shrink-0;
+}
+
+.widget-header--expanded:hover {
+  @apply bg-transparent;
+}
+
+.widget-content--expanded {
+  @apply flex-1 min-h-0 flex flex-col overflow-y-auto;
 }
 
 .fade-enter-active,

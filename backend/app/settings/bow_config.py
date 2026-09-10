@@ -100,6 +100,19 @@ class GoogleOAuth(BaseModel):
     client_secret: Optional[str] = None
 
 
+def brand_for_issuer(issuer: Optional[str]) -> str:
+    """Identify the identity provider behind an OIDC issuer URL.
+
+    Returns one of: "microsoft", "google", "custom".
+    """
+    issuer = (issuer or "").lower()
+    if "login.microsoftonline.com" in issuer or "sts.windows.net" in issuer:
+        return "microsoft"
+    if "accounts.google.com" in issuer:
+        return "google"
+    return "custom"
+
+
 class OIDCProvider(BaseModel):
     name: str
     enabled: bool = False
@@ -123,6 +136,31 @@ class OIDCProvider(BaseModel):
     group_claim: str = "groups"              # claim name in id_token
     resolve_group_names: bool = False        # call Graph API to get display names (Entra returns UUIDs)
 
+    def brand(self) -> str:
+        """Which identity provider is behind this entry.
+
+        `name` is a routing slug (it appears in /api/auth/<name>/callback, which
+        is registered with the IdP), so it can be anything the operator picked —
+        "entra", "corp-sso", "ad". The issuer is what actually tells us who is
+        on the other end, and the login page uses this to pick a logo.
+        """
+        return brand_for_issuer(self.issuer)
+
+    def display_label(self) -> str:
+        """Human-readable provider name for the sign-in button.
+
+        An explicit `label` always wins; otherwise a recognized provider gets
+        its real product name and anything else falls back to the slug.
+        """
+        if self.label:
+            return self.label
+        brand = self.brand()
+        if brand == "microsoft":
+            return "Microsoft"
+        if brand == "google":
+            return "Google"
+        return (self.name or "").replace("_", " ").replace("-", " ").strip().title() or self.name
+
 
 class LDAPConfig(BaseModel):
     """LDAP / Active Directory configuration for group sync and optional bind auth."""
@@ -132,6 +170,12 @@ class LDAPConfig(BaseModel):
     bind_password: Optional[str] = None                # service account password
     use_ssl: bool = True
     start_tls: bool = False
+    ca_certs_file: Optional[str] = None
+    # AD-first: each deployment explicitly admits one organization's group.
+    organization_id: Optional[str] = None
+    admission_group_dn: Optional[str] = None
+    kerberos_realm: Optional[str] = None
+    allow_local_superuser_login: bool = False
     base_dn: str = ""
     user_search_base: Optional[str] = None             # defaults to base_dn
     user_search_filter: str = "(objectClass=person)"
@@ -235,10 +279,51 @@ class Database(BaseModel):
     def uses_iam_auth(self) -> bool:
         return self.auth.provider != "password"
 
+# Whether the Fernet key in use was invented at startup rather than supplied by
+# the operator. An ephemeral key changes on every restart, so anything written
+# with it is unreadable afterwards. Credentials could always be re-entered after
+# that; encrypted analytical payloads cannot be re-derived, so
+# app.ee.encryption refuses to encrypt while this is set.
+_encryption_key_is_ephemeral = False
+
+
+def mark_encryption_key_ephemeral() -> None:
+    global _encryption_key_is_ephemeral
+    _encryption_key_is_ephemeral = True
+
+
+def encryption_key_is_ephemeral() -> bool:
+    return _encryption_key_is_ephemeral
+
+
 def generate_fernet_key():
     # Generate a valid Fernet-compatible key (32 url-safe base64-encoded bytes)
     key = secrets.token_bytes(32)
     return base64.urlsafe_b64encode(key).decode()
+
+class DataEncryptionConfig(BaseModel):
+    """Encryption at rest for row-heavy analytical payloads (enterprise).
+
+    Covers query results and the bounded context summaries derived from them:
+    ``Step.data``, ``StepUserResult.data``, ``Entity.data``,
+    ``EntityUserResult.data`` and ``ToolExecution.result_json``. Credentials
+    have always been encrypted separately; this extends the same protection to
+    the data those credentials fetched, reusing the same ``encryption_key``.
+
+    Defaults to on: on a licensed instance the safe posture is encrypted. It is
+    inert without the enterprise ``data_encryption`` feature, and switching it
+    off only stops *new* writes from being encrypted — already-stored
+    ciphertext is always still decrypted on read.
+    """
+    enabled: bool = True
+
+    @validator("enabled", pre=True)
+    def _default_when_unset(cls, v):
+        # An operator may wire this to an env var; an unresolved placeholder
+        # arrives as None. Treat "not specified" as the default rather than
+        # failing config validation and taking the whole instance down.
+        return True if v is None else v
+
 
 class BowConfig(BaseModel):
     deployment: DeploymentConfig = DeploymentConfig()
@@ -256,6 +341,7 @@ class BowConfig(BaseModel):
         description="Encryption key for sensitive data",
         env="BOW_ENCRYPTION_KEY"
     )
+    data_encryption: DataEncryptionConfig = DataEncryptionConfig()
     stripe: Stripe = Stripe()
     database: Database = Database()
     intercom: Intercom = Intercom()
@@ -282,5 +368,6 @@ class BowConfig(BaseModel):
                 "currently-encrypted credentials undecryptable. Set a stable "
                 "BOW_ENCRYPTION_KEY for any non-throwaway deployment."
             )
+            mark_encryption_key_ephemeral()
             return generate_fernet_key()
         return v

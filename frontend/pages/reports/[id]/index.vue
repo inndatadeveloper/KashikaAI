@@ -71,6 +71,7 @@
 						:report="report"
 						:artifacts="reportArtifacts"
 						:latest-artifact="latestArtifact"
+						:requested-artifact-id="requestedArtifactId"
 						@close="mobileView = 'chat'"
 						class="h-full"
 					/>
@@ -396,6 +397,9 @@
 													:data-sources="report?.data_sources"
 													:report-id="report_id"
 													:system-completion-id="m.system_completion_id || m.id"
+													:can-expand="!isMobile"
+													@openFilePreview="openFilePreview"
+													@openDataPanel="openDataPanel"
 													@addWidget="handleAddWidgetFromPreview"
 													@refreshDashboard="refreshDashboardFast"
 													@toggleSplitScreen="toggleSplitScreen"
@@ -422,7 +426,7 @@
 											
 											<!-- Tool widget preview -->
 											<div class="mt-1" v-if="shouldShowToolWidgetPreview(block.tool_execution) && block.tool_execution">
-												<ToolWidgetPreview :tool-execution="block.tool_execution" @addWidget="handleAddWidgetFromPreview" @toggleSplitScreen="toggleSplitScreen" @editQuery="handleEditQuery" />
+												<ToolWidgetPreview :tool-execution="block.tool_execution" :can-expand="!isMobile" @addWidget="handleAddWidgetFromPreview" @toggleSplitScreen="toggleSplitScreen" @editQuery="handleEditQuery" @openDataPanel="openDataPanel" />
 											</div>
 											</div>
 
@@ -514,7 +518,7 @@
 																<span class="text-[10px] text-gray-400 flex-shrink-0">{{ ins.category || 'general' }}</span>
 																<span class="text-[9px] px-1.5 py-0.5 rounded flex-shrink-0"
 																	:class="(ins.load_mode || 'always') === 'always' ? 'bg-green-50 text-green-600' : 'bg-blue-50 text-blue-600'">
-																	{{ ins.load_mode || 'always' }}
+																	{{ getLoadModeLabel(ins.load_mode) }}
 																</span>
 															</div>
 														</div>
@@ -909,6 +913,46 @@
 					<Icon v-else name="heroicons:cog-6-tooth" class="w-3.5 h-3.5" />
 					{{ currentAgents.length > 1 ? $t('reportView.tabAgents') : (currentAgents[0]?.name || $t('reportView.tabAgent')) }}
 				</button>
+				<!-- Only while a query result is open in the pane. Transient, with
+				     its own dismiss; closing returns to the view that was open. -->
+				<button
+					v-if="panelData"
+					@click="rightPanelView = 'data'"
+					class="flex items-center gap-1.5 ps-3 pe-2 py-1.5 text-xs font-medium rounded-lg transition-colors max-w-[220px]"
+					:class="rightPanelView === 'data'
+						? 'text-gray-900 dark:text-white bg-gray-100 dark:bg-gray-800'
+						: 'text-gray-400 hover:text-gray-600'"
+					data-testid="data-panel-tab"
+				>
+					<Icon :name="panelData.visual ? 'heroicons:chart-bar' : 'heroicons:table-cells'" class="w-3.5 h-3.5 shrink-0" />
+					<span class="truncate">{{ panelData.title || $t('tools.widgetPreview.dataTab') }}</span>
+					<Icon
+						name="heroicons:x-mark"
+						class="w-3 h-3 shrink-0 hover:text-gray-700 dark:hover:text-gray-200"
+						:aria-label="$t('tools.widgetPreview.closeDataPanel')"
+						data-testid="data-panel-close"
+						@click.stop="closeDataPanel"
+					/>
+				</button>
+				<!-- Only while a file is open. Carries its own dismiss so there is
+				     an obvious way back to the dashboard. -->
+				<button
+					v-if="panelFile"
+					@click="rightPanelView = 'file'"
+					class="flex items-center gap-1.5 ps-3 pe-2 py-1.5 text-xs font-medium rounded-lg transition-colors max-w-[220px]"
+					:class="rightPanelView === 'file'
+						? 'text-gray-900 dark:text-white bg-gray-100 dark:bg-gray-800'
+						: 'text-gray-400 hover:text-gray-600'"
+				>
+					<Icon :name="panelFile.kind === 'image' ? 'heroicons:photo' : 'heroicons:document-text'" class="w-3.5 h-3.5 shrink-0" />
+					<span class="truncate">{{ panelFile.name || $t('filePreview.document') }}</span>
+					<Icon
+						name="heroicons:x-mark"
+						class="w-3 h-3 shrink-0 hover:text-gray-700 dark:hover:text-gray-200"
+						:aria-label="$t('filePreview.closeFilePanel')"
+						@click.stop="closeFilePanel"
+					/>
+				</button>
 			</div>
 			<button
 				@click="toggleSplitScreen"
@@ -936,9 +980,11 @@
 						@discardTrainingBuild="onDiscardTrainingBuild"
 						@discardTrainingInstruction="onDiscardTrainingInstruction"
 						:showClose="true"
+						:can-expand="!isMobile"
 						@close="toggleSplitScreen"
 						@editScheduledPrompt="editScheduledPrompt"
 						@openArtifact="handleOpenArtifact"
+						@openDataPanel="openDataPanel"
 						@scrollToMessage="scrollToMessage"
 					/>
 				</div>
@@ -988,6 +1034,7 @@
 				:report="report"
 				:artifacts="reportArtifacts"
 				:latest-artifact="latestArtifact"
+				:requested-artifact-id="requestedArtifactId"
 				@close="toggleSplitScreen"
 				class="h-full"
 			/>
@@ -995,6 +1042,36 @@
 			<!-- Empty state for grid view -->
 			<div v-else-if="rightPanelView === 'grid' && reportLoaded && !(visualizations || []).length" class="p-4 text-center text-gray-500 dark:text-gray-400 h-full">
 				No dashboard items yet.
+			</div>
+
+			<!-- A document or image opened from a read_file card. Reuses the
+			     same viewer the card renders, at panel size. -->
+			<div v-else-if="rightPanelView === 'file' && panelFile" class="h-full min-h-0 p-3 flex flex-col overflow-hidden">
+				<FilePreview
+					:key="panelFile.fileId"
+					:kind="panelFile.kind"
+					:file-id="panelFile.fileId"
+					:image-file-ids="panelFile.imageFileIds"
+					:target-page="panelFile.targetPage"
+					:pages-total="panelFile.pagesTotal"
+					:name="panelFile.name"
+					:expanded="true"
+					@open="(fid: string) => openImagePreview({ id: fid, filename: panelFile?.name || '' })"
+				/>
+			</div>
+
+			<!-- A query result opened from a tool card. Reuses the same preview
+			     the card renders, in its side-panel mode: full width, full
+			     height, and every edit/download/dashboard control. -->
+			<div v-else-if="rightPanelView === 'data' && panelData" class="h-full overflow-auto p-3">
+				<ToolWidgetPreview
+					:key="panelData.key"
+					:tool-execution="panelData.toolExecution"
+					:expanded="true"
+					@addWidget="handleAddWidgetFromPreview"
+					@toggleSplitScreen="toggleSplitScreen"
+					@editQuery="handleEditQuery"
+				/>
 			</div>
 		</template>
 	</SplitScreenLayout>
@@ -1114,6 +1191,8 @@ import { useCan } from '~/composables/usePermissions'
 import { promptMentionsToRefs } from '~/utils/mentions'
 import { MarkdownRender } from 'markstream-vue'
 import 'markstream-vue/index.css'
+// Render load_mode via the shared label map — the UI calls 'intelligent' mode "Smart".
+const { getLoadModeLabel } = useInstructionHelpers()
 
 // Types
 type ChatRole = 'user' | 'system'
@@ -1551,6 +1630,13 @@ provide('artifactVizIds', activeArtifactVizIds)
 // ArtifactFrame as a mount-time seed so it does not refetch the artifact it
 // is about to select. Version switches keep their own fetch path.
 const latestArtifact = ref<any | null>(null)
+// The artifact the user last asked to open. ArtifactFrame reads it as a
+// mount-time seed: the pane shares a v-if chain with ChatSummary, so a click in
+// the summary unmounts the summary and mounts a FRESH frame, and the
+// `artifact:select` window event fires before that frame can subscribe. Holding
+// the request in page state instead of a transient event makes it survive the
+// remount, so the pane opens what was clicked rather than the newest artifact.
+const requestedArtifactId = ref<string | null>(null)
 // Keep the shared ids in sync when ArtifactFrame changes selection.
 function handleArtifactVizIdsBroadcast(ev: Event) {
 	const ids = (ev as CustomEvent).detail?.visualization_ids
@@ -2234,7 +2320,88 @@ const prefillText = ref('')
 watch(() => report.value?.mode, (m) => { if (m) currentPromptMode.value = m === 'training' ? 'training' : 'chat' }, { immediate: true })
 
 // Right panel view mode
-const rightPanelView = ref<'grid' | 'artifact' | 'agent' | 'summary'>('artifact')
+const rightPanelView = ref<'grid' | 'artifact' | 'agent' | 'summary' | 'file' | 'data'>('artifact')
+
+// A document/image opened from a read_file card into the side panel. Transient
+// by nature — it exists only while a file is selected, which is why it gets a
+// conditional tab rather than a permanent one. Switching tabs keeps it so the
+// user can come back; the tab's close button is what clears it.
+const panelFile = ref<{
+	fileId: string
+	kind: 'pdf' | 'image'
+	targetPage?: number | null
+	pagesTotal?: number | null
+	imageFileIds?: string[] | null
+	name?: string
+} | null>(null)
+
+function openFilePreview(payload: any) {
+	if (!payload?.fileId) return
+	panelFile.value = payload
+	// Mobile keeps the inline/modal behaviour — mobileView is a separate closed
+	// union and opening a second surface there is its own piece of work.
+	if (isMobile.value) return
+	if (!isSplitScreen.value) toggleSplitScreen()
+	rightPanelView.value = 'file'
+}
+
+// Chat pane width as a fraction of the window, per panel view. A document
+// viewer earns the most room: while a PDF is open, reading it IS the task.
+// 280 matches the floor the manual resizer enforces, so a narrow window can
+// never programmatically produce a pane the user could not drag back.
+const PANEL_LEFT_RATIO: Record<string, number> = {
+	summary: 0.55,
+	agent: 0.45,
+}
+const DEFAULT_LEFT_RATIO = 0.37
+const MIN_LEFT_PANEL_WIDTH = 280
+
+function leftWidthFor(view: string): number {
+	const ratio = PANEL_LEFT_RATIO[view] ?? DEFAULT_LEFT_RATIO
+	return Math.max(MIN_LEFT_PANEL_WIDTH, Math.round(window.innerWidth * ratio))
+}
+
+function closeFilePanel() {
+	panelFile.value = null
+	if (rightPanelView.value === 'file') rightPanelView.value = 'artifact'
+}
+
+// A query result (create_data / read_query / …) opened from its inline card
+// into the side panel, the way a document opens from a read_file card. The
+// tool execution object is the same one the timeline renders, so the panel
+// tracks the card (new default step, visualization edits) for free.
+const panelData = ref<{
+	toolExecution: any
+	title: string
+	visual: boolean
+	key: string
+} | null>(null)
+// The view that was showing when the data pane opened, so closing it goes
+// back there (dashboard, agent, summary…) rather than always to the dashboard.
+const dataPanelReturnView = ref<'grid' | 'artifact' | 'agent' | 'summary' | 'file'>('artifact')
+
+function openDataPanel(payload: { toolExecution: any; title?: string; visual?: boolean }) {
+	const te = payload?.toolExecution
+	if (!te) return
+	panelData.value = {
+		toolExecution: te,
+		title: payload.title || te?.created_widget?.title || te?.created_step?.title || '',
+		visual: !!payload.visual,
+		key: String(te.id || te.created_step_id || Date.now()),
+	}
+	if (isMobile.value) return
+	if (rightPanelView.value !== 'data') dataPanelReturnView.value = rightPanelView.value
+	if (!isSplitScreen.value) toggleSplitScreen()
+	rightPanelView.value = 'data'
+}
+
+function closeDataPanel() {
+	panelData.value = null
+	if (rightPanelView.value !== 'data') return
+	// A file view only exists while its file is open.
+	const back = dataPanelReturnView.value
+	rightPanelView.value = back === 'file' && !panelFile.value ? 'artifact' : back
+}
 
 // Mobile view mode (full-screen single section on narrow screens)
 const mobileView = ref<'chat' | 'summary' | 'dashboard' | 'agent'>('chat')
@@ -2637,16 +2804,9 @@ watch(() => isSplitScreen.value, () => {
 // Adjust left panel width based on active right panel tab
 watch(rightPanelView, (view) => {
     if (!isSplitScreen.value || isResizing.value) return
-    const windowWidth = window.innerWidth
-    if (view === 'summary') {
-        leftPanelWidth.value = Math.round(windowWidth * 0.55)
-    } else if (view === 'agent') {
-        leftPanelWidth.value = Math.round(windowWidth * 0.45)
-        collapseSidebar()
-    } else {
-        leftPanelWidth.value = Math.round(windowWidth * 0.37)
-        collapseSidebar()
-    }
+    leftPanelWidth.value = leftWidthFor(view)
+    // Summary keeps the sidebar; every other view wants the horizontal room.
+    if (view !== 'summary') collapseSidebar()
 })
 
 function goBack() {
@@ -2797,7 +2957,12 @@ function resolveToolEventBlock(sysMessage: any, payload: any) {
 	return blocks[blocks.length - 1]
 }
 
-async function handleStreamingEvent(eventType: string | null, payload: any, sysMessageIndex: number) {
+async function handleStreamingEvent(eventType: string | null, payload: any, sysMessageIndex: number, opts: { ownStream?: boolean } = {}) {
+	// ownStream: this event came from the prompt THIS viewer just sent (default),
+	// vs. the watcher attaching to a run started elsewhere (another tab, another
+	// user, a scheduled run). Artifact creations only take over the pane for
+	// the viewer's own runs.
+	const ownStream = opts.ownStream !== false
 	if (!eventType || sysMessageIndex === -1) return
 
 	if (!messages.value[sysMessageIndex]) return
@@ -3271,7 +3436,8 @@ async function handleStreamingEvent(eventType: string | null, payload: any, sysM
 									detail: {
 										report_id: report_id,
 										artifact_id: p.artifact_id,
-										status: 'pending'
+										status: 'pending',
+										select: ownStream
 									}
 								}))
 							} catch {}
@@ -3358,18 +3524,20 @@ async function handleStreamingEvent(eventType: string | null, payload: any, sysM
 						rj.answer = (rj.answer || '') + delta
 						lastBlock.status = 'in_progress'
 					}
-					// Forward Office.js code execution to the Excel taskpane.
+					// Forward Office.js execution (code runs + acked table writes)
+					// to the Excel taskpane. Both action types carry id +
+					// completion_id and are answered with an officeJsResult.
 					const excelAction = payload.payload?.excel_action
-					if (excelAction && excelAction.type === 'runOfficeJs' && isExcel.value) {
+					if (excelAction && (excelAction.type === 'runOfficeJs' || excelAction.type === 'applyToExcel') && isExcel.value) {
 						try {
 							window.parent.postMessage({
-								type: 'runOfficeJs',
+								type: excelAction.type,
 								data: JSON.stringify(excelAction)
 							}, window.location.origin)
 						} catch (e) {
-							console.warn('Failed to forward runOfficeJs to Excel taskpane:', e)
+							console.warn('Failed to forward ' + excelAction.type + ' to Excel taskpane:', e)
 						}
-						if (lastBlock.tool_execution) {
+						if (excelAction.type === 'runOfficeJs' && lastBlock.tool_execution) {
 							lastBlock.tool_execution.arguments_json = lastBlock.tool_execution.arguments_json || {}
 							const aj: any = lastBlock.tool_execution.arguments_json
 							if (excelAction.code && !aj.code) aj.code = excelAction.code
@@ -3451,7 +3619,8 @@ async function handleStreamingEvent(eventType: string | null, payload: any, sysM
 							window.dispatchEvent(new CustomEvent('artifact:created', {
 								detail: {
 									report_id: report_id,
-									artifact_id: payload.result_json?.artifact_id
+									artifact_id: payload.result_json?.artifact_id,
+									select: ownStream
 								}
 							}))
 						} catch {}
@@ -3463,23 +3632,15 @@ async function handleStreamingEvent(eventType: string | null, payload: any, sysM
 							window.dispatchEvent(new CustomEvent('artifact:created', {
 								detail: {
 									report_id: report_id,
-									artifact_id: payload.result_json?.artifact_id
+									artifact_id: payload.result_json?.artifact_id,
+									select: ownStream
 								}
 							}))
 						} catch {}
 					}
-					// If write_to_excel completed, forward data to Excel taskpane via postMessage
-					if (payload.tool_name === 'write_to_excel' && payload.status === 'success' && payload.result_json?.excel_action && isExcel.value) {
-						try {
-							const action = payload.result_json.excel_action
-							window.parent.postMessage({
-								type: action.type,
-								data: JSON.stringify(action.data)
-							}, window.location.origin)
-						} catch (e) {
-							console.warn('Failed to forward write_to_excel data to Excel taskpane:', e)
-						}
-					}
+					// write_to_excel now dispatches applyToExcel on tool.partial and
+					// awaits the taskpane's ack (see the tool.partial handler above),
+					// so there is nothing to forward at tool.finished anymore.
 				}
 			}
 			break
@@ -4156,6 +4317,7 @@ onMounted(() => {
     // session event server-side — reload the timeline so its strip appears.
     // Scoped to this report; reuses the debounced, mid-stream-safe reload.
     window.addEventListener('report:mutated', onReportMutated as EventListener)
+    window.addEventListener('report:updated', onReportUpdatedEvent as EventListener)
     markdownAutoDir.value = useMarkdownAutoDir()
 })
 
@@ -4165,6 +4327,16 @@ onMounted(() => {
 // selectedAgents is read-only here; selectAgents writes it, tripping the
 // debounced PUT /users/me/default_agents watcher in useAgent.
 const { selectAgents, selectedAgents } = useAgent()
+
+// A child (the dashboard pane's rename) changed this report's title. The
+// page owns `report` and passes it down as a prop, so it is the one that
+// has to absorb the new title — the tab (useHead) and the pane follow.
+function onReportUpdatedEvent(ev: CustomEvent) {
+    const detail = ev?.detail || {}
+    if (!detail.id || String(detail.id) !== String(report_id)) return
+    if (typeof detail.title !== 'string' || !report.value) return
+    if (report.value.title !== detail.title) report.value = { ...report.value, title: detail.title }
+}
 
 function onReportMutated(ev: CustomEvent) {
     const rid = ev?.detail?.reportId
@@ -4183,6 +4355,7 @@ function onReportMutated(ev: CustomEvent) {
 }
 onBeforeUnmount(() => {
     window.removeEventListener('report:mutated', onReportMutated as EventListener)
+    window.removeEventListener('report:updated', onReportUpdatedEvent as EventListener)
 })
 
 // When a tool finishes saving a new step, broadcast the default step change if we have enough info
@@ -4269,12 +4442,7 @@ function toggleSplitScreen() {
 	nextTick(() => {
 		isSplitScreen.value = !isSplitScreen.value
 		if (isSplitScreen.value) {
-			const windowWidth = window.innerWidth
-			leftPanelWidth.value = rightPanelView.value === 'summary'
-				? Math.round(windowWidth * 0.55)
-				: rightPanelView.value === 'agent'
-				? Math.round(windowWidth * 0.45)
-				: Math.round(windowWidth * 0.37)
+			leftPanelWidth.value = leftWidthFor(rightPanelView.value)
 			collapseSidebar()
 		}
         safeScrollToBottom()
@@ -4391,7 +4559,10 @@ async function handleAddWidgetFromPreview(payload: { widget?: any, step?: any, v
 }
 
 // Handle opening an artifact from CreateArtifactTool
-function handleOpenArtifact(payload: { artifactId?: string; loading?: boolean }) {
+async function handleOpenArtifact(payload: { artifactId?: string; loading?: boolean }) {
+	// Record BEFORE flipping the view: switching panes may remount ArtifactFrame,
+	// and the seed has to be readable by the time its onMounted runs.
+	if (payload.artifactId) requestedArtifactId.value = payload.artifactId
 	if (isMobile.value) {
 		// On mobile there is no split layout — surface the dashboard as a
 		// full-screen tab. Set the view directly (not via toggleSplitScreen,
@@ -4408,7 +4579,17 @@ function handleOpenArtifact(payload: { artifactId?: string; loading?: boolean })
 	// If artifactId provided, dispatch event to ArtifactFrame to select this artifact
 	// If loading is true, just open the pane - ArtifactFrame will show loading state
 	// and artifact:created event will trigger selection when ready
+	//
+	// Wait for the pane to actually render first. ArtifactFrame and ChatSummary
+	// sit in the SAME v-if chain on the right panel, so opening the summary
+	// unmounts the frame — and every click from the summary therefore lands
+	// while no `artifact:select` listener exists. Dispatching synchronously here
+	// dropped the event, the frame then mounted with no selection and fell back
+	// to artifactsList[0] (the newest artifact), so picking any row always
+	// opened whichever artifact was regenerated last. nextTick resolves after
+	// the mount flush, by which point onMounted has registered the listener.
 	if (payload.artifactId) {
+		await nextTick()
 		try {
 			window.dispatchEvent(new CustomEvent('artifact:select', {
 				detail: { artifact_id: payload.artifactId }
@@ -5057,7 +5238,7 @@ async function consumeWatchStream(res: Response, completionId: string, sysId: st
 					const idx = findWatchMessageIndex(completionId, sysId)
 					if (idx !== -1) {
 						gotEvents = true
-						await handleStreamingEvent(currentEvent, payload, idx)
+						await handleStreamingEvent(currentEvent, payload, idx, { ownStream: false })
 						if (!pendingScroll.value) {
 							pendingScroll.value = true
 							window.requestAnimationFrame(() => {
@@ -5428,6 +5609,15 @@ onMounted(async () => {
 	blockquote { @apply border-l-4 border-gray-200 pl-4 italic my-4; unicode-bidi: plaintext; }
 	table { @apply w-full border-collapse mb-4; unicode-bidi: plaintext; }
 	table th, table td { @apply border border-gray-200 p-2 text-xs bg-white; unicode-bidi: plaintext; }
+
+	/* useMarkdownAutoDir stamps an explicit dir (dominant-direction estimate)
+	   on these blocks; once stamped, isolate replaces plaintext so the stamped
+	   dir governs alignment — plaintext keeps re-resolving from the first
+	   strong character, which is exactly what mis-aligns an RTL sentence that
+	   opens with a Latin token (see composables/useMarkdownAutoDir.ts). */
+	:where(p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, table):is([dir="rtl"], [dir="ltr"]) {
+		unicode-bidi: isolate;
+	}
 }
 
 

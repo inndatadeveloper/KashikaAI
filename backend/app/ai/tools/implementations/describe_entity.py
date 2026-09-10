@@ -32,14 +32,21 @@ class DescribeEntityTool(Tool):
         return ToolMetadata(
             name="describe_entity",
             description=(
-                "Look up a pre-built entity from the catalog by name or ID.\n\n"
+                "Load a saved query (catalog entity) by name or ID — no code generation.\n\n"
                 "**Research mode** (default): Returns SQL code, columns, and sample data. "
                 "Use for research, investigation, understanding how something was built, "
                 "or as a reference before writing similar code.\n\n"
-                "**Create mode** (should_create=True): Creates a visualization from the "
-                "entity's stored data. Use when the user wants to display an existing entity "
-                "rather than build something new.\n\n"
-                "Prefer this over create_data when a relevant entity already exists in the catalog."
+                "**Create mode** (should_create=True): Materializes the entity as a tracked "
+                "query + visualization in this report. Use when the user wants an existing "
+                "entity displayed or refreshed rather than something new built.\n\n"
+                "**Parameters**: when the entity lists <parameters> in <entities>, pass the "
+                "values the user asked for in `params` ({name: value}); the saved code runs "
+                "with them and the result keeps those controls for the viewer. Omitted "
+                "parameters use their defaults.\n\n"
+                "Prefer this over create_data whenever a published entity already answers the "
+                "ask as-is or with different parameter values — it skips code generation "
+                "entirely. Use create_data (with load_entity) only when the entity's rows must "
+                "be transformed or combined with other data."
             ),
             category="research",
             version="1.0.0",
@@ -277,43 +284,49 @@ class DescribeEntityTool(Tool):
             )
             return
 
-        # Determine data source: cached or re-executed
-        entity_data = entity.data or {}
+        # Determine data source: cached or re-executed. The cached snapshot is
+        # resolved through the viewer-data policy: on a user-scoped
+        # (user_required/RLS) source it is the OWNER's row slice — any other
+        # reader gets no cached rows and the tool re-executes under THEIR
+        # credentials instead.
+        from app.services.viewer_data_policy import entity_data_withheld
+        snapshot_withheld = await entity_data_withheld(db, entity, user)
+        entity_data = {} if snapshot_withheld else (entity.data or {})
         execution_log = None
         errors: List[str] = []
+        declared_params = list(getattr(entity, "parameters", None) or []) or None
+        # The values the served rows were produced with: the shared
+        # snapshot's own record until a run below replaces it.
+        applied_params = dict(getattr(entity, "applied_params", None) or {}) or None
+        request_values = dict(data.params or {})
 
-        if data.should_rerun:
+        if request_values or data.should_rerun or snapshot_withheld:
+            # Viewer-mode run of the SAVED code: defaults <- the requested
+            # values <- this user's identity bindings, cached per (entity,
+            # user, values). No code generation anywhere on this path; a
+            # repeat with the same values is served from the cache.
             yield ToolProgressEvent(type="tool.progress", payload={"stage": "code_execution"})
             try:
-                from app.ai.code_execution.code_execution import StreamingCodeExecutor
-                from app.services.data_source_service import DataSourceService
-
-                ds_service = DataSourceService()
-                ds_clients = {}
-                for ds in (entity.data_sources or []):
-                    try:
-                        clients = await ds_service.construct_clients(db, ds, user)
-                        ds_clients.update(clients)
-                    except Exception as e:
-                        errors.append(f"Failed to connect to {ds.name}: {str(e)}")
-
-                executor = StreamingCodeExecutor(organization_settings=organization_settings)
-                code_to_run = entity.code or ""
-
-                if not code_to_run.strip():
+                if not (entity.code or "").strip():
                     errors.append("Entity has no code to execute")
                 else:
-                    exec_df, execution_log, _ = executor.execute_code(
-                        code=code_to_run,
-                        ds_clients=ds_clients,
-                        excel_files=[],
+                    from app.services.entity_service import EntityService
+                    run = await EntityService().run_entity_for_user(
+                        db, entity, organization, user, request_values,
+                        force_refresh=bool(data.should_rerun),
                     )
-                    entity_data = executor.format_df_for_widget(exec_df)
-
+                    entity_data = run["data"] or {}
+                    applied_params = dict(run["applied_params"] or {}) or None
+                    execution_log = (
+                        "served from the per-user cache" if run.get("cached")
+                        else "executed the entity's saved code"
+                    )
             except Exception as e:
                 errors.append(f"Code execution failed: {str(e)}")
-                # Fall back to cached data
-                entity_data = entity.data or {}
+                # Fall back to cached data — but never to a snapshot the
+                # policy withholds from this reader, and never to a snapshot
+                # that answers different parameter values than asked.
+                entity_data = {} if (snapshot_withheld or request_values) else (entity.data or {})
 
         # Build data profile
         allow_llm_see_data = True
@@ -324,14 +337,26 @@ class DescribeEntityTool(Tool):
             except Exception:
                 pass
 
+        # UI card keeps the compact column profile; the PLANNER gets the same
+        # budgeted preview create_data/read_query emit — small results (an
+        # options list, a lookup) come through whole instead of 5 head rows,
+        # so the planner never needs a second read_query to see them.
         data_profile = self._build_data_profile(entity_data, allow_llm_see_data)
+        from app.ai.data_preview import build_data_preview, clamp_stats, gate_stats_for_privacy
+        data_preview = build_data_preview(entity_data or {}, allow_llm_see_data=allow_llm_see_data)
+        _info = (entity_data or {}).get("info", {}) or {}
+        stats = clamp_stats(_info) if allow_llm_see_data else clamp_stats(gate_stats_for_privacy(_info))
 
         # If should_create, create step and visualization
         step_id = None
         data_model = None
         view = None
 
-        if data.should_create:
+        # A run that failed (bad parameter values, no client, broken code)
+        # must not materialize: the orchestrator creates the query/step on
+        # the progress event below, and a step with no data would sit in the
+        # chat as an empty card while the planner retries.
+        if data.should_create and not errors:
             yield ToolProgressEvent(type="tool.progress", payload={"stage": "creating_visualization"})
 
             try:
@@ -390,20 +415,31 @@ class DescribeEntityTool(Tool):
             description=entity.description,
             code=entity.code if allow_llm_see_data else "[code hidden]",
             data_profile=data_profile,
+            data_preview=data_preview,
+            stats=stats,
             step_id=step_id,
             data_model=data_model,
             view=view,
+            parameters=declared_params,
+            applied_params=applied_params,
             execution_log=execution_log,
             errors=errors,
         ).model_dump()
 
         # Add full data for step creation if should_create
-        if data.should_create:
+        if data.should_create and not errors:
             output["data"] = entity_data
+            # The step persists the REAL code regardless of the LLM-facing
+            # redaction below: the created query must be re-runnable.
+            output["code"] = entity.code
 
         # Build observation
         summary_parts = [f"Described entity '{entity.title}' (type={entity.type})"]
-        if data.should_rerun:
+        if request_values:
+            summary_parts.append(
+                "ran with parameters " + ", ".join(f"{k}={v!r}" for k, v in (applied_params or {}).items())
+            )
+        elif data.should_rerun:
             summary_parts.append("re-executed code")
         if data.should_create:
             summary_parts.append("created visualization")
@@ -414,10 +450,19 @@ class DescribeEntityTool(Tool):
             "entity_type": entity.type,
             "title": entity.title,
             "description": entity.description[:200] if entity.description else None,
-            "data_profile": data_profile,
+            "data_preview": data_preview,
+            "stats": stats,
             "analysis_complete": False,
             "final_answer": None,
         }
+
+        if declared_params:
+            observation["parameters"] = [
+                {k: p.get(k) for k in ("name", "type", "source", "default", "required") if k in p}
+                for p in declared_params if isinstance(p, dict)
+            ]
+        if applied_params:
+            observation["applied_params"] = applied_params
 
         if data.should_create:
             observation["data_model"] = data_model

@@ -34,11 +34,12 @@ _STOP_REASON_MAP = {
 }
 
 # Model families that reject sampling parameters (temperature/top_p/top_k)
-# with a 400. Sonnet 5 / Opus 4.7 / Opus 4.8 / Fable 5 removed them from the
-# API — prompting is the steering mechanism there. Older models (4.6 and
-# earlier) still accept temperature.
+# with a 400. Sonnet 5 / Opus 5 / Opus 4.7 / Opus 4.8 / Fable 5 removed them
+# from the API — prompting is the steering mechanism there. Older models (4.6
+# and earlier) still accept temperature.
 _NO_SAMPLING_PARAM_TAGS = (
     "sonnet-5",
+    "opus-5",
     "opus-4-7",
     "opus-4-8",
     "fable-5",
@@ -52,12 +53,25 @@ def _accepts_temperature(model_id: str) -> bool:
 
 
 class Anthropic(LLMClient):
-    def __init__(self, api_key: str, base_url: str = None):
+    def __init__(self, api_key: str, base_url: str = None, temperature: Optional[float] = None,
+                 default_headers: Optional[dict] = None):
         super().__init__()
-        self.client = AnthropicAPI(api_key=api_key)
-        self.async_client = AsyncAnthropic(api_key=api_key)
+        # base_url was accepted but silently dropped here, so every caller got
+        # api.anthropic.com no matter what it asked for. It is a real routing
+        # input: Anthropic models hosted on Azure AI Foundry answer the same
+        # Messages API under ``<resource>/anthropic/v1``.
+        client_kwargs: dict = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+        self.client = AnthropicAPI(**client_kwargs)
+        self.async_client = AsyncAnthropic(**client_kwargs)
         self.max_tokens = 32768
-        self.temperature = 0.3
+        # Admin-configured override, or the historical default. Either way the
+        # _accepts_temperature gate stays authoritative: model families that
+        # reject sampling params never receive the parameter.
+        self.temperature = 0.3 if temperature is None else temperature
 
     @staticmethod
     def _build_content(prompt: str, images: Optional[list[ImageInput]] = None) -> str | list[dict[str, Any]]:

@@ -647,7 +647,12 @@ def build_view_from_data_model(
         return ViewSchema(view=view)
 
     if chart_type == "table":
-        view = TableView(title=title, defaultFilters=default_filters)
+        # No defaultFilters on tables: the query already returned exactly the
+        # rows to show, and the inference pass's row-narrowing filters exist to
+        # pick the one row a single-value card renders. Attached to a table
+        # they silently hide rows (e.g. 1 of 31 shown) with no way to undo it
+        # from the filter UI.
+        view = TableView(title=title)
         return ViewSchema(view=view)
 
     # Presentation formatting for single-value cards (validated upstream by
@@ -1326,7 +1331,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
     def metadata(self) -> ToolMetadata:
         return ToolMetadata(
             name="create_data",
-            description="Generate code from prompt and execute to return a data result as table or chart. Use this when you want to generate a tracked insight, or you have enough information to generate a widget. Call create_data for 1 insight at a time; independent insights may be requested as parallel calls in one response. Shape the output to the ask: scalar questions get a scalar ('how many' → COUNT), 'top N' → N rows, lists → the fields the user cares about. For row-returning queries include identity columns (primary/natural keys) so drill-downs don't need re-queries, and reuse the identity/dimension columns of related prior queries so results align across steps. Reuse over rebuild: when the data already exists in a prior step from this report (see <available_steps>) or a published entity (see <entities>) — especially when the user refers to it by name or asks to extend/modify a previous result — prefer create_data here, which loads that data via load_step/load_entity instead of writing SQL from scratch. Results are re-executed verbatim later (dashboard refresh, scheduled runs), so describe time windows RELATIVELY in your prompts — 'the latest day in the data', 'last 7 days at run time' — never as resolved literal dates, unless the user explicitly named a fixed date. Queries are subject to a per-connection timeout.",
+            description="Generate code from prompt and execute to return a data result as table or chart. Use this when you want to generate a tracked insight, or you have enough information to generate a widget. Call create_data for 1 insight at a time; independent insights may be requested as parallel calls in one response. Shape the output to the ask: scalar questions get a scalar ('how many' → COUNT), 'top N' → N rows, lists → the fields the user cares about. For row-returning queries include identity columns (primary/natural keys) so drill-downs don't need re-queries, and reuse the identity/dimension columns of related prior queries so results align across steps. Reuse over rebuild: when the data already exists in a prior step from this report (see <available_steps>) — especially when the user refers to it by name or asks to extend/modify a previous result — prefer create_data here, which loads that data via load_step instead of writing SQL from scratch. When a published entity in <entities> already answers the ask as-is or with different parameter values, call describe_entity (should_create=True, params={...}) instead — it materializes the saved query without generating code; use create_data with load_entity only when the entity's rows must be transformed or combined with other data. Results are re-executed verbatim later (dashboard refresh, scheduled runs), so describe time windows RELATIVELY in your prompts — 'the latest day in the data', 'last 7 days at run time' — never as resolved literal dates, unless the user explicitly named a fixed date. Queries are subject to a per-connection timeout.",
             category="action",
             version="1.0.0",
             input_schema=CreateDataInput.model_json_schema(),
@@ -1692,13 +1697,66 @@ Do not use generic placeholders like "value" unless that is the actual column na
             usage_context=usage_ctx,
         )
 
+        # Declared parameters: resolve creator-default values (the creation run
+        # is the creator's preview) and teach the coder the params contract via
+        # a prompt directive. Identity params bind the CREATOR's identity here;
+        # viewers get their own binding on /run.
+        declared_param_specs = list(data.parameters or [])
+        resolved_default_params: dict = {}
+        params_directive = ""
+        if declared_param_specs:
+            from app.ai.code_execution.query_params import resolve_param_values as _resolve_pv
+            _identity = None
+            try:
+                _org = runtime_ctx.get("organization")
+                _usr = runtime_ctx.get("user")
+                if _org is not None and _usr is not None:
+                    # Fresh short-lived session: create_data can run as a
+                    # parallel action, and the shared runtime_ctx session must
+                    # never be used from two concurrent tool runs.
+                    from app.services.rls_identity_service import resolve_identity as _ri
+                    async with async_session_maker() as _ident_db:
+                        _identity = await _ri(_ident_db, _usr, str(_org.id))
+            except Exception:
+                _identity = None
+            try:
+                resolved_default_params = _resolve_pv(declared_param_specs, None, _identity)
+            except Exception:
+                resolved_default_params = {
+                    s.name: s.default for s in declared_param_specs
+                }
+            _param_lines = []
+            for s in declared_param_specs:
+                _param_lines.append(
+                    f"- {s.name} ({s.type}, source={s.source}"
+                    + (f", binding={s.identity_binding}" if s.identity_binding else "")
+                    + f"): current value = {resolved_default_params.get(s.name)!r}"
+                )
+            params_directive = (
+                "\n\nPARAMETERS CONTRACT (MANDATORY): define generate_df with a `params` "
+                "argument: def generate_df(ds_clients, excel_files, params). `params` is a "
+                "dict with these declared parameters:\n" + "\n".join(_param_lines) + "\n"
+                "Rules:\n"
+                "1. Use each parameter to filter/shape the data: put `:name` placeholders in "
+                "the SQL and pass the values via execute_query(sql, params={'name': params['name'], ...}). "
+                "NEVER f-string, concatenate, or .format() a param value into SQL — the "
+                "platform renders placeholders safely.\n"
+                "2. An optional parameter whose value is None means 'all' — skip that "
+                "predicate (build the SQL conditionally or use a `(:name IS NULL OR col = :name)` pattern; "
+                "when you pass params to execute_query, include every placeholder used in that SQL).\n"
+                "3. A list-typed parameter renders as an IN list: use `col IN :name`.\n"
+                "4. identity-source parameters carry the viewing user's identity — always "
+                "apply them as filters so each viewer sees only their rows.\n"
+                "5. Every declared parameter above MUST be read from `params` in the code."
+            )
+
         # Build typed context via helper (use resolved active tables, not original patterns)
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "building_context"})
         codegen_context = await build_codegen_context(
             runtime_ctx=runtime_ctx,
-            user_prompt=(data.user_prompt or data.interpreted_prompt or "") + source_directive,
+            user_prompt=(data.user_prompt or data.interpreted_prompt or "") + source_directive + params_directive,
             interpreted_prompt=(
-                ((data.interpreted_prompt or "") + source_directive)
+                ((data.interpreted_prompt or "") + source_directive + params_directive)
                 if data.interpreted_prompt else None
             ),
             schemas_excerpt=(schemas_excerpt or ""),
@@ -1741,6 +1799,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 code_generator_fn=coder.generate_code,
                 sigkill_event=runtime_ctx.get("sigkill_event"),
                 loadable_resolver_fn=_loadables_resolver.resolve,
+                params=resolved_default_params,
             ):
                 if e["type"] == "progress":
                     # Map internal stage names to UI-friendly names
@@ -2018,6 +2077,22 @@ Do not use generic placeholders like "value" unless that is the actual column na
             observation["step_id"] = current_step_id
         run_span.set_attribute("tool.success", True)
         run_span.set_attribute("tool.chart_type", final_dm.get("type", "table"))
+        # Keep only declarations the generated code actually consumes — a
+        # declared-but-dead param would render a control that does nothing.
+        surviving_params = None
+        if declared_param_specs:
+            from app.ai.code_execution.query_params import (
+                code_accepts_params, extract_code_param_names,
+            )
+            if code_accepts_params(generated_code or ""):
+                used = extract_code_param_names(generated_code or "")
+                surviving = [s for s in declared_param_specs if s.name in used]
+                surviving_params = [s.model_dump() for s in surviving] or None
+        if surviving_params:
+            observation["parameters"] = [
+                {"name": p.get("name"), "type": p.get("type"), "source": p.get("source")}
+                for p in surviving_params
+            ]
         yield ToolEndEvent(
             type="tool.end",
             payload={
@@ -2035,6 +2110,11 @@ Do not use generic placeholders like "value" unless that is the actual column na
                     "query_timings": query_timings,
                     "codegen_ms": codegen_ms,
                     "execution_ms": execution_ms,
+                    "parameters": surviving_params,
+                    "applied_params": (
+                        {k: v for k, v in (resolved_default_params or {}).items()}
+                        if surviving_params else None
+                    ),
                 },
                 "observation": observation,
             },

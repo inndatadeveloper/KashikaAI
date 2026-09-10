@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, Text, JSON, DateTime, ForeignKey, Table, UniqueConstraint, Boolean, Integer
 from sqlalchemy.orm import relationship
 from app.models.base import BaseSchema
+from app.ee.encryption import EncryptedJSON
 
 
 # Association table for many-to-many relationship between entities and data sources
@@ -29,7 +30,14 @@ class Entity(BaseSchema):
 
     # Execution and preview
     code = Column(Text, nullable=False)  # single source of truth (SQL or expression)
-    data = Column(JSON, nullable=True, default=dict)
+    data = Column(EncryptedJSON, nullable=True, default=dict)
+    # Declared ParamSpec dicts (app/schemas/param_schema.py), carried over
+    # from the source query on promotion. The shared `data` snapshot is the
+    # defaults + OWNER-identity materialization; identity-scoped entities
+    # resolve per viewer via entity_user_results.
+    parameters = Column(JSON, nullable=True, default=list)
+    # The resolved values the shared snapshot was produced with.
+    applied_params = Column(JSON(none_as_null=True), nullable=True, default=None)
     original_data_model = Column(JSON, nullable=True, default=dict)
     view = Column(JSON, nullable=True, default=dict)
 

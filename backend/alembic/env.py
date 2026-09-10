@@ -71,6 +71,8 @@ from app.models.connection_tool import ConnectionTool
 from app.models.user_connection_tool import UserConnectionTool
 from app.models.user_connection_tool_preference import UserConnectionToolPreference
 from app.models.tool_confirmation import ToolConfirmation
+from app.models.officejs_pending_result import OfficeJsPendingResult
+from app.models.login_exchange_code import LoginExchangeCode
 from app.models.data_source_connection_tool import DataSourceConnectionTool
 from app.models.domain_connection import domain_connection
 from app.models.user_connection_credentials import UserConnectionCredentials
@@ -99,6 +101,7 @@ from app.models.report_share import ReportShare
 from app.models.report_star import ReportStar
 from app.models.report_view import ReportView
 from app.models.step_user_result import StepUserResult
+from app.models.entity_user_result import EntityUserResult
 from app.models.project import Project, project_data_source_association, project_file_association
 from app.models.agent_automation_run import AgentAutomationRun
 from app.models.review_item import ReviewItem

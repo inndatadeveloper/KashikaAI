@@ -161,9 +161,12 @@ class ReadExcelAsCsvTool(Tool):
             },
         )
 
+        user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
         result, cancelled, timed_out = await await_result(
             tool_call_id=tool_call_id,
             sigkill_event=sigkill_event,
+            completion_id=completion_id,
+            user_id=str(user.id) if user is not None else None,
         )
 
         if cancelled or timed_out:
@@ -319,6 +322,9 @@ async def _persist_csv_as_file(
             path=dest_path,
             content_type="text/csv",
             preview=preview,
+            # Derived by a tool from an attachment — an artifact, not a new
+            # upload (see File.source_kind).
+            source_kind="artifact",
             user_id=str(user.id),
             organization_id=str(organization.id),
         )

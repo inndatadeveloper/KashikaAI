@@ -286,6 +286,9 @@ async def set_report_visibility(
         payload.shared_user_ids, current_user, organization,
         run_identity=payload.run_identity,
         shared_group_ids=payload.shared_group_ids,
+        include_data_tab=payload.include_data_tab,
+        artifact_chat_enabled=payload.artifact_chat_enabled,
+        artifact_chat_data_source_ids=payload.artifact_chat_data_source_ids,
     )
 
 
@@ -302,6 +305,40 @@ async def get_report_shares(
     if share_type not in ('artifact', 'conversation'):
         raise HTTPException(status_code=400, detail="share_type must be 'artifact' or 'conversation'")
     return await report_service.get_shares(db, report_id, share_type)
+
+
+@router.get("/reports/{report_id}/artifact_chat/agents")
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def get_artifact_chat_agents(
+    report_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Candidate agents for the ShareModal's chat scope picker: the agents this
+    report actually uses — its attached roster, or (for Auto reports) the
+    agents recovered from its tool executions. See
+    ArtifactChatService.candidate_agent_ids."""
+    from sqlalchemy.orm import selectinload, lazyload
+    from app.models.data_source import DataSource
+    from app.services.artifact_chat_service import artifact_chat_service
+
+    report = (await db.execute(
+        select(Report)
+        .options(lazyload("*"), selectinload(Report.data_sources).options(lazyload("*")))
+        .where(Report.id == report_id)
+    )).unique().scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    agent_ids = await artifact_chat_service.candidate_agent_ids(db, report)
+    by_id = {str(ds.id): ds for ds in (report.data_sources or [])}
+    agents = []
+    for aid in agent_ids:
+        ds = by_id.get(aid) or await db.get(DataSource, aid)
+        if ds is not None and ds.deleted_at is None:
+            agents.append({"id": str(ds.id), "name": ds.name})
+    return {"agents": agents}
 
 
 @router.post("/reports/{report_id}/fork", response_model=ForkResponse)
@@ -611,6 +648,13 @@ import asyncio as _asyncio
 from collections import defaultdict as _defaultdict
 _pdf_export_locks: dict[str, "_asyncio.Lock"] = _defaultdict(_asyncio.Lock)
 
+# Upper bound on one export request: waiting for the lock (at most one render
+# already in flight) plus our own render. The render itself is capped at
+# ReportPdfService.RENDER_TIMEOUT_SECONDS; without this outer bound a request
+# queued behind a wedged render would wait forever and the client would sit at
+# "Exporting..." with no way to learn it failed.
+_PDF_EXPORT_TIMEOUT_SECONDS = 330
+
 
 @router.get("/r/{report_id}/export_pdf")
 async def export_public_report_pdf(
@@ -631,8 +675,19 @@ async def export_public_report_pdf(
 
     from app.services.report_pdf_service import ReportPdfService
 
-    async with _pdf_export_locks[str(report_id)]:
-        pdf_path = await ReportPdfService().generate_for_report(str(report_id))
+    async def _generate_locked() -> str | None:
+        async with _pdf_export_locks[str(report_id)]:
+            return await ReportPdfService().generate_for_report(str(report_id))
+
+    try:
+        pdf_path = await _asyncio.wait_for(
+            _generate_locked(), timeout=_PDF_EXPORT_TIMEOUT_SECONDS
+        )
+    except _asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="PDF export timed out. Please try again.",
+        )
 
     import os
     if not pdf_path or not os.path.isfile(pdf_path):
@@ -661,6 +716,226 @@ async def export_public_report_pdf(
         filename=f"{schema.title or 'report'}.pdf",
         content_disposition_type="attachment",
     )
+
+
+@router.get("/r/{report_id}/export_pptx")
+async def export_public_report_pptx(
+    report_id: str,
+    request: Request,
+    artifact_id: str | None = None,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Download the shared deck as a PowerPoint file.
+
+    The in-app PPTX export lives on the artifact router, which requires a
+    signed-in user, so a share-link viewer had no way to reach it. This is the
+    report-scoped twin of export_pdf/export_html: same gates, and it serves the
+    .pptx that slide generation already wrote to disk — no rendering, so no
+    lock or timeout is needed.
+    """
+    import os
+    import re
+
+    from fastapi.responses import FileResponse
+
+    from app.core.path_safety import UnsafePathError, safe_join
+    from app.ee.audit.service import audit_service
+    from app.models.artifact import Artifact as ArtifactModel
+    from app.services.report_pdf_service import ReportPdfService
+    from app.services.viewer_data_policy import report_snapshot_withheld
+
+    # Raises 401/403/404 exactly like the page's other public endpoints, and
+    # applies the artifact_visibility gate rather than only the report one.
+    listed = await report_service.get_public_artifacts(db, report_id, user=user)
+
+    decks = [a for a in listed if (getattr(a, "mode", None) or "page") == "slides"]
+    if artifact_id is not None:
+        # Only ids this viewer was just shown; never a raw id off the request.
+        if not any(str(a.id) == str(artifact_id) for a in decks):
+            raise HTTPException(status_code=404, detail="Not found")
+        chosen_id = artifact_id
+    else:
+        if not decks:
+            raise HTTPException(
+                status_code=409,
+                detail="PowerPoint export is not available for this report",
+            )
+        # get_public_artifacts returns newest first.
+        chosen_id = str(decks[0].id)
+
+    # The deck bakes in the shared snapshot exactly as the PDF and HTML exports
+    # do, and once downloaded it leaves our control entirely — so this is the
+    # last point at which the viewer-data policy can be applied.
+    if await report_snapshot_withheld(db, str(report_id)):
+        raise HTTPException(
+            status_code=409,
+            detail="This deck runs with each viewer's own credentials, so it cannot be exported.",
+        )
+
+    artifact = await db.get(ArtifactModel, chosen_id)
+    if artifact is None or artifact.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Same gate as the in-app twin: a failed artifact would export stale or
+    # broken content.code as a successful download, with nothing telling the
+    # viewer the file is built from a render that never completed.
+    if artifact.status == "failed":
+        raise HTTPException(
+            status_code=409,
+            detail="This deck failed to generate. Regenerate it before exporting.",
+        )
+
+    # The in-app route audits every export; without this, a member who
+    # downloads the full snapshot through the share link instead of the in-app
+    # button leaves no trail, and a "who exported this dashboard" review misses
+    # them entirely. user_id is None for an anonymous share-link viewer, which
+    # the column allows — the entry still records that the export happened.
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=artifact.organization_id,
+            action="artifact.exported",
+            user_id=str(user.id) if user else None,
+            resource_type="artifact",
+            resource_id=str(artifact.id),
+            details={"format": "pptx", "title": artifact.title, "via": "share_link"},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    # Serve only a file under the generated-decks root, rebuilt from that fixed
+    # root plus the bare filename, so no stored path component can point out of
+    # the export tree.
+    candidate = artifact.pptx_path or f"{artifact.id}.pptx"
+    try:
+        safe_pptx = safe_join(ReportPdfService.PPTX_DIR, os.path.basename(candidate))
+    except UnsafePathError:
+        safe_pptx = None
+    if safe_pptx is None or not safe_pptx.is_file():
+        raise HTTPException(
+            status_code=409,
+            detail="PowerPoint export is not available for this report",
+        )
+
+    safe_title = (artifact.title or "presentation").encode("ascii", "ignore").decode("ascii")
+    safe_title = re.sub(r"[^\w\s-]", "", safe_title).strip() or "presentation"
+    return FileResponse(
+        str(safe_pptx),
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        filename=f"{safe_title}.pptx",
+        content_disposition_type="attachment",
+    )
+
+
+@router.get("/r/{report_id}/export_html")
+async def export_public_report_html(
+    report_id: str,
+    request: Request,
+    artifact_id: str | None = None,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Download the shared dashboard as one standalone, fully offline HTML file.
+
+    Same bundler as the in-app export (services/html_export_service.py), and
+    the same gates as the other /r endpoints: get_public_artifacts enforces the
+    report's artifact_visibility, and the shared snapshot is refused in
+    viewer-identity mode on user-scoped connections exactly as export_pdf
+    refuses it — the file bakes that snapshot in and then leaves our control
+    entirely, so this is the last point at which the policy can be applied.
+    """
+    from urllib.parse import quote
+
+    from fastapi.responses import Response
+
+    from app.ee.audit.service import audit_service
+    from app.models.artifact import Artifact as ArtifactModel
+    from app.services.html_export_service import (
+        ExportUnavailable,
+        ascii_fallback_filename,
+        build_standalone_html,
+        suggested_filename,
+    )
+    from app.services.viewer_data_policy import report_snapshot_withheld
+
+    # Raises 401/403/404 exactly like the page's other public endpoints, and
+    # applies the artifact_visibility gate rather than only the report one.
+    listed = await report_service.get_public_artifacts(db, report_id, user=user)
+
+    dashboards = [a for a in listed if (getattr(a, "mode", None) or "page") == "page"]
+    if artifact_id is not None:
+        # Only ids this viewer was just shown; never a raw id off the request.
+        if not any(str(a.id) == str(artifact_id) for a in dashboards):
+            raise HTTPException(status_code=404, detail="Not found")
+        chosen_id = artifact_id
+    else:
+        if not dashboards:
+            raise HTTPException(
+                status_code=409,
+                detail="HTML export is not available for this report",
+            )
+        # get_public_artifacts returns newest first.
+        chosen_id = str(dashboards[0].id)
+
+    if await report_snapshot_withheld(db, str(report_id)):
+        raise HTTPException(
+            status_code=409,
+            detail="This dashboard runs with each viewer's own credentials, so it cannot be exported.",
+        )
+
+    artifact = await db.get(ArtifactModel, chosen_id)
+    if artifact is None or artifact.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Same gate as the in-app twin: a failed artifact would export stale or
+    # broken content.code as a successful download, with nothing telling the
+    # viewer the file is built from a render that never completed.
+    if artifact.status == "failed":
+        raise HTTPException(
+            status_code=409,
+            detail="This dashboard failed to generate. Regenerate it before exporting.",
+        )
+
+    # The in-app route audits every export; without this, a member who
+    # downloads the full snapshot through the share link instead of the in-app
+    # button leaves no trail, and a "who exported this dashboard" review misses
+    # them entirely. user_id is None for an anonymous share-link viewer, which
+    # the column allows — the entry still records that the export happened.
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=artifact.organization_id,
+            action="artifact.exported",
+            user_id=str(user.id) if user else None,
+            resource_type="artifact",
+            resource_id=str(artifact.id),
+            details={"format": "html", "title": artifact.title, "via": "share_link"},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    try:
+        html = await build_standalone_html(db, artifact)
+    except ExportUnavailable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+    filename = suggested_filename(artifact)
+    disposition = (
+        f'attachment; filename="{ascii_fallback_filename(filename)}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+    return Response(
+        content=html,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition": disposition,
+            "Cache-Control": "no-store",
+        },
+    )
+
 
 
 @router.post("/r/{report_id}/rerun", response_model=ReportRerunResultSchema)

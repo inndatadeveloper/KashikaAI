@@ -3,7 +3,7 @@
     <!-- Header / Toolbar -->
     <div class="flex-shrink-0 flex items-center justify-between px-4 py-2 bg-gradient-to-b from-cyan-50/50 dark:from-cyan-900/10 to-white dark:to-gray-900 border-b border-gray-200 dark:border-gray-700/60">
       <div class="flex items-center gap-3">
-        <UTooltip text="Back to chat">
+        <UTooltip :text="$t('artifactFrame.backToChat')">
           <button @click="$emit('close')" class="hover:bg-gray-100 dark:hover:bg-gray-700 p-1 rounded">
             <Icon name="heroicons:x-mark" class="w-4 h-4 text-gray-500 dark:text-gray-400" />
           </button>
@@ -11,15 +11,53 @@
 
         <!-- Artifact Selector Dropdown -->
         <div class="flex items-center gap-2">
+          <!-- Rename (owner only): the selector becomes an input in place so
+               the toolbar keeps its width. Enter saves, Escape cancels. -->
+          <form
+            v-if="isRenaming"
+            class="flex items-center gap-1"
+            @submit.prevent="saveRename"
+          >
+            <UInput
+              ref="renameInputRef"
+              v-model="renameDraft"
+              size="xs"
+              class="min-w-[280px]"
+              :maxlength="255"
+              :disabled="isSavingRename"
+              :placeholder="$t('artifactFrame.renamePlaceholder')"
+              @keydown.escape.prevent="cancelRename"
+            />
+            <UTooltip :text="$t('common.save')">
+              <button
+                type="submit"
+                :disabled="isSavingRename || !renameDraft.trim()"
+                class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+              >
+                <Spinner v-if="isSavingRename" class="w-3.5 h-3.5 text-gray-500" />
+                <Icon v-else name="heroicons:check" class="w-3.5 h-3.5 text-emerald-600" />
+              </button>
+            </UTooltip>
+            <UTooltip :text="$t('common.cancel')">
+              <button
+                type="button"
+                :disabled="isSavingRename"
+                @click="cancelRename"
+                class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+              >
+                <Icon name="heroicons:x-mark" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
+              </button>
+            </UTooltip>
+          </form>
           <USelectMenu
-            v-if="artifactsList.length > 0"
+            v-else-if="artifactsList.length > 0"
             v-model="selectedArtifactId"
             :options="artifactOptions"
             value-attribute="value"
             option-attribute="label"
             size="xs"
             class="min-w-[280px]"
-            placeholder="Select artifact..."
+            :placeholder="$t('artifactFrame.selectArtifact')"
             :ui="{ option: { base: 'py-2' } }"
           >
             <template #label>
@@ -53,6 +91,16 @@
           </USelectMenu>
           <span v-else class="text-xs text-gray-400 italic">No artifacts yet</span>
 
+          <!-- A run elsewhere created a new artifact: offer it, never hijack -->
+          <button
+            v-if="offeredArtifactId"
+            @click="acceptOfferedArtifact"
+            class="text-xs px-2 py-1 bg-emerald-50 dark:bg-emerald-950 text-emerald-600 hover:bg-emerald-100 rounded border border-emerald-200 transition-colors flex items-center gap-1"
+          >
+            <Icon name="heroicons:sparkles" class="w-3 h-3" />
+            New artifact — view
+          </button>
+
           <!-- Use this version button (shown when non-latest is selected) -->
           <button
             v-if="!isLatestSelected && artifactsList.length > 1"
@@ -62,7 +110,7 @@
           >
             <Spinner v-if="isDuplicating" class="w-3 h-3" />
             <Icon v-else name="heroicons:arrow-uturn-up" class="w-3 h-3" />
-            Use this version
+            {{ $t('artifactFrame.useThisVersion') }}
           </button>
         </div>
       </div>
@@ -70,68 +118,97 @@
       <div class="flex items-center gap-2">
         <span v-if="isLoading" class="text-xs text-gray-400">{{ t('artifactFrame.loading') }}</span>
 
-        <!-- Refresh Dashboard (rerun + refresh) -->
-        <UTooltip text="Refresh Data">
+        <!-- Refresh Dashboard (rerun + refresh). Everyday action, so it stays
+             a visible button.
+             Disabled while previewing as someone else: neither refresh
+             endpoint takes run_as_user_id, so the rerun would resolve
+             identity params as YOU and replace what is on screen while the
+             banner still says "Viewing as X". -->
+        <UTooltip :text="isViewAsActive ? $t('artifactFrame.refreshDisabledViewAs') : $t('artifactFrame.refreshData')">
           <button
             @click="refreshDashboard"
-            :disabled="isRefreshing"
-            class="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50"
+            :disabled="isRefreshing || isViewAsActive"
+            class="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Spinner v-if="isRefreshing" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
             <Icon v-else name="heroicons:arrow-path" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
           </button>
         </UTooltip>
 
-        <!-- Schedule -->
-        <CronModal v-if="report" :report="report" />
+        <!-- Data (query manager) and Schedule stay visible next to Refresh:
+             the three things a dashboard owner touches routinely. Each
+             component renders its own trigger and keeps its modal mounted. -->
+        <DataModal
+          v-if="report"
+          :report-id="reportId"
+          :artifact-id="selectedArtifact?.id"
+          :artifact-viz-ids="selectedArtifact?.content?.visualization_ids || []"
+          :artifact-mode="selectedArtifact?.mode"
+        />
+        <CronModal v-if="report" :report="report" compact />
 
-        <!-- Doc export lives in the editor toolbar (owner, edit-by-default).
-             For the read-only viewer (non-owner) keep .md + PDF here. -->
-        <template v-if="isDocMode && !isEditingDoc">
-          <UTooltip :text="t('docViewer.exportMarkdown')">
+        <!-- Everything used less than daily lives behind one ⋯ with labelled
+             rows: rename, every export (download), full screen, new tab.
+             Icon-only buttons for all of these made the bar unreadable. -->
+        <UDropdown
+          v-if="moreMenuItems.length"
+          :items="moreMenuItems"
+          :popper="{ placement: 'bottom-end' }"
+          :ui="{ width: 'w-auto min-w-[11rem]', item: { padding: 'px-2 py-1.5' } }"
+        >
+          <UTooltip :text="$t('artifactFrame.more')">
             <button
-              @click="exportDocMarkdown"
-              class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded"
+              type="button"
+              :aria-label="$t('artifactFrame.more')"
+              class="p-1.5 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors"
             >
-              <Icon name="heroicons:arrow-down-tray" class="w-3.5 h-3.5 text-blue-600" />
-              <span class="text-xs text-blue-600 font-medium">.md</span>
+              <Spinner v-if="isExporting" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
+              <Icon v-else name="heroicons:ellipsis-horizontal" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
             </button>
           </UTooltip>
-          <UTooltip :text="t('docViewer.exportPdf')">
-            <button
-              @click="printDoc"
-              class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded"
-            >
-              <Icon name="heroicons:printer" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
-            </button>
-          </UTooltip>
-        </template>
+          <template #item="{ item }">
+            <div class="flex items-center gap-2 text-start w-full">
+              <UIcon :name="item.icon" class="w-4 h-4 shrink-0 text-gray-400 dark:text-gray-500" />
+              <span class="text-xs font-medium text-gray-900 dark:text-white">{{ item.label }}</span>
+            </div>
+          </template>
+        </UDropdown>
 
-        <!-- Export PPTX (slides mode only) -->
-        <UTooltip v-if="selectedArtifact?.mode === 'slides'" text="Export as PowerPoint">
-          <button
-            @click="exportPptx"
-            :disabled="isExporting"
-            class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded disabled:opacity-50"
-          >
-            <Icon v-if="isExporting" name="heroicons:arrow-path" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400 animate-spin" />
-            <Icon v-else name="heroicons:arrow-down-tray" class="w-3.5 h-3.5 text-purple-600" />
-            <span class="text-xs text-purple-600 font-medium">PPTX</span>
-          </button>
-        </UTooltip>
-
-        <!-- Fullscreen -->
-        <UTooltip text="Full screen">
-          <button @click="openFullscreen" class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded">
-            <Icon name="heroicons:arrows-pointing-out" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
-          </button>
-        </UTooltip>
-
-        <!-- Open in new tab (if published) -->
-        <UTooltip text="Open in new tab" v-if="report?.status === 'published'">
-          <a :href="`/r/${report.id}`" target="_blank" class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded">
-            <Icon name="heroicons:arrow-top-right-on-square" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400" />
-          </a>
+        <!-- View as (page artifacts only): preview the dashboard as another
+             viewer — anonymous or any org member, searchable by name/email.
+             Identity-only — data is unaffected. -->
+        <USelectMenu
+          v-if="canViewAs"
+          v-model="viewAsMode"
+          :options="viewAsOptions"
+          value-attribute="value"
+          option-attribute="label"
+          searchable
+          :search-attributes="['label', 'email']"
+          :searchable-placeholder="$t('artifactFrame.searchMembers')"
+          size="xs"
+          class="min-w-[130px]"
+        >
+          <template #label>
+            <span class="flex items-center gap-1 text-xs" :class="viewAsMode !== 'you' ? 'text-indigo-600 font-medium' : ''">
+              <Icon name="heroicons:eye" class="w-3.5 h-3.5" />
+              {{ viewAsLabel }}
+            </span>
+          </template>
+          <template #option="{ option }">
+            <div class="flex flex-col">
+              <span class="text-xs">{{ option.label }}</span>
+              <span v-if="option.email" class="text-[10px] text-gray-400">{{ option.email }}</span>
+            </div>
+          </template>
+        </USelectMenu>
+        <!-- Delegated-source caveat, visible before a target is even picked -->
+        <UTooltip
+          v-if="canViewAs && credentialScoped"
+          :text="$t('artifactFrame.viewAsTooltip')"
+          :popper="{ placement: 'bottom' }"
+        >
+          <Icon name="heroicons:information-circle" class="w-3.5 h-3.5 text-amber-500" />
         </UTooltip>
 
         <!-- Share Dashboard -->
@@ -141,6 +218,50 @@
 
     <!-- Iframe Container -->
     <div class="flex-1 min-h-0 relative bg-white dark:bg-gray-900">
+      <!-- View-as switch in flight: cover the pane with a spinner until the
+           new identity (and any identity-scoped re-runs) fully settle, so the
+           transient anonymous fallback never flashes as the final render. -->
+      <div
+        v-if="previewLoading"
+        class="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-white/70 dark:bg-gray-900/70 backdrop-blur-[1px]"
+      >
+        <Spinner class="w-6 h-6 text-indigo-500" />
+        <span class="text-xs text-gray-500 dark:text-gray-400">Switching view...</span>
+      </div>
+
+      <!-- View-as banner: keep the simulated view unmistakable, and be honest
+           about its scope (identity only — data is not re-scoped). -->
+      <div
+        v-if="viewAsMode !== 'you' && canViewAs"
+        class="absolute top-2 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1 max-w-[90%]"
+      >
+        <!-- Failed member fetch: never claim "Viewing as X" over an anonymous
+             payload — say what actually happened and offer a retry. -->
+        <div
+          v-if="previewViewerFailed"
+          class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500 text-white shadow-lg text-xs"
+        >
+          <Icon name="heroicons:exclamation-triangle" class="w-3.5 h-3.5" />
+          <span>Couldn't load {{ viewAsLabel }}'s identity — showing anonymous view</span>
+          <button @click="retryPreviewViewer" class="font-semibold underline underline-offset-2 hover:text-amber-100">Retry</button>
+          <button @click="viewAsMode = 'you'" class="font-semibold underline underline-offset-2 hover:text-amber-100">Exit</button>
+        </div>
+        <div v-else class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-600 text-white shadow-lg text-xs">
+          <Icon name="heroicons:eye" class="w-3.5 h-3.5" />
+          <span>Viewing as {{ viewAsLabel }}</span>
+          <button @click="viewAsMode = 'you'" class="font-semibold underline underline-offset-2 hover:text-indigo-200">Exit</button>
+        </div>
+        <!-- Delegated sources can't be impersonated: the preview binds this
+             user's identity parameters, but per-user-credential sources
+             (e.g. Power BI) still run as YOU — their rows may differ. -->
+        <div
+          v-if="credentialScoped"
+          class="flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-200 shadow text-[11px]"
+        >
+          <Icon name="heroicons:exclamation-triangle" class="w-3.5 h-3.5 shrink-0" />
+          <span>Identity parameters only — sources that authenticate per user still run with your credentials, so this user's actual rows may differ.</span>
+        </div>
+      </div>
       <!-- Loading State -->
       <div v-if="isLoading" class="absolute inset-0 flex items-center justify-center bg-white dark:bg-gray-900">
         <div class="flex flex-col items-center gap-3">
@@ -203,6 +324,28 @@
         class="absolute inset-0"
       />
 
+      <!-- Slides without previews: content.code is python-pptx source, which
+           the browser cannot render — never inject it into the iframe. -->
+      <div v-else-if="slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center bg-white dark:bg-gray-900">
+        <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 text-gray-400 mb-3" />
+        <template v-if="selectedArtifact?.status === 'failed'">
+          <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Slides generation failed</h3>
+          <p class="text-xs text-gray-400 mb-4 max-w-sm text-center">
+            The presentation could not be built. Ask the agent to regenerate the slides.
+          </p>
+        </template>
+        <template v-else>
+          <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Slide previews unavailable</h3>
+          <p class="text-xs text-gray-400 mb-4 max-w-sm text-center">
+            The deck was built, but preview images could not be generated on the server. You can still download the PowerPoint file.
+          </p>
+          <UButton @click="exportPptx" :disabled="isExporting" size="xs" color="purple" variant="soft">
+            <Icon name="heroicons:arrow-down-tray" class="w-4 h-4" />
+            Export PPTX
+          </UButton>
+        </template>
+      </div>
+
       <!-- Doc Mode - owner editing (TipTap) -->
       <DocEditor
         v-else-if="isDocMode && selectedArtifact && isEditingDoc"
@@ -214,6 +357,7 @@
         class="absolute inset-0"
         @save="saveDocEdit"
         @cancel="isEditingDoc = false"
+        @export-pdf="exportDocPdf"
       />
 
       <!-- Doc Mode - markdown document with live visualizations -->
@@ -247,8 +391,8 @@
         v-show="hasArtifact && !isLoading && !isPendingArtifact && !hasSlidesWithPreviews && !isDocMode && !snapshotWithheld && !iframeError && iframeSrcdoc"
         ref="iframeRef"
         :srcdoc="iframeSrcdoc"
-        sandbox="allow-scripts allow-same-origin"
-        class="absolute inset-0 w-full h-full border-0 bg-white z-0"
+        sandbox="allow-scripts allow-same-origin allow-downloads"
+        class="absolute inset-0 w-full h-full border-0 bg-white dark:bg-gray-900 z-0"
         @load="onIframeLoad"
       />
 
@@ -256,7 +400,7 @@
            slides render as page images through SlideViewer, so there is no
            iframe for the element picker to talk to) -->
       <div
-        v-if="hasArtifact && !isLoading && !isPendingArtifact && !snapshotWithheld && !iframeError && !isDocMode && !hasSlidesWithPreviews"
+        v-if="hasArtifact && !isLoading && !isPendingArtifact && !snapshotWithheld && !iframeError && !isDocMode && !hasSlidesWithPreviews && !slidesPreviewsMissing"
         class="absolute bottom-4 left-4 z-20"
       >
         <button
@@ -303,7 +447,7 @@
             :disabled="!polishInstruction.trim()"
             class="px-3 py-1.5 bg-indigo-500 text-white text-sm rounded-md hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
-            Apply
+            {{ $t('artifactFrame.apply') }}
           </button>
         </form>
       </div>
@@ -337,11 +481,16 @@
               :visualizations="visualizationsData"
               class="absolute inset-0"
             />
+            <!-- Slides without previews have no renderable content -->
+            <div v-else-if="isFullscreenOpen && slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center text-gray-400">
+              <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 mb-2" />
+              <span class="text-sm">Slide previews unavailable</span>
+            </div>
             <!-- Other artifacts use iframe -->
             <iframe
               v-else-if="isFullscreenOpen && iframeSrcdoc"
               :srcdoc="iframeSrcdoc"
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts allow-same-origin allow-downloads"
               class="absolute inset-0 w-full h-full border-0"
             />
           </div>
@@ -352,16 +501,18 @@
 </template>
 
 <script setup lang="ts">
+import type { ExportFormat } from '~/composables/useArtifactExports'
 import { ref, computed, onMounted, onUnmounted, watch, toRaw, nextTick } from 'vue';
 import { useMyFetch } from '~/composables/useMyFetch';
 import CronModal from '../CronModal.vue';
+import DataModal from './DataModal.vue';
 import ShareModal from '../ShareModal.vue';
 import Spinner from '../Spinner.vue';
 import SlideViewer from './SlideViewer.vue';
 import DocViewer from './DocViewer.vue';
 import DocEditor from './DocEditor.vue';
 import ViewerRunGate from './ViewerRunGate.vue';
-import { buildArtifactIframeHtml } from '~/utils/artifactIframe';
+import { buildArtifactIframeHtml, isHtmlSlidesCode } from '~/utils/artifactIframe';
 
 const { t } = useI18n();
 const toast = useToast();
@@ -375,9 +526,9 @@ const { relativeTime: formatRelativeTime } = useRelativeTime()
 async function copyArtifactId(id: string) {
   try {
     await navigator.clipboard.writeText(id);
-    toast.add({ title: 'Copied', description: 'Artifact ID copied to clipboard', color: 'green' });
+    toast.add({ title: t('artifactFrame.copied'), description: t('artifactFrame.artifactIdCopied'), color: 'green' });
   } catch {
-    toast.add({ title: 'Failed to copy', color: 'red' });
+    toast.add({ title: t('artifactFrame.copyFailed'), color: 'red' });
   }
 }
 
@@ -399,6 +550,12 @@ const props = defineProps<{
    *  version switches and refreshes always refetch. */
   latestArtifact?: any;
   artifactCode?: string;
+  /** Artifact the opener wants shown. Read as a mount-time seed, because the
+   *  `artifact:select` window event cannot reach a frame that has not mounted
+   *  yet — and this frame shares a v-if chain with ChatSummary, so opening the
+   *  summary unmounts it and every click from there arrives too early. A prop
+   *  is already reactive state on the page, so it survives the remount. */
+  requestedArtifactId?: string | null;
 }>();
 
 defineEmits<{
@@ -483,6 +640,9 @@ function submitPolishPrompt() {
 // Refresh Dashboard - reruns report queries and refreshes data
 async function refreshDashboard() {
   if (isRefreshing.value) return;
+  // Belt and braces with the button's :disabled — refreshing under view-as
+  // would resolve identity params as the caller, not the previewed member.
+  if (isViewAsActive.value) return;
 
   isRefreshing.value = true;
   isLoading.value = true;
@@ -521,7 +681,7 @@ async function refreshDashboard() {
     }
   } catch (error: any) {
     console.error('Failed to refresh dashboard:', error);
-    toast.add({ title: 'Error', description: `Failed to refresh dashboard. ${error.message || ''}`, color: 'red' });
+    toast.add({ title: t('artifactFrame.error'), description: t('artifactFrame.refreshDashboardFailed', { error: error.message || '' }), color: 'red' });
     // fetchData never ran, so clear the loading overlay it would have reset —
     // otherwise the dashboard stays hidden behind the spinner forever.
     isLoading.value = false;
@@ -541,6 +701,80 @@ function closeFullscreen() {
 }
 
 // Export artifact as PPTX
+function handleExport(format: ExportFormat) {
+  if (format === 'pdf') return exportPdf();
+  if (format === 'pptx') return exportPptx();
+  return exportHtml();
+}
+
+// Download the dashboard or deck as a PDF. Same headless-Chromium render the
+// emailed share already uses; the request can run for minutes, so this uses
+// native fetch (no ofetch retry to silently re-run the render) exactly like
+// the PPTX and HTML paths below.
+async function exportPdf() {
+  if (!selectedArtifactId.value || isExporting.value) return;
+
+  isExporting.value = true;
+  try {
+    const headers: Record<string, string> = {
+      Authorization: `${token.value}`,
+    };
+    if (organization.value?.id) {
+      headers['X-Organization-Id'] = organization.value.id;
+    }
+
+    const response = await fetch(
+      `${config.public.baseURL}/artifacts/${selectedArtifactId.value}/export/pdf`,
+      { method: 'GET', headers },
+    );
+
+    if (!response.ok) {
+      // The route reports actionable reasons (timed out, snapshot withheld,
+      // artifact never rendered) — surface them, not a bare status code.
+      let detail = `HTTP error! status: ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body?.detail) detail = String(body.detail);
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(detail);
+    }
+
+    // Same detachment as the other two paths: buffer the bytes and wrap them
+    // in a fresh local Blob so the download URL is never the remote response.
+    const arrayBuffer = await response.arrayBuffer();
+    const localBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
+
+    const rawTitle = selectedArtifact.value?.title || 'artifact';
+    const fallbackName =
+      `${String(rawTitle).replace(/[^\w\s.-]/g, '').trim().slice(0, 120) || 'artifact'}.pdf`;
+    const filename =
+      filenameFromDisposition(response.headers.get('Content-Disposition')) || fallbackName;
+
+    const url = window.URL.createObjectURL(localBlob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+
+    toast.add({ title: t('exports.complete'), description: t('exports.pdfDone') });
+  } catch (error: any) {
+    console.error('Failed to export PDF:', error);
+    toast.add({
+      title: t('exports.failed'),
+      description: error.message || t('exports.failed'),
+      color: 'red',
+    });
+  } finally {
+    isExporting.value = false;
+  }
+}
+
 async function exportPptx() {
   if (!selectedArtifactId.value || isExporting.value) return;
 
@@ -583,18 +817,428 @@ async function exportPptx() {
     document.body.removeChild(link);
     window.URL.revokeObjectURL(url);
 
-    toast.add({ title: 'Export complete', description: 'PowerPoint file downloaded successfully.' });
+    toast.add({ title: t('artifactFrame.exportComplete'), description: t('artifactFrame.exportPptxDone') });
   } catch (error: any) {
     console.error('Failed to export PPTX:', error);
-    toast.add({ title: 'Export failed', description: error.message || 'Failed to export PowerPoint file.', color: 'red' });
+    toast.add({ title: t('artifactFrame.exportFailed'), description: error.message || t('artifactFrame.exportPptxFailed'), color: 'red' });
   } finally {
     isExporting.value = false;
   }
 }
 
+/**
+ * Filename the server chose, honouring the RFC 5987 form first — dashboard
+ * titles are routinely non-Latin and only that form carries them intact.
+ */
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null;
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded[1].trim());
+    } catch {
+      /* fall through to the ASCII form */
+    }
+  }
+  const plain = /filename="([^"]+)"/i.exec(header);
+  return plain ? plain[1] : null;
+}
+
+// Export the dashboard as one standalone HTML file that works fully offline.
+async function exportHtml() {
+  if (!selectedArtifactId.value || isExporting.value) return;
+
+  isExporting.value = true;
+  try {
+    const headers: Record<string, string> = {
+      Authorization: `${token.value}`,
+    };
+    if (organization.value?.id) {
+      headers['X-Organization-Id'] = organization.value.id;
+    }
+
+    const response = await fetch(
+      `${config.public.baseURL}/artifacts/${selectedArtifactId.value}/export/html`,
+      { method: 'GET', headers },
+    );
+
+    if (!response.ok) {
+      // The route reports real, actionable reasons (missing vendored libs, a
+      // withheld snapshot) — surface them instead of a bare status code.
+      let detail = `HTTP error! status: ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body?.detail) detail = String(body.detail);
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(detail);
+    }
+
+    // Same detachment as the PPTX path: buffer the bytes and wrap them in a
+    // fresh local Blob so the download URL is never the remote response. That
+    // matters more here — the payload IS html, and handing the browser a
+    // remote text/html URL to open would run it in our origin.
+    const arrayBuffer = await response.arrayBuffer();
+    const localBlob = new Blob([arrayBuffer], { type: 'text/html' });
+
+    const rawTitle = selectedArtifact.value?.title || 'dashboard';
+    const fallbackName =
+      `${String(rawTitle).replace(/[^\w\s.-]/g, '').trim().slice(0, 120) || 'dashboard'}.html`;
+    const filename =
+      filenameFromDisposition(response.headers.get('Content-Disposition')) || fallbackName;
+
+    const url = window.URL.createObjectURL(localBlob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+
+    toast.add({
+      title: t('artifactFrame.exportComplete'),
+      description: t('artifactFrame.exportHtmlDone'),
+    });
+  } catch (error: any) {
+    console.error('Failed to export HTML:', error);
+    toast.add({
+      title: t('artifactFrame.exportFailed'),
+      description: error.message || t('artifactFrame.exportHtmlFailed'),
+      color: 'red',
+    });
+  } finally {
+    isExporting.value = false;
+  }
+}
+
+// Viewer identity for ARTIFACT_DATA.current_user (per-render, never stored on
+// the artifact). null until fetched — and stays null on any failure so the
+// dashboard renders anonymously instead of blocking.
+const viewerContext = ref<any>(null);
+async function fetchViewerContext() {
+  try {
+    const { data } = await useMyFetch('/api/users/me/viewer_context');
+    viewerContext.value = data.value || null;
+  } catch {
+    viewerContext.value = null;
+  }
+}
+
 const iframeRef = ref<HTMLIFrameElement | null>(null);
 const isLoading = ref(true);
+
+// App color mode, forwarded into the artifact iframe (initial srcdoc + live
+// toggle via postMessage so switching themes doesn't reload the artifact).
+const colorMode = useColorMode();
+// Plain (non-reactive) snapshot read by the srcdoc computed, so a mode toggle
+// updates the live iframe via postMessage instead of recomputing srcdoc and
+// reloading the artifact.
+let artifactColorMode: 'light' | 'dark' = colorMode.value === 'dark' ? 'dark' : 'light';
+watch(() => colorMode.value, (v) => {
+  artifactColorMode = v === 'dark' ? 'dark' : 'light';
+  iframeRef.value?.contentWindow?.postMessage(
+    { type: 'ARTIFACT_SET_COLOR_MODE', mode: artifactColorMode },
+    window.location.origin
+  );
+});
 const dataReady = ref(false);  // Guards iframeSrcdoc to prevent rendering before data loads
+
+// ── Query parameters ─────────────────────────────────────────────────────────
+// Declarations per query (qid → ParamSpec[]) and the current applied values.
+// Identity-source params never carry a client value — the server binds them
+// per viewer; the artifact only shows "scoped to you".
+const queryParamSpecs = ref<Record<string, any[]>>({});
+const paramValues = ref<Record<string, any>>({});
+// Host-resolved stable choices per param name: static declared options and
+// options-source query rows (the filter-space pattern — e.g. a 'Genres' query
+// feeding the genre control of 'Albums by Genre'). Controls read these via
+// useParamOptions(), never the filtered data itself.
+const paramOptions = ref<Record<string, Array<{ value: any; label: string }>>>({});
+const paramRunLoading = ref(false);
+// Highest ARTIFACT_SET_PARAMS seq received from the iframe; echoed back in
+// paramsPayload().ack so the runtime store can tell which of its in-flight
+// commits this data push reflects (older pushes must not clobber newer typing).
+let paramAckSeq = 0;
+// Latest run id per query — a slower, superseded run must not overwrite the
+// rows a newer run already delivered (the 'Si' echo landing after 'Sir').
+let paramRunCounter = 0;
+const latestParamRunForQid: Record<string, number> = {};
+// Snapshot embedded in the iframe's srcdoc; frozen per data load so live
+// param/view-as updates (postMessage) never trigger an iframe reload.
+const srcdocSeed = ref<any>(null);
+
+function paramsPayload() {
+  // Aggregate declarations by name: same-named params across queries render
+  // as ONE control that drives all of them.
+  const byName: Record<string, any> = {};
+  for (const [qid, specs] of Object.entries(queryParamSpecs.value)) {
+    for (const spec of specs || []) {
+      if (!byName[spec.name]) byName[spec.name] = { ...spec, query_ids: [] };
+      byName[spec.name].query_ids.push(qid);
+    }
+  }
+  return {
+    declarations: Object.values(byName),
+    values: { ...paramValues.value },
+    options: { ...paramOptions.value },
+    ack: paramAckSeq,
+  };
+}
+
+function normalizeStaticOptions(opts: any[]): Array<{ value: any; label: string }> {
+  return (opts || []).map((v: any) =>
+    (v && typeof v === 'object' && 'value' in v) ? v : { value: v, label: String(v) });
+}
+
+// Resolve each param's stable choice list. Options-source rows win over a
+// static list; a source query outside the artifact is fetched from the
+// report-level list once. Dedupe by value; label falls back to the value.
+async function resolveParamOptions(loadedQueries: any[], fetchAll: () => Promise<any[]>) {
+  const byId = new Map(loadedQueries.map((q: any) => [String(q.id), q]));
+  const out: Record<string, Array<{ value: any; label: string }>> = {};
+  let fetchedAll = false;
+  for (const specs of Object.values(queryParamSpecs.value)) {
+    for (const spec of (specs as any[]) || []) {
+      if (!spec?.name) continue;
+      if (!out[spec.name] && Array.isArray(spec.options) && spec.options.length) {
+        out[spec.name] = normalizeStaticOptions(spec.options);
+      }
+      const src = spec.options_source;
+      if (!src?.query_id) continue;
+      // Match by id, falling back to title — refs persisted from agent runs
+      // before server-side canonicalization name the query loosely.
+      const findSrc = () => {
+        const ref = String(src.query_id);
+        if (byId.has(ref)) return byId.get(ref);
+        const lowered = ref.toLowerCase();
+        for (const q of byId.values()) {
+          if (String(q?.title || '').toLowerCase() === lowered) return q;
+        }
+        return null;
+      };
+      let srcQ: any = findSrc();
+      if (!srcQ && !fetchedAll) {
+        fetchedAll = true;
+        try {
+          for (const q of await fetchAll()) byId.set(String(q.id), q);
+        } catch { /* options degrade to static/none */ }
+        srcQ = findSrc();
+      }
+      const rows = srcQ?.default_step?.data?.rows || srcQ?.__step_rows || [];
+      const seen = new Set<string>();
+      const opts: Array<{ value: any; label: string }> = [];
+      for (const r of rows) {
+        const value = r?.[src.value_column];
+        if (value === undefined || value === null) continue;
+        const key = String(value);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const label = src.label_column ? (r?.[src.label_column] ?? value) : value;
+        opts.push({ value, label: String(label) });
+      }
+      if (opts.length) out[spec.name] = opts;
+    }
+  }
+  derivedFallbackOptions(out, (qid) => {
+    const step = byId.get(String(qid))?.default_step;
+    return step ? { data: step.data, applied_params: step.applied_params } : null;
+  });
+  paramOptions.value = out;
+}
+
+// Last-resort options tier: an input param with neither static options nor an
+// options-source query still deserves a populated control. Derive stable
+// choices ONCE per load from the initially loaded rows of its declaring
+// queries, matching a column by (singularized) param name — e.g. genre_id →
+// GenreId, genres → GenreName. Computed only here, never on param-driven data
+// pushes, so the list cannot narrow itself to the current selection.
+function derivedFallbackOptions(
+  out: Record<string, Array<{ value: any; label: string }>>,
+  dataOfQuery: (qid: string) => any,
+) {
+  const norm = (s: any) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  for (const [qid, specs] of Object.entries(queryParamSpecs.value)) {
+    const entry = dataOfQuery(qid) || {};
+    const data = entry.data || entry;
+    const applied = entry.applied_params || {};
+    const rows = data.rows || [];
+    const cols: string[] = (data.columns || []).map((c: any) => c.field || c.headerName).filter(Boolean);
+    if (!rows.length || !cols.length) continue;
+    for (const spec of (specs as any[]) || []) {
+      if (!spec?.name || out[spec.name] || spec.source === 'identity') continue;
+      // A snapshot the param already filtered yields a degenerate one-value
+      // list — only derive when the snapshot ran with this param = All.
+      if (applied[spec.name] !== null && applied[spec.name] !== undefined) continue;
+      let n = norm(spec.name);
+      if (n.endsWith('s')) n = n.slice(0, -1);
+      const valueCol = cols.find(c => norm(c) === norm(spec.name))
+        || cols.find(c => norm(c) === n)
+        || cols.find(c => norm(c).startsWith(n))
+        || cols.find(c => norm(c).includes(n));
+      if (!valueCol) continue;
+      // Friendlier labels: for an id-ish column, use a name/title sibling
+      // sharing the stem (genre_id → genre_name) when one exists.
+      const stem = norm(valueCol).replace(/id$/, '');
+      const labelCol = stem
+        ? cols.find(c => [stem + 'name', stem + 'title', stem].includes(norm(c)) && c !== valueCol)
+        : null;
+      const seen = new Set<string>();
+      const opts: Array<{ value: any; label: string }> = [];
+      for (const r of rows) {
+        const value = r?.[valueCol];
+        if (value === undefined || value === null) continue;
+        const key = String(value);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        opts.push({ value, label: String(labelCol ? (r?.[labelCol] ?? value) : value) });
+        if (opts.length >= 200) break;
+      }
+      if (opts.length) out[spec.name] = opts;
+    }
+  }
+}
+
+function paramSubsetForQuery(qid: string) {
+  const out: Record<string, any> = {};
+  for (const spec of queryParamSpecs.value[qid] || []) {
+    if (spec.source === 'identity') continue; // server-resolved, client values rejected
+    if (Object.prototype.hasOwnProperty.call(paramValues.value, spec.name)) {
+      out[spec.name] = paramValues.value[spec.name];
+    }
+  }
+  return out;
+}
+
+function queriesWithIdentityParams(): string[] {
+  return Object.entries(queryParamSpecs.value)
+    .filter(([, specs]) => (specs || []).some((s: any) =>
+      s.source === 'identity' || s.source === 'input_identity_default'))
+    .map(([qid]) => qid);
+}
+
+function postParamsStatus(loading: boolean, error: string | null = null) {
+  paramRunLoading.value = loading;
+  try {
+    iframeRef.value?.contentWindow?.postMessage(
+      { type: 'ARTIFACT_PARAMS_STATUS', payload: { loading, error } },
+      window.location.origin,
+    );
+  } catch { /* iframe not ready */ }
+}
+
+// Execute the parameterized queries server-side (viewer mode: per-viewer
+// cached results, no new Step) and swap the fresh rows into the payload.
+async function runParamQueries(
+  changes: Record<string, any> | null,
+  targets: string[] | null = null,
+  opts: { force?: boolean; identityOnly?: boolean } = {},
+) {
+  const changedNames = Object.keys(changes || {});
+
+  // A name no query declares would silently no-op (nothing to run) — the
+  // classic generated-code bug of setParam('genre') vs a declared genre_id.
+  // Fail loudly into the params status channel instead.
+  const declaredNames = new Set(
+    Object.values(queryParamSpecs.value).flatMap((specs: any) =>
+      (specs || []).map((s: any) => s.name)));
+  const unknown = changedNames.filter(n => !declaredNames.has(n));
+  if (unknown.length) {
+    postParamsStatus(false,
+      `Unknown parameter(s): ${unknown.join(', ')} — declared: ${[...declaredNames].join(', ') || 'none'}. ` +
+      'Controls must call setParam with a declared param name.');
+    return;
+  }
+  for (const name of changedNames) paramValues.value[name] = (changes as any)[name];
+
+  let affected = Object.entries(queryParamSpecs.value)
+    .filter(([qid, specs]) => {
+      if (targets && !targets.includes(qid)) return false;
+      if (opts.identityOnly) {
+        return (specs || []).some((s: any) =>
+          s.source === 'identity' || s.source === 'input_identity_default');
+      }
+      if (!changedNames.length) return (specs || []).length > 0;
+      return (specs || []).some((s: any) => changedNames.includes(s.name));
+    })
+    .map(([qid]) => qid);
+  affected = [...new Set(affected)];
+  if (!affected.length) return;
+
+  const myRun = ++paramRunCounter;
+  for (const qid of affected) latestParamRunForQid[qid] = myRun;
+
+  postParamsStatus(true);
+  let firstError: string | null = null;
+  const runAs = (viewAsMode.value !== 'you' && viewAsMode.value !== 'anonymous')
+    ? viewAsMode.value : undefined;
+  await Promise.all(affected.map(async (qid) => {
+    try {
+      const { data: runRes, error } = await useMyFetch(`/api/queries/${qid}/run`, {
+        method: 'POST',
+        body: {
+          mode: 'viewer',
+          params: paramSubsetForQuery(qid),
+          force_refresh: !!opts.force,
+          ...(runAs ? { run_as_user_id: runAs } : {}),
+        },
+      });
+      const res: any = runRes.value;
+      if (error.value || !res || res.status !== 'success') {
+        const msg = (error.value as any)?.data?.detail || res?.error || 'Query run failed';
+        if (!firstError) firstError = String(msg);
+        return;
+      }
+      if (latestParamRunForQid[qid] !== myRun) return; // superseded mid-flight
+      for (const viz of visualizationsData.value) {
+        if (viz.queryId === qid) {
+          viz.rows = res.data?.rows || [];
+          viz.columns = res.data?.columns || [];
+          viz.stepStatus = 'success';
+        }
+      }
+    } catch (e: any) {
+      if (!firstError) firstError = e?.message || 'Query run failed';
+    }
+  }));
+  // New array identity so watchers fire and the fresh rows reach the iframe.
+  visualizationsData.value = [...visualizationsData.value];
+  // A fully superseded run stays quiet: the newer run owns the status line
+  // and will push its own (fresher) data.
+  if (myRun === paramRunCounter) {
+    postParamsStatus(false, firstError);
+    syncParamsToUrl();
+  }
+}
+
+// Shareable state: param values mirror into the URL (?qp_<name>=...) and are
+// restored on load.
+const paramRoute = useRoute();
+const paramRouter = useRouter();
+function syncParamsToUrl() {
+  try {
+    const q: Record<string, any> = { ...paramRoute.query };
+    for (const k of Object.keys(q)) if (k.startsWith('qp_')) delete q[k];
+    for (const [name, value] of Object.entries(paramValues.value)) {
+      if (value === null || value === undefined || value === '') continue;
+      q[`qp_${name}`] = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    }
+    paramRouter.replace({ query: q });
+  } catch { /* non-fatal */ }
+}
+function readParamsFromUrl(): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(paramRoute.query || {})) {
+    if (!k.startsWith('qp_') || v == null) continue;
+    const name = k.slice(3);
+    const raw = Array.isArray(v) ? v[0] : v;
+    try { out[name] = JSON.parse(String(raw)); }
+    catch { out[name] = String(raw); }
+  }
+  return out;
+}
 const iframeReady = ref(false);
 const visualizationsData = ref<any[]>([]);
 const filesData = ref<any[]>([]);
@@ -626,6 +1270,10 @@ const artifactsList = ref<ArtifactItem[]>([]);
 const selectedArtifactId = ref<string | undefined>(undefined);
 const selectedArtifact = ref<any>(null);
 
+// Availability of PDF / PPTX / HTML for whatever is on screen; the public
+// share page derives its list from the same composable.
+const { availableExports } = useArtifactExports(selectedArtifact)
+
 // Computed options for dropdown
 const artifactOptions = computed(() => {
   return artifactsList.value.map(a => ({
@@ -640,7 +1288,7 @@ const selectedArtifactLabel = computed(() => {
   if (selected) {
     return `${selected.title || 'Untitled'} (v${selected.version})`;
   }
-  return 'Select artifact...';
+  return t('artifactFrame.selectArtifact');
 });
 
 // Check if selected artifact is the latest (first in list, sorted by created_at desc)
@@ -677,6 +1325,16 @@ const hasSlidesWithPreviews = computed(() => {
   return Array.isArray(previewImages) && previewImages.length > 0;
 });
 
+// Slides artifact whose previews are missing (preview generation failed, or
+// the pptx build itself failed) and whose code is python-pptx source, not
+// legacy HTML slides. Such an artifact has nothing browser-renderable — show
+// the dedicated fallback instead of the iframe.
+const slidesPreviewsMissing = computed(() => {
+  if (selectedArtifact.value?.mode !== 'slides') return false;
+  if (hasSlidesWithPreviews.value) return false;
+  return !isHtmlSlidesCode(selectedArtifact.value?.content?.code || '');
+});
+
 // Doc mode: markdown document rendered by DocViewer (no iframe, no JSX)
 const isDocMode = computed(() => selectedArtifact.value?.mode === 'doc');
 const docMarkdown = computed(() => selectedArtifact.value?.content?.markdown || '');
@@ -691,12 +1349,148 @@ const isReportOwner = computed(() => {
 const isEditingDoc = ref(false);
 const docEditorRef = ref<any>(null);
 
+// --- Rename the dashboard ------------------------------------------------
+// "The dashboard" is two records to the user: the report (its card on
+// /dashboards, the sidebar entry, the browser tab) and the selected artifact
+// version (the label in the dropdown above, the /r/{id} tab). Renaming one
+// without the other looked like the rename silently failed, so both are
+// written. Both endpoints are owner-only (update_reports + owner_only), so
+// the pencil is hidden for everyone else rather than failing on click.
+const isRenaming = ref(false);
+const renameDraft = ref('');
+const isSavingRename = ref(false);
+const renameInputRef = ref<any>(null);
+
+const canRename = computed(() =>
+  isReportOwner.value && !!selectedArtifactId.value && !isPendingArtifact.value);
+
+function currentArtifactTitle(): string {
+  const item = artifactsList.value.find(a => a.id === selectedArtifactId.value);
+  const title = item?.title || selectedArtifact.value?.title || '';
+  // The model default is a placeholder, not a name worth editing around.
+  return title === 'Untitled Artifact' ? '' : title;
+}
+
+async function startRename() {
+  if (!canRename.value) return;
+  renameDraft.value = currentArtifactTitle();
+  isRenaming.value = true;
+  await nextTick();
+  const el = renameInputRef.value?.$el?.querySelector?.('input') || renameInputRef.value?.input;
+  el?.focus?.();
+  el?.select?.();
+}
+
+function cancelRename() {
+  if (isSavingRename.value) return;
+  isRenaming.value = false;
+  renameDraft.value = '';
+}
+
+async function saveRename() {
+  const id = selectedArtifactId.value;
+  const title = renameDraft.value.trim();
+  if (!id || !title || isSavingRename.value) return;
+  if (title === currentArtifactTitle()) { cancelRename(); return; }
+
+  isSavingRename.value = true;
+  try {
+    const { data, error } = await useMyFetch(`/api/artifacts/${id}`, {
+      method: 'PATCH',
+      body: { title },
+    });
+    if (error.value) throw error.value;
+
+    const saved = (data.value as any)?.title || title;
+
+    // The report title is what every list renders (see /dashboards). Keep it
+    // in step, then tell the page and the sidebar — the same event
+    // loadReport() fires when the server generates a title.
+    if (props.report?.id) {
+      const { error: reportError } = await useMyFetch(`/api/reports/${props.report.id}`, {
+        method: 'PUT',
+        body: { title: saved },
+      });
+      if (reportError.value) throw reportError.value;
+      window.dispatchEvent(new CustomEvent('report:updated', {
+        detail: { id: props.report.id, title: saved },
+      }));
+    }
+    // Patch local state instead of refetching: the list endpoint is the same
+    // one the report page seeds us from, and a refetch would race an
+    // in-flight generation and could snap the selection.
+    artifactsList.value = artifactsList.value.map(a => a.id === id ? { ...a, title: saved } : a);
+    if (selectedArtifact.value?.id === id) {
+      selectedArtifact.value = { ...selectedArtifact.value, title: saved };
+    }
+    isRenaming.value = false;
+    renameDraft.value = '';
+    toast.add({ title: t('artifactFrame.renamed'), color: 'green' });
+  } catch (e: any) {
+    console.error('[ArtifactFrame] Failed to rename artifact:', e);
+    toast.add({
+      title: t('artifactFrame.error'),
+      description: e?.data?.detail?.message || e?.data?.detail || t('artifactFrame.renameFailed'),
+      color: 'red',
+    });
+  } finally {
+    isSavingRename.value = false;
+  }
+}
+
+// Switching versions mid-edit would silently retarget the save.
+watch(selectedArtifactId, () => { if (isRenaming.value) cancelRename(); });
+
+// --- Overflow (⋯) menu ---------------------------------------------------
+type MenuItem = { label: string; icon: string; click: () => void; disabled?: boolean };
+
+// Groups render with dividers between them (Nuxt UI takes an array of
+// arrays). Empty groups are dropped so no divider ever leads nowhere.
+const moreMenuItems = computed<MenuItem[][]>(() => {
+  const edit: MenuItem[] = [];
+  if (canRename.value) {
+    edit.push({ label: t('artifactFrame.rename'), icon: 'i-heroicons-pencil', click: startRename });
+  }
+
+  // The .md source download is doc-only; PDF/PPTX/HTML come from
+  // useArtifactExports so this menu and the public share page agree on what
+  // a given artifact can produce.
+  const exports: MenuItem[] = [];
+  if (isDocMode.value && !isEditingDoc.value) {
+    exports.push({ label: t('docViewer.exportMarkdown'), icon: 'i-heroicons-arrow-down-tray', click: exportDocMarkdown });
+  }
+  for (const option of availableExports.value) {
+    exports.push({
+      label: t('artifactFrame.exportAs', { format: option.label }),
+      icon: option.icon,
+      disabled: isExporting.value,
+      click: () => handleExport(option.format),
+    });
+  }
+
+  const view: MenuItem[] = [
+    { label: t('artifactFrame.fullScreen'), icon: 'i-heroicons-arrows-pointing-out', click: openFullscreen },
+  ];
+  if (props.report) {
+    // /r/{id} itself enforces access — an unshared report is still viewable
+    // there by its owner.
+    view.push({ label: t('artifactFrame.openInNewTab'), icon: 'i-heroicons-arrow-top-right-on-square', click: () => window.open(`/r/${props.report.id}`, '_blank', 'noopener') });
+  }
+
+  return [edit, exports, view].filter(g => g.length > 0);
+});
+
 // --- Viewer-run gate state (per-user dashboards viewed by a non-owner) ---
 // True when the backend hid the shared snapshot from this reader
 // (viewer-identity sharing on user-scoped sources, or RLS): steps arrive with
 // snapshot_withheld and empty data, and rendering the artifact against them
 // crashes generated code that assumes rows exist. Mirror of /r/[id].
 const snapshotWithheld = ref(false);
+// True when any of the dashboard's queries reads a delegated (per-user
+// credential) source: View-as swaps identity params only — source-level rows
+// still come back under the caller's own credentials, so the preview must
+// carry a note saying the impersonated user's actual rows may differ.
+const credentialScoped = ref(false);
 // True when any step already carries this user's own per-viewer result row —
 // auto-run only fires for a first-time viewer; a failed earlier run becomes an
 // explicit fallback state instead of a retry loop.
@@ -755,6 +1549,122 @@ async function runAsViewer() {
   }
 }
 
+// "View as" preview (page artifacts): render the dashboard as another viewer
+// would see it — anonymous, or any org member (picked by name/email search).
+// IDENTITY ONLY — current_user is swapped, but the data payload is untouched:
+// per-viewer data scoping happens server-side (viewer runs / RLS), so this
+// must never be presented as an access check.
+// NOTE: declared after selectedArtifact/isPendingArtifact/snapshotWithheld —
+// the immediate watch below evaluates canViewAs during setup, so the refs it
+// reads must already be initialized.
+const viewAsMode = ref<string>('you');  // 'you' | 'anonymous' | <member user_id>
+const previewViewer = ref<any>(null);   // fetched context of the picked member
+// True when the picked member's viewer_context fetch failed or came back
+// empty. The render still falls back to anonymous (never the wrong person),
+// but the banner must SAY so — a banner claiming "Viewing as X" over an
+// anonymous payload silently misrepresents what's on screen.
+const previewViewerFailed = ref(false);
+// True while a view-as switch is settling (member context fetch + identity
+// param re-run + data push). Drives a full-pane spinner so the transient
+// anonymous fallback never flashes as if it were the final render.
+const previewLoading = ref(false);
+const membersList = ref<any[]>([]);
+const canViewAs = computed(() =>
+  selectedArtifact.value?.mode === 'page' && !isPendingArtifact.value && !snapshotWithheld.value);
+
+// Previewing as somebody else. Only the per-query run (/api/queries/{id}/run)
+// carries run_as_user_id; both refresh endpoints resolve identity from the
+// caller, so refreshing here would silently swap the slice on screen — and,
+// for the owner, persist THEIR slice into the snapshot every reader sees.
+// Exit view-as first.
+const isViewAsActive = computed(() => canViewAs.value && viewAsMode.value !== 'you');
+
+const viewAsOptions = computed(() => [
+  { value: 'you', label: 'You', email: (viewerContext.value?.email as string) || '' },
+  { value: 'anonymous', label: 'Anonymous user', email: '' },
+  ...membersList.value
+    .filter((m: any) => m.user?.id && String(m.user.id) !== String(viewerContext.value?.id))
+    .map((m: any) => ({
+      value: String(m.user.id),
+      label: m.user.name || m.user.email || m.email || 'Member',
+      email: m.user.email || m.email || '',
+    })),
+]);
+
+const viewAsLabel = computed(() => {
+  if (viewAsMode.value === 'you') return t('artifactFrame.viewAs');
+  if (viewAsMode.value === 'anonymous') return t('artifactFrame.anonymousUser');
+  const opt = viewAsOptions.value.find(o => o.value === viewAsMode.value);
+  return opt?.label || 'Member';
+});
+
+const effectiveViewerContext = computed(() => {
+  if (viewAsMode.value === 'anonymous') return null;
+  if (viewAsMode.value === 'you') return viewerContext.value;
+  // A member is picked but their context hasn't resolved yet → render
+  // anonymously rather than as the wrong person.
+  return previewViewer.value;
+});
+
+// Members load lazily, once, when the picker becomes available.
+let membersFetched = false;
+async function fetchMembersList() {
+  if (membersFetched || !organization.value?.id) return;
+  membersFetched = true;
+  try {
+    const { data } = await useMyFetch(`/api/organizations/${organization.value.id}/members`);
+    membersList.value = Array.isArray(data.value) ? (data.value as any[]) : [];
+  } catch {
+    membersList.value = [];
+  }
+}
+watch(canViewAs, (v) => { if (v) fetchMembersList(); }, { immediate: true });
+
+async function fetchPreviewViewer(memberId: string) {
+  previewViewerFailed.value = false;
+  try {
+    const { data, error } = await useMyFetch(`/api/users/${memberId}/viewer_context`);
+    previewViewer.value = (!error.value && data.value) ? data.value : null;
+  } catch {
+    previewViewer.value = null;
+  }
+  if (!previewViewer.value) previewViewerFailed.value = true;
+}
+
+async function retryPreviewViewer() {
+  const mode = viewAsMode.value;
+  if (mode === 'you' || mode === 'anonymous') return;
+  await fetchPreviewViewer(mode);
+  if (iframeReady.value) sendDataToIframe();
+}
+
+watch(viewAsMode, async (mode) => {
+  previewViewer.value = null;
+  previewViewerFailed.value = false;
+  previewLoading.value = true;
+  try {
+    if (mode !== 'you' && mode !== 'anonymous') {
+      await fetchPreviewViewer(mode);
+    }
+    // Identity-scoped queries re-run as the previewed member (server-verified:
+    // owner/admin only; results are preview-only, cached under the CALLER).
+    // Back to 'you' re-scopes to the caller's own slice. Anonymous is
+    // identity-display only — the data path needs an authenticated identity.
+    try {
+      if (mode !== 'anonymous' && queriesWithIdentityParams().length) {
+        await runParamQueries(null, null, { identityOnly: true });
+      }
+    } catch (e) {
+      console.error('[ArtifactFrame] View-as param re-run failed:', e);
+    }
+    // Swapping identity re-sends data into an already-mounted iframe (srcdoc
+    // also recomputes, but postMessage covers the no-reload path).
+    if (iframeReady.value) sendDataToIframe();
+  } finally {
+    previewLoading.value = false;
+  }
+});
+
 // Docs open in edit mode by default for the report owner; everyone else gets
 // the read-only viewer. Keyed on the loaded artifact so mode + ownership are
 // known (selectedArtifactId changes before the artifact finishes fetching).
@@ -790,18 +1700,17 @@ async function saveDocEdit(markdown: string) {
   }
 }
 
-// Print the doc (browser print dialog → full-fidelity PDF with live charts).
-// A temporary root class isolates the DocViewer via the print stylesheet.
-function printDoc() {
-  document.documentElement.classList.add('printing-doc');
-  const cleanup = () => {
-    document.documentElement.classList.remove('printing-doc');
-    window.removeEventListener('afterprint', cleanup);
-  };
-  window.addEventListener('afterprint', cleanup);
-  // Fallback cleanup for browsers that don't fire afterprint reliably
-  setTimeout(cleanup, 2000);
-  window.print();
+// PDF from the editor toolbar. The server renders the SAVED document, so
+// exporting mid-edit would quietly hand back yesterday's text — say so instead.
+function exportDocPdf() {
+  if (docEditorRef.value?.hasUnsavedChanges?.()) {
+    toast.add({
+      title: t('docEditor.unsavedForExport'),
+      color: 'amber',
+    });
+    return;
+  }
+  exportPdf();
 }
 
 // Download the doc's markdown source
@@ -861,7 +1770,7 @@ async function useThisVersion() {
       selectedArtifactId.value = (data.value as any).id;
     }
 
-    toast.add({ title: 'Version set as default', color: 'green' });
+    toast.add({ title: t('artifactFrame.versionSetDefault'), color: 'green' });
 
     // The revert emits a silent artifact_version_reverted session event
     // server-side — reload the timeline so its strip appears (no websocket).
@@ -870,33 +1779,68 @@ async function useThisVersion() {
     }));
   } catch (error: any) {
     console.error('Failed to set version as default:', error);
-    toast.add({ title: 'Error', description: 'Failed to set version as default.', color: 'red' });
+    toast.add({ title: t('artifactFrame.error'), description: t('artifactFrame.versionSetDefaultFailed'), color: 'red' });
   } finally {
     isDuplicating.value = false;
   }
 }
 
 // Handle artifact:select event (select a specific artifact by ID)
-function handleArtifactSelect(event: Event) {
+async function handleArtifactSelect(event: Event) {
   const artifactId = (event as CustomEvent).detail?.artifact_id;
-  if (artifactId && artifactsList.value.some(a => a.id === artifactId)) {
+  if (!artifactId) return;
+  // Unknown id ≠ bad id: the list may simply be stale (artifact created while
+  // the pane was closed, a missed artifact:created event, another tab).
+  // Refresh once and retry instead of silently dropping the user's click.
+  if (!artifactsList.value.some(a => a.id === artifactId)) {
+    await fetchArtifactsList(true);
+  }
+  if (artifactsList.value.some(a => a.id === artifactId)) {
     selectedArtifactId.value = artifactId;
   }
 }
 
-// Handle artifact:created event (refresh list and select new artifact)
-async function handleArtifactCreated(event: Event) {
-  const artifactId = (event as CustomEvent).detail?.artifact_id;
+// A creation from a run this viewer didn't start (another tab, another user,
+// a scheduled run) — offered via a pill instead of taking over the pane.
+const offeredArtifactId = ref<string | null>(null);
+
+async function acceptOfferedArtifact() {
+  const id = offeredArtifactId.value;
+  offeredArtifactId.value = null;
+  if (!id) return;
+  await switchToArtifact(id);
+}
+
+async function switchToArtifact(artifactId: string) {
   // Reset dataReady BEFORE selecting the new artifact so iframeSrcdoc doesn't
   // render new code (with viz[N] refs) against stale visualization data.
   dataReady.value = false;
   await fetchArtifactsList(true);
+  selectedArtifactId.value = artifactId;
+  // Force refetch in case same artifact transitioned from pending to completed
+  await fetchSelectedArtifact();
+  // Fetch visualization data for the new artifact before rendering
+  await fetchData(artifactId);
+}
+
+// Handle artifact:created event (refresh list; select the new artifact only
+// when the creation belongs to this viewer's own run — select !== false —
+// or updates the artifact already on screen)
+async function handleArtifactCreated(event: Event) {
+  const detail = (event as CustomEvent).detail || {};
+  const artifactId = detail.artifact_id;
+  const takeover = detail.select !== false;
+  if (!takeover && artifactId && selectedArtifactId.value &&
+      artifactId !== selectedArtifactId.value) {
+    await fetchArtifactsList(true);
+    offeredArtifactId.value = artifactId;
+    return;
+  }
   if (artifactId) {
-    selectedArtifactId.value = artifactId;
-    // Force refetch in case same artifact transitioned from pending to completed
-    await fetchSelectedArtifact();
-    // Fetch visualization data for the new artifact before rendering
-    await fetchData(artifactId);
+    await switchToArtifact(artifactId);
+  } else {
+    dataReady.value = false;
+    await fetchArtifactsList(true);
   }
 }
 
@@ -906,8 +1850,17 @@ onMounted(async () => {
   window.addEventListener('artifact:select', handleArtifactSelect);
   window.addEventListener('artifact:created', handleArtifactCreated);
 
-  // First fetch artifact list to know which artifact is selected
-  await fetchArtifactsList();
+  // Honour an explicit open request before anything auto-selects. Seeding here
+  // (not via the event) makes the choice independent of mount timing:
+  // fetchArtifactsList only auto-picks artifactsList[0] when nothing is
+  // selected, so with this set it leaves the requested artifact alone.
+  if (props.requestedArtifactId) {
+    selectedArtifactId.value = props.requestedArtifactId;
+  }
+
+  // First fetch artifact list to know which artifact is selected (viewer
+  // identity in parallel — it gates nothing, a failure just renders anonymous)
+  await Promise.all([fetchArtifactsList(), fetchViewerContext()]);
 
   // Load the selected artifact exactly once after initial selection. The
   // report page already fetched the latest artifact; reuse that object when
@@ -935,13 +1888,26 @@ onMounted(async () => {
     autoRunTried.value = true;
     await runAsViewer();
   }
+
+  // Paint first, refresh second (refresh_on_view, default-on): the server
+  // enforces the flag, a staleness gate, and a cross-worker single-flight
+  // claim, so this is at most one owner-credential rerun per interval no
+  // matter how many people open the page. Mirrors the /r host.
+  try {
+    const { data } = await useMyFetch(`/api/r/${props.reportId}/rerun`, { method: 'POST' });
+    const run: any = data.value;
+    if (run && !run.skipped && run.steps_succeeded) await refreshAll();
+  } catch { /* a failed background refresh must never break a rendered page */ }
 });
 
 // Fetch list of all artifacts for the report
 async function fetchArtifactsList(force = false) {
   try {
     let artifacts: ArtifactItem[] | null = null;
-    if (!force && Array.isArray(props.artifacts)) {
+    // An EMPTY prop array is "not seeded yet", not an answer: the report page
+    // fetches the report once, so a pane opened after an artifact was created
+    // would otherwise trust a stale [] and show "No artifacts yet" forever.
+    if (!force && Array.isArray(props.artifacts) && props.artifacts.length > 0) {
       artifacts = props.artifacts;
     } else {
       const { data } = await useMyFetch(`/artifacts/report/${props.reportId}`);
@@ -952,15 +1918,23 @@ async function fetchArtifactsList(force = false) {
     if (artifacts) {
       artifactsList.value = [...artifacts];
 
-      // Auto-select the most recent artifact
+      // Auto-select the most recent artifact — but never move a deliberate
+      // selection: only when nothing is selected yet or the selected id no
+      // longer exists (refreshes used to snap the pane to the newest).
       if (artifactsList.value.length > 0) {
-        selectedArtifactId.value = artifactsList.value[0].id;
+        const stillExists = !!selectedArtifactId.value &&
+          artifactsList.value.some(a => a.id === selectedArtifactId.value);
+        if (!stillExists) selectedArtifactId.value = artifactsList.value[0].id;
       }
     }
   } catch (e) {
     console.log('[ArtifactFrame] No artifacts found');
   }
 }
+
+watch(selectedArtifactId, (id) => {
+  if (id && id === offeredArtifactId.value) offeredArtifactId.value = null;
+});
 
 // Fetch the full artifact content when selection changes
 async function fetchSelectedArtifact() {
@@ -990,6 +1964,7 @@ watch(selectedArtifactId, async (newId, oldId) => {
   if (oldId === undefined) return;
   iframeError.value = null;
   iframeReady.value = false;
+  viewAsMode.value = 'you';
   if (isPolishMode.value) exitPolishMode();
   await fetchSelectedArtifact();
   // Only refetch data if this is a user-initiated change (not initial load)
@@ -1020,6 +1995,17 @@ function handleIframeMessage(event: MessageEvent) {
     polishPromptVisible.value = true;
     polishInstruction.value = '';
     nextTick(() => polishInputRef.value?.focus());
+  } else if (event.data?.type === 'ARTIFACT_SET_PARAMS') {
+    // A control in the artifact committed param changes: run the consuming
+    // queries server-side and push fresh rows back down.
+    if (event.source === iframeRef.value?.contentWindow) {
+      paramAckSeq = Math.max(paramAckSeq, Number(event.data.seq) || 0);
+      runParamQueries(event.data.changes || {}, event.data.targets || null, {});
+    }
+  } else if (event.data?.type === 'ARTIFACT_REFRESH_PARAMS') {
+    if (event.source === iframeRef.value?.contentWindow) {
+      runParamQueries(null, event.data.targets || null, { force: true });
+    }
   }
 }
 
@@ -1030,7 +2016,9 @@ function sendDataToIframe() {
   const payload = JSON.parse(JSON.stringify({
     report: toRaw(reportData.value),
     visualizations: toRaw(visualizationsData.value),
-    files: toRaw(filesData.value)
+    files: toRaw(filesData.value),
+    current_user: toRaw(effectiveViewerContext.value),
+    params: paramsPayload()
   }));
 
   try {
@@ -1084,13 +2072,25 @@ async function fetchData(artifactId?: string) {
     const vizData: any[] = [];
     let anyWithheld = false;
     let anyOwnResult = false;
+    let anyCredentialScoped = false;
     let failedReason: string | null = null;
 
+    const nextParamSpecs: Record<string, any[]> = {};
     for (let qi = 0; qi < queries.length; qi++) {
       const query = queries[qi];
       // list_queries already embeds the viewer-safe default Step. Re-fetching
       // it once per query duplicated the dashboard waterfall and payload.
       const step = query.default_step;
+
+      // Declared query parameters (ParamSpec dicts) drive artifact controls.
+      if (Array.isArray(query.parameters) && query.parameters.length) {
+        nextParamSpecs[query.id] = query.parameters;
+      }
+
+      // Delegated (per-user credential) sources: View-as can only swap
+      // identity params, not the target's source credentials — the note on
+      // the View-as control keys off this.
+      if (query.credential_scoped) anyCredentialScoped = true;
 
       // Per-viewer step-data policy markers: withheld snapshots gate the
       // render; an existing per-viewer result row gates auto-run.
@@ -1115,8 +2115,35 @@ async function fetchData(artifactId?: string) {
           code: step?.code || '',
           description: viz.description || query.description || step?.description || '',
           dataSource: singleDataSourceName,
+          queryId: query.id,
         });
       }
+    }
+    queryParamSpecs.value = nextParamSpecs;
+
+    // Stable control choices (static options + options-source query rows).
+    await resolveParamOptions(queries, async () => {
+      const { data } = await useMyFetch(`/api/queries?report_id=${props.reportId}`);
+      return Array.isArray(data.value) ? (data.value as any[]) : [];
+    });
+
+    // Initialize applied values: declaration defaults, overridden by any
+    // qp_<name> URL state (shareable dashboards). Identity params carry no
+    // client value — the server binds them per viewer.
+    {
+      const urlValues = readParamsFromUrl();
+      const nextValues: Record<string, any> = {};
+      for (const specs of Object.values(nextParamSpecs)) {
+        for (const spec of specs as any[]) {
+          if (spec.source === 'identity') continue;
+          if (Object.prototype.hasOwnProperty.call(urlValues, spec.name)) {
+            nextValues[spec.name] = urlValues[spec.name];
+          } else if (spec.default !== undefined && spec.default !== null) {
+            nextValues[spec.name] = spec.default;
+          }
+        }
+      }
+      paramValues.value = nextValues;
     }
 
     // Reorder vizData to match artifact's visualization_ids order
@@ -1136,6 +2163,7 @@ async function fetchData(artifactId?: string) {
     }
     snapshotWithheld.value = anyWithheld;
     hasOwnResult.value = anyOwnResult;
+    credentialScoped.value = anyCredentialScoped;
     viewerRunFailedReason.value = failedReason;
     console.log('[ArtifactFrame] Fetched', visualizationsData.value.length, 'visualizations');
 
@@ -1149,6 +2177,33 @@ async function fetchData(artifactId?: string) {
       console.error('[ArtifactFrame] Failed to fetch embedded files:', e);
       filesData.value = [];
     }
+
+    // Identity-scoped queries apply the viewer's identity BEFORE first paint:
+    // the shared snapshot is the creator's slice, so run those queries as the
+    // viewer now (server binds identity; results are per-viewer cached, so a
+    // revisit is a cache hit). URL-restored input values apply here too.
+    try {
+      const urlValueNames = Object.keys(readParamsFromUrl());
+      if (urlValueNames.length) {
+        await runParamQueries(null, null, {});
+      } else if (queriesWithIdentityParams().length) {
+        await runParamQueries(null, null, { identityOnly: true });
+      }
+    } catch (e) {
+      console.error('[ArtifactFrame] Initial param run failed:', e);
+    }
+
+    // Freeze the srcdoc seed: the iframe's initial document embeds THIS
+    // snapshot. Later updates (param runs, view-as swaps) flow via
+    // postMessage into the live data store — never by recomputing srcdoc,
+    // which would reload the iframe and lose control state.
+    srcdocSeed.value = JSON.parse(JSON.stringify({
+      report: toRaw(reportData.value),
+      visualizations: toRaw(visualizationsData.value),
+      files: toRaw(filesData.value),
+      current_user: toRaw(effectiveViewerContext.value),
+      params: paramsPayload(),
+    }));
 
     // Mark data as ready - triggers iframeSrcdoc to compute with loaded data
     dataReady.value = true;
@@ -1195,13 +2250,13 @@ function App() {
   const { report, visualizations } = data;
 
   return (
-    <div className="min-h-full bg-gradient-to-br from-slate-50 to-slate-100 p-8">
+    <div className="min-h-full bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-900 dark:to-slate-950 p-8">
       {/* Header */}
       <div className="mb-8">
-        <h1 className="text-3xl font-bold text-gray-900 tracking-tight">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100 tracking-tight">
           {report?.title || 'Dashboard'}
         </h1>
-        <p className="text-sm text-gray-500 mt-2">
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">
           {visualizations.length} visualization{visualizations.length !== 1 ? 's' : ''} available
         </p>
       </div>
@@ -1209,13 +2264,13 @@ function App() {
       {/* Empty state */}
       {visualizations.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-center">
-          <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-4">
+          <div className="w-16 h-16 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mb-4">
             <svg className="w-8 h-8 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
           </div>
-          <h3 className="text-lg font-medium text-gray-900 mb-1">No visualizations yet</h3>
-          <p className="text-sm text-gray-500 max-w-sm">
+          <h3 className="text-lg font-medium text-gray-900 dark:text-gray-100 mb-1">No visualizations yet</h3>
+          <p className="text-sm text-gray-500 dark:text-gray-400 max-w-sm">
             Ask the agent to create visualizations, then generate an artifact to see them here.
           </p>
         </div>
@@ -1262,9 +2317,9 @@ function VisualizationCard({ viz }) {
   const viewType = viz.view?.view?.type || viz.view?.type || viz.dataModel?.type || 'table';
 
   return (
-    <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden hover:shadow-md transition-shadow">
-      <div className="px-5 py-4 border-b border-gray-50">
-        <h3 className="font-semibold text-gray-900">{viz.title}</h3>
+    <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden hover:shadow-md transition-shadow">
+      <div className="px-5 py-4 border-b border-gray-50 dark:border-gray-800">
+        <h3 className="font-semibold text-gray-900 dark:text-gray-100">{viz.title}</h3>
         <span className="text-xs text-gray-400 uppercase tracking-wide">{viewType}</span>
       </div>
       <div className="p-5">
@@ -1280,7 +2335,7 @@ function VisualizationCard({ viz }) {
           </div>
         )}
       </div>
-      <div className="px-5 py-3 bg-gray-50/50 text-xs text-gray-500">
+      <div className="px-5 py-3 bg-gray-50/50 dark:bg-gray-800/50 text-xs text-gray-500 dark:text-gray-400">
         {viz.rows?.length || 0} rows
       </div>
     </div>
@@ -1294,12 +2349,12 @@ function TableView({ data }) {
     : Object.keys(rows[0] || {});
 
   return (
-    <div className="overflow-x-auto max-h-72 rounded-lg border border-gray-100">
+    <div className="overflow-x-auto max-h-72 rounded-lg border border-gray-100 dark:border-gray-700">
       <table className="w-full text-sm">
-        <thead className="bg-gray-50 sticky top-0">
+        <thead className="bg-gray-50 dark:bg-gray-800 sticky top-0">
           <tr>
             {cols.slice(0, 6).map((col) => (
-              <th key={col} className="text-left px-3 py-2 font-medium text-gray-600 border-b border-gray-100">
+              <th key={col} className="text-left px-3 py-2 font-medium text-gray-600 dark:text-gray-300 border-b border-gray-100 dark:border-gray-700">
                 {col}
               </th>
             ))}
@@ -1307,9 +2362,9 @@ function TableView({ data }) {
         </thead>
         <tbody>
           {rows.slice(0, 10).map((row, i) => (
-            <tr key={i} className="border-b border-gray-50 hover:bg-gray-50/50">
+            <tr key={i} className="border-b border-gray-50 dark:border-gray-800 hover:bg-gray-50/50 dark:hover:bg-gray-800/50">
               {cols.slice(0, 6).map((col) => (
-                <td key={col} className="px-3 py-2 text-gray-700">
+                <td key={col} className="px-3 py-2 text-gray-700 dark:text-gray-200">
                   {formatValue(row[col] ?? row[col.toLowerCase()])}
                 </td>
               ))}
@@ -1318,7 +2373,7 @@ function TableView({ data }) {
         </tbody>
       </table>
       {rows.length > 10 && (
-        <div className="text-xs text-gray-400 p-2 text-center bg-gray-50">
+        <div className="text-xs text-gray-400 p-2 text-center bg-gray-50 dark:bg-gray-800">
           Showing 10 of {rows.length} rows
         </div>
       )}
@@ -1463,6 +2518,10 @@ const iframeSrcdoc = computed(() => {
   // ViewerRunGate covers this state until the viewer's own run resolves it.
   if (snapshotWithheld.value) return undefined;
 
+  // Slides without previews carry python-pptx source; it must never be
+  // injected into the iframe (the browser would render it as raw text).
+  if (slidesPreviewsMissing.value) return undefined;
+
   // If artifacts exist, wait for the selected artifact to be fully loaded
   if (artifactsList.value.length > 0 && !selectedArtifact.value?.content?.code) return undefined;
 
@@ -1471,17 +2530,23 @@ const iframeSrcdoc = computed(() => {
     || selectedArtifact.value?.content?.code
     || sampleArtifactCode.value;
 
+  // Frozen seed (set once per data load) so live updates don't reload the
+  // iframe; falls back to live refs for the pre-data sample path.
+  const seed = srcdocSeed.value || {
+    report: reportData.value,
+    visualizations: visualizationsData.value,
+    files: filesData.value,
+    current_user: effectiveViewerContext.value,
+    params: paramsPayload(),
+  };
   return buildArtifactIframeHtml({
-    data: {
-      report: reportData.value,
-      visualizations: visualizationsData.value,
-      files: filesData.value,
-    },
+    data: seed,
     code: artifactCode,
     mode: selectedArtifact.value?.mode || 'page',
     polishMode: true,
     loadingLabel: t('artifactFrame.loadingArtifact'),
     reactBuild: 'development',
+    colorMode: artifactColorMode,
   });
 });
 

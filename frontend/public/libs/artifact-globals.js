@@ -17,9 +17,59 @@
   window.useMemo = React.useMemo;
   window.useCallback = React.useCallback;
 
+  // ── Live data store ─────────────────────────────────────────────────────────
+  // The host can push fresh ARTIFACT_DATA at any time (param changes, view-as
+  // swaps) via postMessage without reloading the iframe. Components subscribe
+  // through useArtifactData()/useParams() and re-render on push.
+  window.__artifactDataListeners = [];
+  function notifyArtifactData() {
+    for (var i = 0; i < window.__artifactDataListeners.length; i++) {
+      try { window.__artifactDataListeners[i](); } catch (e) {}
+    }
+  }
+  window.__setArtifactData = function(data) {
+    window.ARTIFACT_DATA = data;
+    if (window.__paramStore) window.__paramStore._ingest(data);
+    notifyArtifactData();
+  };
+
   // ── useArtifactData() ───────────────────────────────────────────────────────
   window.useArtifactData = function() {
+    var _s = React.useState(0);
+    var forceUpdate = _s[1];
+    React.useEffect(function() {
+      var fn = function() { forceUpdate(function(c) { return c + 1; }); };
+      window.__artifactDataListeners.push(fn);
+      return function() {
+        var idx = window.__artifactDataListeners.indexOf(fn);
+        if (idx >= 0) window.__artifactDataListeners.splice(idx, 1);
+      };
+    }, []);
     return window.ARTIFACT_DATA;
+  };
+
+  // ── vizById() ───────────────────────────────────────────────────────────────
+  // Stable, id-keyed access to a visualization's data. Preferred over
+  // positional `viz[N]` (which silently repoints at the wrong dataset when
+  // the viz set changes). Positional access remains supported for legacy
+  // artifacts — this runtime only ever grows.
+  window.vizById = function(id) {
+    var data = window.ARTIFACT_DATA || {};
+    var list = data.visualizations || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && String(list[i].id) === String(id)) return list[i];
+    }
+    return null;
+  };
+
+  // ── useCurrentUser() ────────────────────────────────────────────────────────
+  // The viewing user, injected by the host as ARTIFACT_DATA.current_user:
+  // { id, name, email, image_url, role, profile_attributes } — every field
+  // nullable. Returns null for anonymous viewers and headless renders, so
+  // callers must guard: useCurrentUser()?.name.
+  window.useCurrentUser = function() {
+    var data = window.ARTIFACT_DATA || {};
+    return data.current_user || null;
   };
 
   // ── LoadingSpinner ──────────────────────────────────────────────────────────
@@ -198,6 +248,207 @@
   };
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // Params store + useParams — server-side query parameters.
+  //
+  // Unlike useFilters (client-side, filters rows already in the browser),
+  // params RE-RUN the underlying queries at the source: the iframe posts the
+  // intent to the authenticated host page, the host calls the backend, and
+  // fresh rows arrive via a new ARTIFACT_DATA push. Declarations come from
+  // ARTIFACT_DATA.params: { declarations: [{name, type, label, source,
+  // default, required, options, query_ids}], values: {name: value} }.
+  // Identity-source params are locked server-side — they carry no client
+  // value and render as "scoped to you", never as an input.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  window.__paramStore = (function() {
+    var declarations = [];
+    var values = {};
+    var options = {};   // name -> [{value, label}] — host-resolved stable choices
+    var pending = {};
+    // Committed-but-unconfirmed changes. The user's latest input stays
+    // authoritative through the host round trip: getValues() overlays
+    // values with inflight and pending, so a controlled input can never
+    // snap back to a stale applied value while a run is in the air.
+    var inflight = {};
+    var inflightSeq = {};   // name -> commit seq that last wrote it
+    var commitSeq = 0;
+    var loading = false;
+    var error = null;
+    var listeners = [];
+    var timer = null;
+
+    function notify() {
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](); } catch (e) {}
+      }
+    }
+
+    function post(msg) {
+      try { window.parent.postMessage(msg, '*'); } catch (e) {}
+    }
+
+    function commit(targets) {
+      var changes = {};
+      var any = false;
+      commitSeq += 1;
+      for (var k in pending) {
+        changes[k] = pending[k];
+        inflight[k] = pending[k];
+        inflightSeq[k] = commitSeq;
+        any = true;
+      }
+      if (!any) return;
+      pending = {};
+      loading = true;
+      error = null;
+      notify();
+      post({ type: 'ARTIFACT_SET_PARAMS', changes: changes, targets: targets || null, seq: commitSeq });
+    }
+
+    return {
+      _ingest: function(data) {
+        var p = (data && data.params) || {};
+        declarations = p.declarations || [];
+        values = p.values || {};
+        options = p.options || {};
+        // Confirm inflight keys the host has caught up on. ack is the highest
+        // ARTIFACT_SET_PARAMS seq the host has seen; a key committed at or
+        // below it is reflected in this echo (possibly server-normalized), so
+        // the echoed value becomes truth. A key committed later keeps its
+        // local value — this push predates it. Without ack (older host),
+        // fall back to value equality.
+        var ack = (typeof p.ack === 'number') ? p.ack : null;
+        for (var k in inflight) {
+          var confirmed = (ack !== null)
+            ? (inflightSeq[k] <= ack)
+            : (JSON.stringify(values[k]) === JSON.stringify(inflight[k]));
+          if (confirmed) { delete inflight[k]; delete inflightSeq[k]; }
+        }
+        loading = false;
+        error = null;
+        notify();
+      },
+      _status: function(payload) {
+        loading = !!(payload && payload.loading);
+        error = (payload && payload.error) || null;
+        notify();
+      },
+      getDeclarations: function() { return declarations; },
+      // Applied values overlaid with everything newer the user did locally
+      // (committed-in-flight, then still-debouncing pending) — what a
+      // controlled input should bind so typing never resets mid round-trip.
+      getValues: function() {
+        var out = {};
+        var k;
+        for (k in values) out[k] = values[k];
+        for (k in inflight) out[k] = inflight[k];
+        for (k in pending) out[k] = pending[k];
+        return out;
+      },
+      // Stable [{value, label}] choices for one param: host-resolved rows
+      // (static options or an options-source query) — never the currently
+      // filtered data, so selecting a value can't collapse the list.
+      getOptions: function(name) {
+        if (options && options[name] && options[name].length) return options[name];
+        for (var i = 0; i < declarations.length; i++) {
+          var d = declarations[i];
+          if (d && d.name === name && d.options && d.options.length) {
+            return d.options.map(function(v) {
+              return (v && typeof v === 'object' && 'value' in v)
+                ? v : { value: v, label: String(v) };
+            });
+          }
+        }
+        return null;
+      },
+      getPending: function() { return pending; },
+      isLoading: function() { return loading; },
+      getError: function() { return error; },
+      setParam: function(name, value, opts) {
+        pending[name] = value;
+        notify();
+        if (opts && opts.apply === false) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(function() { timer = null; commit(null); }, 250);
+      },
+      setParams: function(changes, opts) {
+        for (var k in (changes || {})) pending[k] = changes[k];
+        notify();
+        if (opts && opts.apply === false) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(function() { timer = null; commit(null); }, 250);
+      },
+      apply: function(targets) {
+        if (timer) { clearTimeout(timer); timer = null; }
+        commit(targets || null);
+      },
+      refresh: function(targets) {
+        loading = true;
+        notify();
+        post({ type: 'ARTIFACT_REFRESH_PARAMS', targets: targets || null });
+      },
+      sub: function(fn) {
+        listeners.push(fn);
+        return function() {
+          var idx = listeners.indexOf(fn);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      }
+    };
+  })();
+
+  window.useParams = function() {
+    var _s = React.useState(0);
+    var forceUpdate = _s[1];
+    React.useEffect(function() {
+      return window.__paramStore.sub(function() {
+        forceUpdate(function(c) { return c + 1; });
+      });
+    }, []);
+    var store = window.__paramStore;
+    return {
+      declarations: store.getDeclarations(),
+      values: store.getValues(),
+      pending: store.getPending(),
+      loading: store.isLoading(),
+      error: store.getError(),
+      setParam: store.setParam,
+      setParams: store.setParams,
+      apply: store.apply,
+      refresh: store.refresh,
+      getOptions: store.getOptions
+    };
+  };
+
+  // Stable choice list for one declared param — [{value, label}] or null.
+  // Re-renders when the host pushes fresh params (e.g. the options query
+  // refreshed). See __paramStore.getOptions for resolution order.
+  window.useParamOptions = function(name) {
+    var _s = React.useState(0);
+    var forceUpdate = _s[1];
+    React.useEffect(function() {
+      return window.__paramStore.sub(function() {
+        forceUpdate(function(c) { return c + 1; });
+      });
+    }, []);
+    return window.__paramStore.getOptions(name);
+  };
+
+  // Seed the store from the data embedded in the initial srcdoc.
+  try { window.__paramStore._ingest(window.ARTIFACT_DATA || {}); } catch (e) {}
+
+  // Host → iframe bridge: fresh data pushes and param-run status. Only the
+  // parent frame is trusted.
+  window.addEventListener('message', function(e) {
+    if (e.source !== window.parent || !e.data) return;
+    if (e.data.type === 'ARTIFACT_DATA' && e.data.payload) {
+      window.__setArtifactData(e.data.payload);
+    } else if (e.data.type === 'ARTIFACT_PARAMS_STATUS') {
+      window.__paramStore._status(e.data.payload || {});
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // InfoPopover — built-in provenance popup for prebuilt components.
   // Pass a `viz` object (from useArtifactData().visualizations) to KPICard /
   // SectionCard and a small "i" button appears that opens a clean panel showing
@@ -364,29 +615,53 @@
 
     var calcText = _infoCalc(opts.calc);
 
+    // Download the rows this tab displays (filtered set when present, full
+    // otherwise) — the FULL array, not the 100-row on-screen slice.
+    var exportBtn = (dataRows.length && cols.length) ? h('button', {
+      key: 'dl', type: 'button', 'data-testid': 'bow-popover-export',
+      title: 'Download CSV' + (isFiltered ? ' (filtered rows)' : ''),
+      onClick: function(e) {
+        e.stopPropagation();
+        window.exportCSV(dataRows, {
+          columns: cols.map(function(c) { return c.field; }),
+          filename: (viz.title || 'export')
+        });
+      },
+      className: 'inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium text-slate-400 hover:text-slate-700 hover:bg-slate-100 dark:hover:text-slate-200 dark:hover:bg-slate-700/60 transition-colors shrink-0'
+    }, [
+      h('svg', { key: 'i', width: 11, height: 11, viewBox: '0 0 16 16', fill: 'none' }, [
+        h('path', { key: 'a', d: 'M8 2v8m0 0l-3-3m3 3l3-3', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }),
+        h('path', { key: 'b', d: 'M3 13h10', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' })
+      ]),
+      h('span', { key: 't' }, 'CSV')
+    ]) : null;
+
     return h('div', { key: 'data', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, [
       calcText ? h('div', { key: 'calc' }, [
         h('div', { key: 'l', className: 'text-[10px] font-medium uppercase tracking-wide text-slate-400 mb-1' }, 'Calculation'),
-        h('div', { key: 'v', className: 'text-xs font-mono text-slate-700 bg-slate-50 border border-slate-100 rounded-md px-2 py-1.5' }, calcText)
+        h('div', { key: 'v', className: 'text-xs font-mono text-slate-700 bg-slate-50 border border-slate-100 dark:text-slate-200 dark:bg-slate-800 dark:border-slate-700 rounded-md px-2 py-1.5' }, calcText)
       ]) : null,
-      metaBits.length ? h('div', { key: 'm', className: 'text-[11px] text-slate-400' }, metaBits.join('  ·  ')) : null,
+      (metaBits.length || exportBtn) ? h('div', { key: 'm', className: 'flex items-center justify-between gap-2' }, [
+        h('span', { key: 'mb', className: 'text-[11px] text-slate-400' }, metaBits.join('  ·  ')),
+        exportBtn
+      ]) : null,
       filterNote ? h('div', { key: 'af', className: 'text-[11px] text-slate-500' }, filterNote) : null,
       cols.length ? h('div', {
-        key: 'tbl', className: 'border border-slate-100 rounded-md overflow-auto', style: { maxHeight: 300 }
+        key: 'tbl', className: 'border border-slate-100 dark:border-slate-700 rounded-md overflow-auto', style: { maxHeight: 300 }
       }, h('table', { className: 'border-collapse', style: { minWidth: '100%' } }, [
         h('thead', { key: 'h' }, h('tr', {}, cols.map(function(c, i) {
           return h('th', {
             key: i,
-            className: 'text-left font-medium text-slate-500 bg-slate-50 px-2 py-1.5 border-b border-slate-100 whitespace-nowrap sticky top-0',
+            className: 'text-left font-medium text-slate-500 bg-slate-50 border-b border-slate-100 dark:text-slate-400 dark:bg-slate-800 dark:border-slate-700 px-2 py-1.5 whitespace-nowrap sticky top-0',
             style: { fontSize: 11 }
           }, c.header);
         }))),
         h('tbody', { key: 'b' }, dataRows.slice(0, MAXR).map(function(row, ri) {
-          return h('tr', { key: ri, className: ri % 2 ? 'bg-slate-50/40' : '' }, cols.map(function(c, ci) {
+          return h('tr', { key: ri, className: ri % 2 ? 'bg-slate-50/40 dark:bg-slate-800/40' : '' }, cols.map(function(c, ci) {
             var cell = _infoCell(row[c.field]);
             return h('td', {
               key: ci, title: cell,
-              className: 'px-2 py-1 text-slate-700 whitespace-nowrap border-b border-slate-50',
+              className: 'px-2 py-1 text-slate-700 border-b border-slate-50 dark:text-slate-200 dark:border-slate-800 whitespace-nowrap',
               style: { fontSize: 11, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis' }
             }, cell);
           }));
@@ -401,7 +676,7 @@
   function _codeTabBody(viz) {
     return h('div', { key: 'code' }, viz.code
       ? h('pre', {
-          className: 'text-[11px] font-mono text-slate-700 bg-slate-50 border border-slate-100 rounded-md p-2 overflow-auto',
+          className: 'text-[11px] font-mono text-slate-700 bg-slate-50 border border-slate-100 dark:text-slate-200 dark:bg-slate-800 dark:border-slate-700 rounded-md p-2 overflow-auto',
           style: { maxHeight: 340, whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: 0 }
         }, viz.code)
       : h('div', { className: 'text-xs text-slate-400 py-4 text-center' }, 'No query available for this visualization.'));
@@ -464,7 +739,7 @@
       return h('button', {
         key: id, type: 'button', onClick: function() { setTab(id); },
         className: 'px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors '
-          + (active ? 'border-slate-800 text-slate-800' : 'border-transparent text-slate-400 hover:text-slate-600')
+          + (active ? 'border-slate-800 text-slate-800 dark:border-slate-200 dark:text-slate-200' : 'border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-300')
       }, label);
     }
 
@@ -474,7 +749,7 @@
     var panel = (open && pos) ? ReactDOM.createPortal(
       h('div', {
         ref: panelRef,
-        className: 'bg-white border border-slate-200 rounded-lg shadow-xl',
+        className: 'bg-white border border-slate-200 dark:bg-slate-900 dark:border-slate-700 rounded-lg shadow-xl',
         style: {
           position: 'fixed', left: pos.left,
           top: pos.top != null ? pos.top : undefined,
@@ -484,21 +759,21 @@
         }
       }, [
         h('div', { key: 'hd', className: 'flex items-start justify-between gap-2 px-3.5 pt-2.5 pb-1' }, [
-          h('div', { key: 't', className: 'text-xs font-semibold text-slate-800 leading-snug' }, viz.title || 'Details'),
+          h('div', { key: 't', className: 'text-xs font-semibold text-slate-800 dark:text-slate-200 leading-snug' }, viz.title || 'Details'),
           h('button', {
             key: 'x', type: 'button', 'aria-label': 'Close',
             onClick: function() { setOpen(false); },
-            className: 'shrink-0 -mt-0.5 text-slate-400 hover:text-slate-600'
+            className: 'shrink-0 -mt-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'
           }, h('svg', { width: 14, height: 14, viewBox: '0 0 14 14', fill: 'none' },
             h('path', { d: 'M3.5 3.5l7 7M10.5 3.5l-7 7', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' })))
         ]),
-        h('div', { key: 'tabs', className: 'flex gap-1 px-3 border-b border-slate-100' }, [
+        h('div', { key: 'tabs', className: 'flex gap-1 px-3 border-b border-slate-100 dark:border-slate-700' }, [
           tabButton('data', 'Data'),
           tabButton('code', 'Code')
         ]),
         h('div', { key: 'bd', className: 'px-3.5 py-3 overflow-auto' }, tab === 'code' ? codeBody : dataBody),
         viz.id ? h('div', {
-          key: 'ft', className: 'px-3.5 py-2 border-t border-slate-100 text-[10px] font-mono text-slate-400 break-all'
+          key: 'ft', className: 'px-3.5 py-2 border-t border-slate-100 dark:border-slate-700 text-[10px] font-mono text-slate-400 break-all'
         }, 'ID  ' + viz.id) : null
       ]),
       document.body
@@ -509,7 +784,7 @@
         key: 'btn', ref: btnRef, type: 'button', 'aria-label': 'Details',
         onClick: function(e) { e.stopPropagation(); setOpen(function(o) { return !o; }); },
         className: 'inline-flex items-center justify-center w-5 h-5 rounded-full transition-colors '
-          + (open ? 'text-slate-600 bg-slate-100' : 'text-slate-300 hover:text-slate-500 hover:bg-slate-100')
+          + (open ? 'text-slate-600 bg-slate-100 dark:text-slate-300 dark:bg-slate-700' : 'text-slate-300 hover:text-slate-500 hover:bg-slate-100 dark:text-slate-600 dark:hover:text-slate-400 dark:hover:bg-slate-800')
       }, h('svg', { width: 15, height: 15, viewBox: '0 0 16 16', fill: 'none' }, [
         h('circle', { key: 'c', cx: 8, cy: 8, r: 6.4, stroke: 'currentColor', strokeWidth: 1.2 }),
         h('circle', { key: 'd', cx: 8, cy: 5.2, r: 0.95, fill: 'currentColor' }),
@@ -526,11 +801,11 @@
   window.KPICard = function(props) {
     var color = props.color || '#3B82F6';
     // Structural classes always applied; className adds to (not replaces) defaults
-    var cls = 'relative rounded-2xl border p-5 shadow-sm overflow-hidden bg-white border-slate-200 text-slate-900'
+    var cls = 'relative rounded-2xl border p-5 shadow-sm overflow-hidden bg-white border-slate-200 text-slate-900 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-100'
       + (props.className ? ' ' + props.className : '');
-    var titleCls = 'text-xs font-medium uppercase tracking-wider mb-1 text-slate-500'
+    var titleCls = 'text-xs font-medium uppercase tracking-wider mb-1 text-slate-500 dark:text-slate-400'
       + (props.titleClassName ? ' ' + props.titleClassName : '');
-    var subtitleCls = 'text-sm mt-1 text-slate-500'
+    var subtitleCls = 'text-sm mt-1 text-slate-500 dark:text-slate-400'
       + (props.subtitleClassName ? ' ' + props.subtitleClassName : '');
     return h('div', { className: cls, style: props.style }, [
       h('div', { key: 'bar', className: 'absolute inset-x-0 top-0 h-1', style: { background: 'linear-gradient(90deg, ' + color + ', ' + color + '99)' } }),
@@ -542,11 +817,11 @@
   };
 
   window.SectionCard = function(props) {
-    var cls = 'relative rounded-2xl border shadow-sm p-6 bg-white border-slate-200'
+    var cls = 'relative rounded-2xl border shadow-sm p-6 bg-white border-slate-200 dark:bg-slate-900 dark:border-slate-700'
       + (props.className ? ' ' + props.className : '');
-    var titleCls = 'text-lg font-semibold text-slate-800'
+    var titleCls = 'text-lg font-semibold text-slate-800 dark:text-slate-100'
       + (props.titleClassName ? ' ' + props.titleClassName : '');
-    var subtitleCls = 'text-sm mt-1 text-slate-500'
+    var subtitleCls = 'text-sm mt-1 text-slate-500 dark:text-slate-400'
       + (props.subtitleClassName ? ' ' + props.subtitleClassName : '');
     return h('div', { className: cls, style: props.style }, [
       props.viz ? h('div', { key: 'info', className: 'absolute top-3 right-3 z-10' }, h(window.InfoPopover, { viz: props.viz, rows: props.rows, calc: props.calc })) : null,
@@ -555,6 +830,291 @@
         props.subtitle ? h('p', { key: 's', className: subtitleCls }, props.subtitle) : null,
       ]) : null,
       h('div', { key: 'body' }, props.children),
+    ]);
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DataTable — sortable, paginated, RTL-aware table with hover/selection
+  // highlight, numeric formatting and CSV export. The default renderer for
+  // table visualizations; prefer it over hand-rolled <table> markup.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Print support: pagination hides rows from the screen but they stay in the
+  // DOM (up to printCap), so PDF export shows the whole table.
+  (function() {
+    var st = document.createElement('style');
+    st.textContent =
+      '@media print {' +
+      '  .bow-dt-offpage { display: table-row !important; }' +
+      '  .bow-dt-chrome { display: none !important; }' +
+      '  .bow-dt-scroll { max-height: none !important; overflow: visible !important; }' +
+      '}';
+    (document.head || document.documentElement).appendChild(st);
+  })();
+
+  var _RTL_CHARS = /[֐-׿؀-ۿ܀-ݏיִ-ﭏ]/g;
+
+  // Heuristic direction detection: compare strong-RTL vs latin letter counts
+  // in the headers and a sample of string cell values.
+  function _dtDetectDir(cols, rows) {
+    var sample = '';
+    for (var i = 0; i < cols.length; i++) sample += (cols[i].header || '') + ' ';
+    for (var r = 0; r < rows.length && r < 5; r++) {
+      var row = rows[r] || {};
+      for (var c = 0; c < cols.length; c++) {
+        var v = row[cols[c].field];
+        if (typeof v === 'string') sample += v + ' ';
+      }
+    }
+    var rtl = (sample.match(_RTL_CHARS) || []).length;
+    var ltr = (sample.match(/[A-Za-z]/g) || []).length;
+    return rtl > ltr ? 'rtl' : 'ltr';
+  }
+
+  function _dtColIsNumeric(col, rows) {
+    if (col.dtype && /int|float|double|decimal|number/i.test(String(col.dtype))) return true;
+    var seen = 0;
+    for (var i = 0; i < rows.length && seen < 5; i++) {
+      var v = rows[i] ? rows[i][col.field] : null;
+      if (v == null) continue;
+      seen++;
+      if (typeof v !== 'number') return false;
+    }
+    return seen > 0;
+  }
+
+  // null/undefined sort last regardless of direction; numbers (and numeric
+  // strings) compare numerically, everything else locale-compares.
+  function _dtCompare(a, b) {
+    if (a == null && b == null) return 0;
+    if (a == null) return 1;
+    if (b == null) return -1;
+    var na = typeof a === 'number' ? a : (a !== '' && !isNaN(Number(a)) ? Number(a) : null);
+    var nb = typeof b === 'number' ? b : (b !== '' && !isNaN(Number(b)) ? Number(b) : null);
+    if (na != null && nb != null) return na - nb;
+    return String(a).localeCompare(String(b));
+  }
+
+  window.DataTable = function(props) {
+    var viz = props.viz || {};
+    var baseRows = Array.isArray(props.rows) ? props.rows
+      : (Array.isArray(viz.rows) ? viz.rows : []);
+    var colSource = Array.isArray(props.columns) && props.columns.length
+      ? { columns: props.columns } : viz;
+    var cols = React.useMemo(function() {
+      return _infoCols(colSource, baseRows);
+    }, [props.columns, viz.columns, baseRows]);
+
+    var sortable = props.sortable !== false;
+    var selectable = props.selectable !== false;
+    var exportable = props.exportable !== false;
+    var searchable = !!props.searchable;
+    var pageSize = props.pageSize != null ? props.pageSize : 15;
+    var printCap = props.printCap != null ? props.printCap : 1000;
+    // When paginated, the page size already bounds the height — a scroll clamp
+    // on top of pagination would hide part of the current page. The default
+    // 400px clamp only applies to non-paginated (pageSize=0) tables.
+    var maxHeight = props.maxHeight != null ? props.maxHeight
+      : (pageSize > 0 ? 'none' : 400);
+
+    var _sort = React.useState(null), sort = _sort[0], setSort = _sort[1];
+    var _pg = React.useState(0), page = _pg[0], setPage = _pg[1];
+    var _q = React.useState(''), query = _q[0], setQuery = _q[1];
+    var _sel = React.useState(null), selRow = _sel[0], setSelRow = _sel[1];
+
+    var dir = props.dir || _dtDetectDir(cols, baseRows);
+
+    var numericByField = React.useMemo(function() {
+      var m = {};
+      for (var i = 0; i < cols.length; i++) m[cols[i].field] = _dtColIsNumeric(cols[i], baseRows);
+      return m;
+    }, [cols, baseRows]);
+
+    // search → sort → paginate
+    var filtered = React.useMemo(function() {
+      if (!query) return baseRows;
+      var q = query.toLowerCase();
+      return baseRows.filter(function(row) {
+        for (var i = 0; i < cols.length; i++) {
+          var v = row ? row[cols[i].field] : null;
+          if (v != null && String(v).toLowerCase().indexOf(q) !== -1) return true;
+        }
+        return false;
+      });
+    }, [baseRows, cols, query]);
+
+    var sorted = React.useMemo(function() {
+      if (!sort) return filtered;
+      var out = filtered.slice();
+      out.sort(function(ra, rb) {
+        var a = ra ? ra[sort.field] : null;
+        var b = rb ? rb[sort.field] : null;
+        // nulls last in BOTH directions — outside the desc negation
+        if (a == null && b == null) return 0;
+        if (a == null) return 1;
+        if (b == null) return -1;
+        var c = _dtCompare(a, b);
+        return sort.desc ? -c : c;
+      });
+      return out;
+    }, [filtered, sort]);
+
+    var paged = pageSize > 0;
+    var pageCount = paged ? Math.max(1, Math.ceil(sorted.length / pageSize)) : 1;
+    var curPage = Math.min(page, pageCount - 1);
+    var start = paged ? curPage * pageSize : 0;
+    var end = paged ? Math.min(start + pageSize, sorted.length) : sorted.length;
+    // DOM rows: everything up to printCap so print/PDF sees the full table;
+    // rows outside the current page are hidden on screen via .bow-dt-offpage.
+    var domRows = sorted.slice(0, Math.max(end, Math.min(sorted.length, printCap)));
+
+    function clickHeader(field) {
+      if (!sortable) return;
+      setPage(0);
+      setSort(function(s) {
+        if (!s || s.field !== field) return { field: field, desc: false };
+        if (!s.desc) return { field: field, desc: true };
+        return null;
+      });
+    }
+
+    function clickRow(row, absIdx) {
+      if (props.onRowClick) props.onRowClick(row, absIdx);
+      if (selectable) setSelRow(function(cur) { return cur === row ? null : row; });
+    }
+
+    var isRtl = dir === 'rtl';
+
+    // ── toolbar (search / export) ──
+    var toolbar = null;
+    if (searchable || exportable) {
+      toolbar = h('div', {
+        key: 'tb',
+        className: 'bow-dt-chrome flex items-center justify-between gap-2 mb-2'
+      }, [
+        searchable ? h('input', {
+          key: 's', type: 'text', value: query,
+          'data-testid': 'bow-dt-search',
+          placeholder: props.searchPlaceholder || 'Search...',
+          onChange: function(e) { setQuery(e.target.value); setPage(0); },
+          className: 'rounded-lg border border-slate-200 text-slate-700 bg-white dark:border-slate-700 dark:text-slate-200 dark:bg-slate-900 dark:placeholder-slate-500 px-3 py-1.5 text-sm outline-none focus:border-blue-400 min-w-[160px]'
+        }) : h('span', { key: 's' }),
+        exportable ? h('button', {
+          key: 'x', type: 'button', 'data-testid': 'bow-dt-export',
+          title: 'Download CSV',
+          onClick: function() {
+            window.exportCSV(sorted, {
+              columns: cols.map(function(c) { return c.field; }),
+              filename: (viz.title || 'table')
+            });
+          },
+          className: 'inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-500 border border-slate-200 hover:text-slate-800 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-400 dark:hover:text-slate-200 dark:hover:bg-slate-800 transition-colors shrink-0'
+        }, [
+          h('svg', { key: 'i', width: 12, height: 12, viewBox: '0 0 16 16', fill: 'none' }, [
+            h('path', { key: 'a', d: 'M8 2v8m0 0l-3-3m3 3l3-3', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' }),
+            h('path', { key: 'b', d: 'M3 13h10', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' })
+          ]),
+          h('span', { key: 't' }, 'CSV')
+        ]) : null
+      ]);
+    }
+
+    // ── header ──
+    var thead = h('thead', { key: 'h', className: 'text-xs uppercase bg-slate-50 dark:bg-slate-800 sticky top-0 z-[1]' },
+      h('tr', {}, cols.map(function(c, i) {
+        var numeric = numericByField[c.field];
+        var isSorted = sort && sort.field === c.field;
+        return h('th', {
+          key: i,
+          onClick: function() { clickHeader(c.field); },
+          'aria-sort': isSorted ? (sort.desc ? 'descending' : 'ascending') : undefined,
+          className: 'px-4 py-3 font-medium text-slate-500 dark:text-slate-400 whitespace-nowrap select-none '
+            + (numeric ? 'text-end' : 'text-start')
+            + (sortable ? ' cursor-pointer hover:text-slate-800 dark:hover:text-slate-200' : '')
+        }, h('span', { className: 'inline-flex items-center gap-1' }, [
+          h('span', { key: 't' }, c.header),
+          sortable ? h('span', {
+            key: 'a',
+            className: 'text-[9px] leading-none ' + (isSorted ? 'text-slate-700 dark:text-slate-200' : 'text-slate-300 dark:text-slate-600')
+          }, isSorted ? (sort.desc ? '▼' : '▲') : '⇅') : null
+        ]));
+      })));
+
+    // ── body ──
+    var tbody = h('tbody', { key: 'b' }, domRows.map(function(row, i) {
+      var onPage = i >= start && i < end;
+      var isSel = selectable && selRow === row;
+      var zebra = props.striped && ((i - start) % 2 === 1);
+      return h('tr', {
+        key: i,
+        onClick: function() { clickRow(row, i); },
+        className: (onPage ? '' : 'bow-dt-offpage hidden ')
+          + 'border-b border-slate-100 dark:border-slate-800 transition-colors '
+          + (isSel ? 'bg-blue-50 hover:bg-blue-50 dark:bg-blue-950/40 dark:hover:bg-blue-950/40 '
+              : (zebra ? 'bg-slate-50/40 dark:bg-slate-800/40 ' : '') + 'hover:bg-slate-100 dark:hover:bg-slate-800 ')
+          + ((selectable || props.onRowClick) ? 'cursor-pointer' : '')
+      }, cols.map(function(c, j) {
+        var numeric = numericByField[c.field];
+        return h('td', {
+          key: j,
+          dir: 'auto',
+          className: 'px-4 py-2 text-slate-700 dark:text-slate-200 ' + (numeric ? 'text-end tabular-nums' : 'text-start')
+        }, _infoCell(row ? row[c.field] : null));
+      }));
+    }));
+
+    // ── footer: pagination + counts ──
+    var footer = null;
+    var footBits = [];
+    if (query) footBits.push(sorted.length + ' of ' + baseRows.length + ' rows match');
+    if (sorted.length > printCap) footBits.push('first ' + printCap + ' rows in print/PDF');
+    if (paged && sorted.length > pageSize) {
+      footer = h('div', {
+        key: 'f',
+        className: 'bow-dt-chrome flex items-center justify-between gap-2 pt-2 text-xs text-slate-500 dark:text-slate-400'
+      }, [
+        h('span', { key: 'c', 'data-testid': 'bow-dt-range' },
+          (sorted.length ? (start + 1) : 0) + '–' + end + ' of ' + sorted.length
+          + (footBits.length ? '  ·  ' + footBits.join('  ·  ') : '')),
+        h('span', { key: 'nav', className: 'inline-flex items-center gap-1' }, [
+          h('button', {
+            key: 'p', type: 'button', 'data-testid': 'bow-dt-prev', disabled: curPage === 0,
+            onClick: function() { setPage(Math.max(0, curPage - 1)); },
+            className: 'px-2 py-1 rounded-md border border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-default'
+          }, isRtl ? '›' : '‹'),
+          h('span', { key: 'pg', className: 'px-1 tabular-nums' }, (curPage + 1) + '/' + pageCount),
+          h('button', {
+            key: 'n', type: 'button', 'data-testid': 'bow-dt-next', disabled: curPage >= pageCount - 1,
+            onClick: function() { setPage(Math.min(pageCount - 1, curPage + 1)); },
+            className: 'px-2 py-1 rounded-md border border-slate-200 hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-default'
+          }, isRtl ? '‹' : '›')
+        ])
+      ]);
+    } else if (footBits.length) {
+      footer = h('div', { key: 'f', className: 'bow-dt-chrome pt-2 text-xs text-slate-500 dark:text-slate-400', 'data-testid': 'bow-dt-range' }, footBits.join('  ·  '));
+    }
+
+    var infoBtn = (props.info && props.viz)
+      ? h('div', { key: 'i', className: 'absolute top-0 z-10 ' + (isRtl ? 'left-0' : 'right-0') },
+          h(window.InfoPopover, { viz: props.viz, rows: props.rows, calc: props.calc }))
+      : null;
+
+    var empty = !cols.length || !baseRows.length;
+
+    return h('div', {
+      dir: dir,
+      'data-testid': 'bow-datatable',
+      className: 'relative' + (props.className ? ' ' + props.className : ''),
+      style: props.style
+    }, empty ? [
+      infoBtn,
+      h('div', { key: 'e', className: 'text-sm text-slate-400 py-8 text-center' }, props.emptyText || 'No data available')
+    ] : [
+      infoBtn,
+      toolbar,
+      h('div', { key: 'scroll', className: 'bow-dt-scroll overflow-auto', style: { maxHeight: maxHeight } },
+        h('table', { className: 'w-full text-sm' }, [thead, tbody])),
+      footer
     ]);
   };
 
@@ -573,8 +1133,13 @@
     });
     var selected = (props.selected || []).map(String);
     var onChange = props.onChange || function() {};
+    // Single-select mode (`single` / `multiple={false}`): picking an option
+    // REPLACES the selection and closes the dropdown, and there is no "Clear
+    // all". Without it a scalar server-side param (e.g. model_type) wired to
+    // this control accumulated checkboxes and `selected[0]` never changed.
+    var single = props.single === true || props.multiple === false;
     // Theme: className OR-replaces defaults (bg/border/text color); structural classes always applied.
-    var theme = props.className || 'bg-white border-slate-200 text-slate-900';
+    var theme = props.className || 'bg-white border-slate-200 text-slate-900 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-100';
     var searchable = props.searchable !== undefined ? props.searchable : opts.length >= 8;
 
     var _s = React.useState(false), open = _s[0], setOpen = _s[1];
@@ -626,6 +1191,11 @@
     function handleToggle() { setOpen(!open); }
 
     function toggle(val) {
+      if (single) {
+        onChange([val]);
+        setOpen(false);
+        return;
+      }
       var idx = selected.indexOf(val);
       onChange(idx >= 0 ? selected.filter(function(v) { return v !== val; }) : selected.concat([val]));
     }
@@ -650,7 +1220,7 @@
         })
       ]));
     }
-    if (selected.length > 0) {
+    if (selected.length > 0 && !single) {
       ddChildren.push(h('button', {
         key: 'clr', type: 'button',
         className: 'w-full text-left px-3 py-1.5 text-xs font-medium opacity-50 hover:opacity-100',
@@ -661,12 +1231,12 @@
       var isSelected = selected.indexOf(o.val) >= 0;
       ddChildren.push(h('label', {
         key: 'opt-' + o.val,
-        className: 'flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-black/5'
+        className: 'flex items-center gap-2 px-3 py-1.5 text-sm cursor-pointer hover:bg-black/5 dark:hover:bg-white/10'
       }, [
         h('input', {
-          key: 'cb', type: 'checkbox', checked: isSelected,
+          key: 'cb', type: single ? 'radio' : 'checkbox', checked: isSelected,
           onChange: function() { toggle(o.val); },
-          className: 'rounded border-slate-300 accent-blue-500'
+          className: (single ? '' : 'rounded ') + 'border-slate-300 dark:border-slate-600 accent-blue-500'
         }),
         h('span', { key: 'v', className: 'truncate' }, o.lbl)
       ]));
@@ -715,7 +1285,7 @@
     var value = props.value || '';
     var onChange = props.onChange || function() {};
     var placeholder = props.placeholder || 'Search...';
-    var theme = props.className || 'bg-white border-slate-200 text-slate-900';
+    var theme = props.className || 'bg-white border-slate-200 text-slate-900 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-100';
     return h('div', { className: 'inline-block min-w-[140px]' }, [
       label ? h('label', { key: 'l', className: 'block text-xs font-medium opacity-60 mb-1' }, label) : null,
       h('input', {
@@ -732,7 +1302,7 @@
     var label = props.label || '';
     var value = props.value || {};
     var onChange = props.onChange || function() {};
-    var theme = props.className || 'bg-white border-slate-200 text-slate-900';
+    var theme = props.className || 'bg-white border-slate-200 text-slate-900 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-100';
     var inputType = props.type || 'date';
     return h('div', { className: 'inline-block min-w-[200px]' }, [
       label ? h('label', { key: 'l', className: 'block text-xs font-medium opacity-60 mb-1' }, label) : null,
@@ -773,13 +1343,13 @@
   // (pdf.js unavailable in headless render, or a load error).
   function _bowPdfCard(src, filename) {
     return h('div', {
-      className: 'flex flex-col items-center justify-center gap-3 h-full w-full bg-slate-50 rounded-lg border border-slate-200 text-center p-6'
+      className: 'flex flex-col items-center justify-center gap-3 h-full w-full bg-slate-50 border-slate-200 dark:bg-slate-800 dark:border-slate-700 rounded-lg border text-center p-6'
     }, [
       h('svg', { key: 'ic', width: 44, height: 44, viewBox: '0 0 24 24', fill: 'none', stroke: '#ef4444', strokeWidth: 1.5 }, [
         h('path', { key: 'p1', d: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z' }),
         h('path', { key: 'p2', d: 'M14 2v6h6' })
       ]),
-      h('div', { key: 'nm', className: 'text-sm font-medium text-slate-700' }, filename || 'Document.pdf'),
+      h('div', { key: 'nm', className: 'text-sm font-medium text-slate-700 dark:text-slate-200' }, filename || 'Document.pdf'),
       h('a', {
         key: 'op', href: src, target: '_blank', rel: 'noopener',
         className: 'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 text-white text-xs font-medium hover:bg-slate-700'
@@ -864,7 +1434,7 @@
       return h('div', { style: { height: height } }, _bowPdfCard(props.src, props.filename));
     }
     return h('div', {
-      className: 'relative w-full rounded-lg border border-slate-200 bg-slate-100 overflow-y-auto',
+      className: 'relative w-full rounded-lg border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800 overflow-y-auto',
       style: { height: height, padding: 8 }
     }, [
       status === 'loading' ? h('div', {
@@ -882,7 +1452,7 @@
 
     if (!file) {
       return h('div', {
-        className: wrapCls + ' flex items-center justify-center bg-slate-50 border border-dashed border-slate-200 rounded-lg text-slate-400 text-sm',
+        className: wrapCls + ' flex items-center justify-center bg-slate-50 border-slate-200 dark:bg-slate-800 dark:border-slate-700 border border-dashed rounded-lg text-slate-400 text-sm',
         style: Object.assign({ minHeight: 160 }, wrapStyle)
       }, 'File not found: ' + (props.id || ''));
     }
@@ -912,7 +1482,7 @@
     } else {
       media = h('a', {
         key: 'dl', href: src, download: file.filename || 'file',
-        className: 'inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 text-slate-600 text-sm hover:bg-slate-50'
+        className: 'inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 text-sm'
       }, 'Download ' + (file.filename || 'file'));
     }
 
@@ -943,6 +1513,60 @@
     }
   });
 
+  // Dark-mode counterpart, picked automatically when the iframe <html> carries
+  // the `dark` class (host app in dark mode).
+  echarts.registerTheme('bow-dark', {
+    color: ['#60A5FA', '#34D399', '#A78BFA', '#FBBF24', '#F87171', '#22D3EE', '#F472B6', '#2DD4BF', '#93C5FD', '#6EE7B7'],
+    backgroundColor: 'transparent',
+    categoryAxis: {
+      axisLine: { show: false }, axisTick: { show: false },
+      axisLabel: { color: '#94a3b8', fontSize: 12 }, splitLine: { show: false }
+    },
+    valueAxis: {
+      axisLine: { show: false }, axisTick: { show: false },
+      axisLabel: { color: '#94a3b8', fontSize: 12 }, splitLine: { lineStyle: { color: 'rgba(148, 163, 184, 0.15)' } }
+    },
+    legend: { textStyle: { color: '#cbd5e1' } },
+    line: { smooth: true, symbol: 'none', lineStyle: { width: 2 } },
+    bar: { itemStyle: { borderRadius: [6, 6, 0, 0] } },
+    pie: { itemStyle: { borderRadius: 6 } },
+    grid: { left: 40, right: 20, top: 20, bottom: 40, containLabel: true },
+    tooltip: {
+      backgroundColor: 'rgba(15, 23, 42, 0.98)',
+      borderColor: 'rgba(71, 85, 105, 0.6)',
+      borderWidth: 1, borderRadius: 12, padding: [12, 16],
+      textStyle: { color: '#fff', fontSize: 13 }, trigger: 'axis'
+    }
+  });
+
+  function _bowIsDark() {
+    return document.documentElement.classList.contains('dark');
+  }
+
+  // Forced-dark artifacts: generated code that wraps its page in
+  // <div className="dark"> means "dark regardless of the host theme". Mirror
+  // that onto <html> so everything OUTSIDE the wrapper follows too — portaled
+  // dropdowns/popovers (they mount on document.body), the bow-dark chart
+  // theme, and the body background. The host's color-mode toggle checks
+  // window.__bowForcedDark and never strips the class while a forced-dark
+  // root is present.
+  (function watchForcedDark() {
+    function sync() {
+      var root = document.getElementById('root');
+      var forced = !!(root && (root.classList.contains('dark') || root.querySelector(':scope .dark')));
+      window.__bowForcedDark = forced;
+      if (forced && !_bowIsDark()) {
+        document.documentElement.classList.add('dark');
+        try { window.dispatchEvent(new CustomEvent('bow-colormode', { detail: { mode: 'dark' } })); } catch (e) {}
+      }
+    }
+    try {
+      var mo = new MutationObserver(sync);
+      mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+      sync();
+    } catch (e) { /* non-fatal */ }
+  })();
+
   // ── EChart wrapper ──────────────────────────────────────────────────────────
   function safeOption(opt) {
     if (opt && opt.tooltip && typeof opt.tooltip.formatter === 'function') {
@@ -956,15 +1580,23 @@
     var ref = React.useRef(null);
     var chartRef = React.useRef(null);
     var ht = props.height || 400;
+    // Track the host color mode; the iframe shell fires 'bow-colormode' when
+    // the host toggles it. The chart re-inits with the matching theme.
+    var _dm = React.useState(_bowIsDark()), isDark = _dm[0], setIsDark = _dm[1];
+    React.useEffect(function() {
+      function onMode() { setIsDark(_bowIsDark()); }
+      window.addEventListener('bow-colormode', onMode);
+      return function() { window.removeEventListener('bow-colormode', onMode); };
+    }, []);
     React.useEffect(function() {
       if (!ref.current) return;
-      var chart = echarts.init(ref.current, 'bow');
+      var chart = echarts.init(ref.current, isDark ? 'bow-dark' : 'bow');
       chartRef.current = chart;
       if (props.option) chart.setOption(safeOption(props.option));
       var ro = new ResizeObserver(function() { chart.resize(); });
       ro.observe(ref.current);
       return function() { ro.disconnect(); chart.dispose(); };
-    }, []);
+    }, [isDark]);
     React.useEffect(function() {
       if (chartRef.current && props.option) {
         chartRef.current.setOption(safeOption(props.option), true);
@@ -1070,7 +1702,7 @@
         key: 'm' + i, type: 'button', 'data-bow-ibtn': '1', 'aria-label': 'Details',
         onClick: function(e) { e.stopPropagation(); setTab('data'); setOpenT(t); },
         style: { position: 'fixed', top: Math.max(2, t.rect.top + 6), left: t.rect.right - 24, zIndex: 99998 },
-        className: 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-white/80 backdrop-blur text-slate-400 hover:text-slate-700 hover:bg-white shadow-sm border border-slate-200/70 transition-colors'
+        className: 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-white/80 backdrop-blur text-slate-400 hover:text-slate-700 hover:bg-white border-slate-200/70 dark:bg-slate-800/80 dark:text-slate-500 dark:hover:text-slate-200 dark:hover:bg-slate-800 dark:border-slate-600/70 shadow-sm border transition-colors'
       }, h('svg', { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none' }, [
         h('circle', { key: 'c', cx: 8, cy: 8, r: 6.4, stroke: 'currentColor', strokeWidth: 1.2 }),
         h('circle', { key: 'd', cx: 8, cy: 5.2, r: 0.95, fill: 'currentColor' }),
@@ -1090,11 +1722,11 @@
       function tabButton(id, label) {
         var active = tab === id;
         return h('button', { key: id, type: 'button', onClick: function() { setTab(id); },
-          className: 'px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors ' + (active ? 'border-slate-800 text-slate-800' : 'border-transparent text-slate-400 hover:text-slate-600') }, label);
+          className: 'px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors ' + (active ? 'border-slate-800 text-slate-800 dark:border-slate-200 dark:text-slate-200' : 'border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-300') }, label);
       }
       panel = h('div', {
         ref: panelRef, 'data-bow-panel': '1',
-        className: 'bg-white border border-slate-200 rounded-lg shadow-xl',
+        className: 'bg-white border border-slate-200 dark:bg-slate-900 dark:border-slate-700 rounded-lg shadow-xl',
         style: {
           position: 'fixed', left: left, width: W, zIndex: 99999, maxHeight: '72vh',
           top: below ? (openT.rect.top + 28) : undefined,
@@ -1103,14 +1735,14 @@
         }
       }, [
         h('div', { key: 'hd', className: 'flex items-start justify-between gap-2 px-3.5 pt-2.5 pb-1' }, [
-          h('div', { key: 't', className: 'text-xs font-semibold text-slate-800 leading-snug' }, vTitle),
+          h('div', { key: 't', className: 'text-xs font-semibold text-slate-800 dark:text-slate-200 leading-snug' }, vTitle),
           h('button', { key: 'x', type: 'button', 'aria-label': 'Close', onClick: function() { setOpenT(null); },
-            className: 'shrink-0 -mt-0.5 text-slate-400 hover:text-slate-600' },
+            className: 'shrink-0 -mt-0.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300' },
             h('svg', { width: 14, height: 14, viewBox: '0 0 14 14', fill: 'none' }, h('path', { d: 'M3.5 3.5l7 7M10.5 3.5l-7 7', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' })))
         ]),
-        h('div', { key: 'tabs', className: 'flex gap-1 px-3 border-b border-slate-100' }, [tabButton('data', 'Data'), tabButton('code', 'Code')]),
+        h('div', { key: 'tabs', className: 'flex gap-1 px-3 border-b border-slate-100 dark:border-slate-700' }, [tabButton('data', 'Data'), tabButton('code', 'Code')]),
         h('div', { key: 'bd', className: 'px-3.5 py-3 overflow-auto' }, tab === 'code' ? _codeTabBody(viz) : _dataTabBody(viz, { calc: openT.calc })),
-        viz.id ? h('div', { key: 'ft', className: 'px-3.5 py-2 border-t border-slate-100 text-[10px] font-mono text-slate-400 break-all' }, 'ID  ' + viz.id) : null
+        viz.id ? h('div', { key: 'ft', className: 'px-3.5 py-2 border-t border-slate-100 dark:border-slate-700 text-[10px] font-mono text-slate-400 break-all' }, 'ID  ' + viz.id) : null
       ]);
     }
 

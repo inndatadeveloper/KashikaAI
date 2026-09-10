@@ -95,12 +95,13 @@ from uuid import UUID
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import insert, delete, or_, and_, func, exists, false as sa_false
+from sqlalchemy import insert, delete, update, or_, and_, func, exists, false as sa_false
 from sqlalchemy.exc import IntegrityError
 from app.schemas.datasource_table_schema import DataSourceTableSchema
 from app.models.datasource_table import DataSourceTable  # Add this import at the top of the file
 from app.models.user_data_source_overlay import UserDataSourceTable as UserOverlayTable, UserDataSourceColumn as UserOverlayColumn
 from app.models.webhook_data_source_association import webhook_data_source_association
+from app.models.eval import TestSuite
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import selectinload, lazyload
@@ -108,6 +109,28 @@ from app.services.instruction_service import InstructionService
 from app.schemas.instruction_schema import InstructionCreate
 from app.core.telemetry import telemetry
 from app.ee.audit.service import audit_service
+
+
+def normalize_overlay_fks(fks) -> list:
+    """Serialize a table's foreign keys into JSON-storable dicts.
+
+    fks may arrive as pydantic ForeignKey objects (from a Table prompt
+    formatter) whose nested TableColumn values are NOT JSON serializable.
+    Persisting them into DataSourceTable.fks (a JSON column) raised "Object of
+    type ForeignKey is not JSON serializable" and aborted the entire per-user
+    overlay upsert for any dataset with relationships — so a delegated Power BI
+    / Fabric model with FKs could never build an overlay. Dicts pass through.
+    """
+    out = []
+    for fk in (fks or []):
+        if isinstance(fk, dict):
+            out.append(fk)
+        elif hasattr(fk, "model_dump"):
+            out.append(fk.model_dump(mode="json"))
+        elif hasattr(fk, "dict"):
+            out.append(fk.dict())
+    return out
+
 
 class DataSourceService:
 
@@ -249,6 +272,7 @@ class DataSourceService:
         legacy_count_by_ds: dict | None = None,
         include_indexing_events: bool = True,
         include_table_counts: bool = True,
+        include_config: bool = True,
         cred_index=None,  # connection_identity.UserCredentialIndex
     ) -> List[ConnectionEmbedded]:
         """
@@ -279,6 +303,14 @@ class DataSourceService:
         one (connection_identity.UserCredentialIndex) across every agent they
         are about to return, so the per-user credential lookups don't repeat
         per connection.
+
+        ``include_config=False`` omits the connection config from the payload.
+        List endpoints (/data_sources, /data_sources/active, public listings)
+        are reachable by every org member and pass False: config carries
+        internal topology (server URLs, MCP static headers, header/metadata
+        injection rules) that belongs on the manage-gated surfaces only
+        (/connections/{id}, /data_sources/{id}/connections, the detail view).
+        connector_key is unaffected — it is derived here before serialization.
         """
         from app.schemas.data_source_registry import data_shape_for
         if not data_source.connections:
@@ -470,7 +502,7 @@ class DataSourceService:
                 type=conn.type,
                 auth_policy=conn.auth_policy,
                 allowed_user_auth_modes=conn.allowed_user_auth_modes,
-                config=conn.config if isinstance(conn.config, dict) else json.loads(conn.config) if conn.config else {},
+                config=(conn.config if isinstance(conn.config, dict) else json.loads(conn.config) if conn.config else {}) if include_config else None,
                 is_active=conn.is_active,
                 last_synced_at=conn.last_synced_at,
                 user_status=user_status,
@@ -488,8 +520,9 @@ class DataSourceService:
         Create memberships for a list of user IDs.
 
         Writes to both DataSourceMembership (legacy) and ResourceGrant (RBAC).
-        `permissions` controls the RBAC grant; defaults to ["view", "view_schema"]
-        to match legacy DSM semantics. Pass ["manage"] for the owner.
+        `permissions` controls the RBAC grant; the default (None) creates an
+        empty grant, which still confers implicit view/view_schema via the
+        resolver's any-grant rule. Pass ["manage"] for the owner.
         """
         if not user_ids:
             return
@@ -592,6 +625,11 @@ class DataSourceService:
             from app.models.connection_table import ConnectionTable
             from app.services.connection_service import ConnectionService
 
+            # Already-indexed connections know their table count synchronously;
+            # summed for telemetry below (a freshly-created connection's count
+            # isn't known yet — it lands later via data_source_schema_synced).
+            total_table_count = 0
+
             for conn_id in existing_connection_ids:
                 conn_result = await db.execute(
                     select(Connection).filter(
@@ -610,6 +648,7 @@ class DataSourceService:
                     select(func.count(ConnectionTable.id)).filter(ConnectionTable.connection_id == conn_id)
                 )
                 conn_table_count = conn_tables_result.scalar() or 0
+                total_table_count += conn_table_count
 
                 if conn_table_count == 0 and conn.auth_policy == "system_only":
                     # Kick off background indexing — the runner populates
@@ -757,6 +796,7 @@ class DataSourceService:
                     "use_llm_sync": bool(use_llm_sync),
                     "from_existing_connection": bool(existing_connection_ids),
                     "connection_count": len(connections_to_link) if connections_to_link else 1,
+                    "table_count": total_table_count if existing_connection_ids else None,
                 },
                 user_id=current_user.id,
                 org_id=organization.id,
@@ -1257,6 +1297,24 @@ class DataSourceService:
         return schema
 
 
+    async def get_domain_file_connections(self, db, data_source_id, organization):
+        """Scope-only projection for authorized agent viewers.
+
+        Do not expose arbitrary connector config: some connector types carry
+        sensitive settings outside the encrypted credentials column.
+        """
+        from app.schemas.data_source_registry import get_entry
+        allowed = {"site_url", "drive_name", "folder_path", "root_path", "bucket",
+                   "prefix", "include_globs", "index_mode", "index_content", "recursive"}
+        result = []
+        for conn in await self.get_domain_connections(db, data_source_id, organization):
+            if get_entry(conn.type).data_shape != "files":
+                continue
+            config = json.loads(conn.config) if isinstance(conn.config, str) else (conn.config or {})
+            result.append({"id": str(conn.id), "name": conn.name, "type": conn.type,
+                           "config": {key: value for key, value in config.items() if key in allowed}})
+        return result
+
     async def get_available_data_sources(self, db: AsyncSession, organization: Organization):
         return list_available_data_sources()
 
@@ -1400,6 +1458,7 @@ class DataSourceService:
                 table_count_by_conn=table_count_by_conn,
                 legacy_count_by_ds=legacy_count_by_ds,
                 include_indexing_events=False,
+                include_config=False,
                 cred_index=cred_index,
             )
             conn = d.connections[0] if d.connections else None
@@ -1646,6 +1705,7 @@ class DataSourceService:
                 table_count_by_conn=table_count_by_conn,
                 legacy_count_by_ds=legacy_count_by_ds,
                 include_indexing_events=False,
+                include_config=False,
                 include_table_counts=False,
                 cred_index=cred_index,
             )
@@ -1750,6 +1810,7 @@ class DataSourceService:
                 table_count_by_conn=table_count_by_conn,
                 legacy_count_by_ds=legacy_count_by_ds,
                 include_indexing_events=False,
+                include_config=False,
             )
 
             s = DataSourceListItemSchema(
@@ -1821,7 +1882,7 @@ class DataSourceService:
         try:
             # Resolve schemas via registry
             config_schema = config_schema_for(data_source_type)
-            from app.schemas.data_source_registry import credentials_schema_for, get_entry
+            from app.schemas.data_source_registry import credentials_schema_for, get_entry, supports_user_auth
             entry = get_entry(data_source_type)
             # Filter auth variants by policy if provided (system_only vs user_required)
             def allowed(mode: str) -> bool:
@@ -1865,17 +1926,26 @@ class DataSourceService:
                 "data_shape": entry.data_shape,
                 "catalog_ownership": entry.catalog_ownership,
                 "ui_form": entry.ui_form,
+                # Numbered setup steps rendered above the fields (None for most types).
+                "setup_guide": meta.get("setup_guide"),
                 "auth": {
                     "default": entry.credentials_auth.default,
                     "by_auth": {k: {"title": v.title} for k, v in (entry.credentials_auth.by_auth or {}).items() if allowed(k)},
                     "policy": auth_policy or "system_only",
                 },
+                # False when no variant has the `user` scope: the form hides the
+                # "Require user authentication" toggle (nothing to require).
+                "supports_user_auth": supports_user_auth(data_source_type),
             }
         except Exception as e:
             raise ValueError(f"Schema not found for {data_source_type}: {str(e)}")
     
     async def delete_data_source(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User):
-        result = await db.execute(select(DataSource).filter(DataSource.id == data_source_id, DataSource.organization_id == organization.id))
+        # Rollbacks expire ORM instances. Keep scalar ids for the FK retry and
+        # audit paths so error handling never triggers async lazy IO.
+        organization_id = str(organization.id)
+        current_user_id = str(current_user.id)
+        result = await db.execute(select(DataSource).filter(DataSource.id == data_source_id, DataSource.organization_id == organization_id))
         data_source = result.scalar_one_or_none()
         if not data_source:
             raise HTTPException(status_code=404, detail="Data source not found")
@@ -1901,6 +1971,16 @@ class DataSourceService:
         )
         await db.execute(
             delete(UserDataSourceCredentials).where(UserDataSourceCredentials.data_source_id == data_source_id)
+        )
+
+        # A suite's data_source_id is only its Drafts home, not ownership.
+        # Preserve the suite and its cases as org-level content when its agent
+        # goes away. Older production constraints lack ON DELETE SET NULL, so
+        # this explicit update is required even after the model is corrected.
+        await db.execute(
+            update(TestSuite)
+            .where(TestSuite.data_source_id == data_source_id)
+            .values(data_source_id=None)
         )
 
         # 2b) Detach this agent from any trigger webhooks. The M2M is declared
@@ -1963,7 +2043,7 @@ class DataSourceService:
                 if attempt == max_attempts - 1:
                     raise
                 # The data source object is expired after rollback; re-fetch it.
-                result = await db.execute(select(DataSource).filter(DataSource.id == data_source_id, DataSource.organization_id == organization.id))
+                result = await db.execute(select(DataSource).filter(DataSource.id == data_source_id, DataSource.organization_id == organization_id))
                 data_source = result.scalar_one_or_none()
                 if not data_source:
                     # Already removed elsewhere; nothing left to delete.
@@ -1974,9 +2054,9 @@ class DataSourceService:
         try:
             await audit_service.log(
                 db=db,
-                organization_id=str(organization.id),
+                organization_id=organization_id,
                 action="data_source.deleted",
-                user_id=str(current_user.id),
+                user_id=current_user_id,
                 resource_type="data_source",
                 resource_id=str(data_source_id),
                 details={"name": data_source_name},
@@ -2534,7 +2614,7 @@ class DataSourceService:
 
             client = ClientClass(**allowed)
             self._attach_client_quota_metadata(client, data_source, conn, key)
-            await self._attach_stored_table_metadata(db, client, data_source, conn)
+            await self._attach_stored_table_metadata(db, client, data_source, conn, current_user=current_user)
             clients[key] = client
 
             # Accelerated (FAST) relations for this connection, exposed as a
@@ -2606,7 +2686,7 @@ class DataSourceService:
             list(rows), connection_name=connection.name, identity=identity
         )
 
-    async def _attach_stored_table_metadata(self, db: AsyncSession, client, data_source: DataSource, connection) -> None:
+    async def _attach_stored_table_metadata(self, db: AsyncSession, client, data_source: DataSource, connection, current_user=None) -> None:
         """Inject the persisted (indexed) table metadata into clients that
         resolve query targets from it.
 
@@ -2636,20 +2716,48 @@ class DataSourceService:
             # Attaching an unlinked row to a sibling connection's client is
             # harmless — resolution is by name, and a name it does not own simply
             # will not match (this is what the old no-rows fallback already did).
+            # NB: no is_active filter. This map only resolves a query target
+            # (table name → dataset GUID); it grants no access — the delegated
+            # token still gates executeQueries. On a user_required source the
+            # canonical row for a delegated dataset is inactive (the service
+            # principal that indexed the catalog has no access to it), so an
+            # is_active filter left the map empty and every viewer run failed
+            # with "Could not resolve Power BI dataset". The GUID is present on
+            # the inactive row, so keep it.
             rows = (await db.execute(
                 select(DataSourceTable.name, DataSourceTable.metadata_json)
                 .outerjoin(ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id)
                 .where(
                     DataSourceTable.datasource_id == str(data_source.id),
-                    DataSourceTable.is_active == True,
                     or_(
                         ConnectionTable.connection_id == str(connection.id),
                         DataSourceTable.connection_table_id.is_(None),
                     ),
                 )
             )).all()
+            attach = {name: metadata_json for name, metadata_json in rows}
+
+            # Merge the executing user's overlay metadata. A delegated dataset
+            # can enter the catalog ONLY through a user's own discovery, so for
+            # a viewer whose overlay carries the GUID but whose canonical row is
+            # missing entirely, the overlay is the sole source of the mapping.
+            # Overlay values win — they were discovered under this user's creds.
+            if current_user is not None:
+                from app.models.user_data_source_overlay import UserDataSourceTable
+                ov = (await db.execute(
+                    select(UserDataSourceTable.table_name, UserDataSourceTable.metadata_json)
+                    .where(
+                        UserDataSourceTable.data_source_id == str(data_source.id),
+                        UserDataSourceTable.user_id == str(current_user.id),
+                        UserDataSourceTable.is_accessible == True,
+                    )
+                )).all()
+                for name, metadata_json in ov:
+                    if metadata_json:
+                        attach[name] = metadata_json
+
             client.attach_table_metadata(
-                [{"name": name, "metadata_json": metadata_json} for name, metadata_json in rows]
+                [{"name": name, "metadata_json": metadata_json} for name, metadata_json in attach.items()]
             )
         except Exception:
             # Non-fatal: the client falls back to live discovery.
@@ -3152,7 +3260,7 @@ class DataSourceService:
         # with the conditional joins below). NULL connection_table_id (legacy
         # tables) is kept.
         _FILE_SOURCE_TYPES = [
-            "network_dir", "s3", "sharepoint", "onedrive", "google_drive",
+            "network_dir", "s3", "sharepoint", "sharepoint_onprem", "onedrive", "google_drive",
             "outlook_mail", "gmail_mail",
         ]
         _file_ct_subq = None
@@ -3368,7 +3476,7 @@ class DataSourceService:
         
         # Apply pagination
         offset = (page - 1) * page_size
-        base_query = base_query.offset(offset).limit(page_size)
+        base_query = base_query.order_by(DataSourceTable.id.asc()).offset(offset).limit(page_size)
 
         # Add selectinload for connection info
         base_query = base_query.options(
@@ -3439,6 +3547,10 @@ class DataSourceService:
                 connection_id=conn_id,
                 connection_name=conn_name,
                 connection_type=conn_type,
+                custom_query_id=str(table.connection_table.id) if table.connection_table and table.connection_table.kind == "bow" else None,
+                last_refreshed_at=table.connection_table.last_refreshed_at if table.connection_table and table.connection_table.kind == "bow" else None,
+                last_refresh_status=table.connection_table.last_refresh_status if table.connection_table and table.connection_table.kind == "bow" else None,
+                rls_enabled=bool(table.connection_table.rls_enabled) if table.connection_table and table.connection_table.kind == "bow" else False,
                 # Metrics
                 centrality_score=table.centrality_score,
                 richness=table.richness,
@@ -3447,6 +3559,7 @@ class DataSourceService:
                 entity_like=table.entity_like,
                 metrics_computed_at=table.metrics_computed_at.isoformat() if table.metrics_computed_at else None,
                 # Stats fields
+                last_used_at=stats.last_used_at if stats else None,
                 usage_count=int(stats.usage_count or 0) if stats else None,
                 success_count=int(stats.success_count or 0) if stats else None,
                 failure_count=int(stats.failure_count or 0) if stats else None,
@@ -3842,8 +3955,10 @@ class DataSourceService:
             ):
                 kwargs["progress_callback"] = progress_callback
             fresh = await client.aget_schemas(**kwargs)
-        if not fresh:
-            return []
+        if fresh is None:
+            # No snapshot is not an authoritative empty snapshot. A successful
+            # empty list must still reconcile and revoke the previous overlay.
+            raise ValueError("Schema discovery returned no snapshot")
 
         # Normalize
         from app.schemas.datasource_table_schema import normalize_indexed_columns as normalize_columns
@@ -3857,7 +3972,7 @@ class DataSourceService:
                 normalized[name] = {
                     "columns": normalize_columns(t.get("columns", [])),
                     "pks": normalize_columns(t.get("pks", [])),
-                    "fks": t.get("fks", []) or [],
+                    "fks": normalize_overlay_fks(t.get("fks", [])),
                     "metadata_json": t.get("metadata_json"),
                 }
             else:
@@ -3867,7 +3982,7 @@ class DataSourceService:
                 normalized[name] = {
                     "columns": normalize_columns(getattr(t, "columns", [])),
                     "pks": normalize_columns(getattr(t, "pks", [])),
-                    "fks": getattr(t, "fks", []) or [],
+                    "fks": normalize_overlay_fks(getattr(t, "fks", [])),
                     "metadata_json": getattr(t, "metadata_json", None),
                 }
 

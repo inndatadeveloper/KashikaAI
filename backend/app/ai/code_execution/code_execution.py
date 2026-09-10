@@ -15,7 +15,7 @@ import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
-from typing import Dict, Any, Tuple, List, Optional, Callable, Coroutine
+from typing import Dict, Any, Tuple, List, Optional, Callable, Coroutine, FrozenSet
 
 from app.ai.http.safe_client import SafeHttpClient
 
@@ -110,6 +110,44 @@ from app.errors.codes import ErrorCode
 
 # Hard fallback when neither connection nor org settings define a value.
 DEFAULT_QUERY_TIMEOUT_SECONDS = 60
+
+# ToolRunner treats a quiet tool stream as stalled after 180 seconds.  Some
+# healthy warehouse drivers block synchronously for almost that long without
+# producing rows or logs, so generated-code work emits a non-timing progress
+# pulse well below that boundary.  The same wrapper covers every caller of the
+# shared executor (inspect_data, create_data, write_csv, and MCP variants).
+_EXECUTION_HEARTBEAT_INTERVAL_S = 30.0
+
+
+async def _await_with_progress_heartbeat(awaitable, *, stage: str, attempt: int):
+    """Stream stage-preserving heartbeats until ``awaitable`` completes.
+
+    The private ``_result`` event is consumed inside StreamingCodeExecutor and
+    never crosses the tool boundary.  Cancelling/closing the outer tool stream
+    also cancels the in-flight codegen/query task so a timeout cannot orphan
+    expensive warehouse work in this process.
+    """
+    task = asyncio.ensure_future(awaitable)
+    interval = max(0.001, float(_EXECUTION_HEARTBEAT_INTERVAL_S))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=interval)
+            if task in done:
+                yield {"type": "_result", "value": task.result()}
+                return
+            yield {
+                "type": "progress",
+                "payload": {
+                    "stage": stage,
+                    "attempt": attempt,
+                    "heartbeat": True,
+                    "timing": False,
+                },
+            }
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 _tracer = get_tracer(__name__)
 
@@ -310,6 +348,10 @@ FORBIDDEN_MODULES = frozenset({
     'tempfile', 'pathlib', 'glob', 'fnmatch',
     'signal', 'resource', 'sysconfig', 'platform',
     'webbrowser', 'antigravity', 'this',
+    # joblib.dump/load serialize straight to a filesystem path (and unpickle on
+    # load), which would sidestep the `open`/`pickle` bans. scikit-learn's own
+    # internal joblib use is unaffected — the AST check only sees model code.
+    'joblib',
 })
 
 # Built-in functions that should never be called
@@ -349,24 +391,74 @@ FORBIDDEN_ATTRIBUTES = frozenset({
 })
 
 
+# Modules that exist only to train models. They are not a security risk, so
+# they are NOT in FORBIDDEN_MODULES; they are gated by the organization's
+# `enable_ml_training` setting instead (see ml_training_settings) and
+# rejected at validation time when that is off, so a disabled workspace fails
+# fast with a clear reason rather than mid-execution.
+ML_TRAINING_MODULES = frozenset({'sklearn', 'scipy'})
+
+# Default and floor for `ml_training_row_limit` — the row count the coder
+# prompt tells generated code to sample down to before fitting.
+ML_TRAINING_ROW_LIMIT_DEFAULT = 50_000
+ML_TRAINING_ROW_LIMIT_MIN = 1_000
+
+
+def ml_training_settings(organization_settings) -> Tuple[bool, int]:
+    """Return ``(enabled, row_limit)`` for scikit-learn use in generated code.
+
+    Both come from org settings (`enable_ml_training`, default on;
+    `ml_training_row_limit`, default 50,000, floored at 1,000 so an edited
+    value can't make every fit degenerate). ``None`` settings — unit tests,
+    legacy callers — get the defaults.
+    """
+    enabled, row_limit = True, ML_TRAINING_ROW_LIMIT_DEFAULT
+    if organization_settings is None:
+        return enabled, row_limit
+    try:
+        cfg = organization_settings.get_config("enable_ml_training")
+        if cfg is not None:
+            enabled = bool(getattr(cfg, "value", True))
+    except Exception:
+        pass
+    try:
+        cfg = organization_settings.get_config("ml_training_row_limit")
+        val = int(getattr(cfg, "value", row_limit) or row_limit)
+        row_limit = max(ML_TRAINING_ROW_LIMIT_MIN, val)
+    except Exception:
+        pass
+    return enabled, row_limit
+
+
 class CodeSecurityVisitor(ast.NodeVisitor):
     """AST visitor that checks for dangerous code patterns."""
 
-    def __init__(self):
+    def __init__(self, extra_forbidden_modules: FrozenSet[str] = frozenset()):
         self.errors: List[str] = []
+        # Org-gated modules (ML_TRAINING_MODULES when training is off) join
+        # the static denylist for this validation only.
+        self.forbidden_modules = FORBIDDEN_MODULES | frozenset(extra_forbidden_modules)
+        self._gated = frozenset(extra_forbidden_modules)
+
+    def _import_error(self, shown: str, module_name: str) -> str:
+        if module_name in self._gated:
+            return (f"Forbidden import: '{shown}' — machine-learning training "
+                    "(scikit-learn/scipy) is disabled for this organization; "
+                    "use pandas/numpy instead")
+        return f"Forbidden import: '{shown}'"
 
     def visit_Import(self, node: ast.Import):
         for alias in node.names:
             module_name = alias.name.split('.')[0]
-            if module_name in FORBIDDEN_MODULES:
-                self.errors.append(f"Forbidden import: '{alias.name}'")
+            if module_name in self.forbidden_modules:
+                self.errors.append(self._import_error(alias.name, module_name))
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         if node.module:
             module_name = node.module.split('.')[0]
-            if module_name in FORBIDDEN_MODULES:
-                self.errors.append(f"Forbidden import: 'from {node.module}'")
+            if module_name in self.forbidden_modules:
+                self.errors.append(self._import_error(f"from {node.module}", module_name))
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call):
@@ -440,9 +532,12 @@ class CodeSecurityVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def validate_python_code(code: str) -> None:
+def validate_python_code(code: str, extra_forbidden_modules: FrozenSet[str] = frozenset()) -> None:
     """
     Validate Python code for security issues using AST analysis.
+
+    ``extra_forbidden_modules`` adds org-gated modules (e.g. ML_TRAINING_MODULES
+    when `enable_ml_training` is off) to the static denylist for this call.
 
     Raises:
         UnsafePythonError: If the code contains dangerous constructs.
@@ -454,7 +549,7 @@ def validate_python_code(code: str) -> None:
         # with a more descriptive error
         return
 
-    visitor = CodeSecurityVisitor()
+    visitor = CodeSecurityVisitor(extra_forbidden_modules=extra_forbidden_modules)
     visitor.visit(tree)
 
     if visitor.errors:
@@ -610,6 +705,26 @@ def augment_db_error_hint(error_text: str) -> str:
 # Query Capturing Wrapper (captures queries passed to execute_query)
 # =============================================================================
 
+# Sentinel for "no positional query was passed". Distinct from None so a client
+# that legitimately receives None as its first argument is not misread.
+_NO_QUERY = object()
+
+
+def _describe_keyword_call(kwargs: dict) -> str:
+    """A capture string for a keyword-only execute_query call.
+
+    Clients whose query surface is not a statement string (Qlik's
+    app/dimensions/measures hypercubes) still need something meaningful in
+    captured_queries, the timing rows, and rate-limit/quota messages — this is
+    what the UI shows as "the query" for that step.
+    """
+    try:
+        body = json.dumps(kwargs, default=str, ensure_ascii=False)
+    except Exception:
+        body = repr(kwargs)
+    return f"execute_query({body})"
+
+
 class QueryCapturingClientWrapper:
     """Wrapper around a database client that captures all queries passed to execute_query.
 
@@ -651,18 +766,46 @@ class QueryCapturingClientWrapper:
             else query_concurrency.DEFAULT_MAX_CONCURRENT_QUERIES
         )
 
-    def execute_query(self, query: str, *args, **kwargs):
-        """Intercept execute_query calls to capture the query string and wall-clock duration."""
-        if isinstance(query, str):
-            self._captured_queries.append(query)
+    def execute_query(self, query=_NO_QUERY, *args, **kwargs):
+        """Intercept execute_query calls to capture the query string and wall-clock duration.
+
+        `query` is optional because not every client's query surface is a
+        statement string: the Qlik connectors take keyword arguments only
+        (app=..., dimensions=..., measures=...), and their system prompts teach
+        the agent that calling convention. Requiring a positional here made
+        every such call die in the wrapper — before the client was reached —
+        with "missing 1 required positional argument". For keyword-only calls
+        the bookkeeping (capture, timings, rate limit, quotas) uses a
+        synthesized description of the call instead.
+
+        Parameterized queries: `execute_query(sql, params={...})` renders the
+        `:name` placeholders into safe typed literals HERE — the one audited
+        place values meet SQL — and the underlying client receives finished
+        plain SQL through its unchanged interface. The captured query is the
+        rendered text, so identity verification sees what actually ran.
+        """
+        if "params" in kwargs:
+            param_values = kwargs.pop("params")
+            if isinstance(query, str) and isinstance(param_values, dict) and param_values:
+                from app.ai.code_execution.query_params import render_sql_with_params
+                query = render_sql_with_params(
+                    query, param_values,
+                    client_type_name=type(self._original).__name__,
+                )
+        if query is _NO_QUERY:
+            capture = _describe_keyword_call(kwargs)
+        else:
+            capture = query
+        if isinstance(capture, str):
+            self._captured_queries.append(capture)
         idx = len(self._captured_timings)
         _q_start = _time.monotonic()
         with _tracer.start_as_current_span("datasource.execute_query") as span:
             span.set_attribute("datasource.type", type(self._original).__name__)
             span.set_attribute("datasource.query_timeout_seconds", self._query_timeout_seconds)
             try:
-                self._enforce_rate_limit(query)
-                self._consume_query_quota(query)
+                self._enforce_rate_limit(capture)
+                self._consume_query_quota(capture)
                 # Hold a per-connection concurrency slot for the duration of
                 # the query. A burst queues here instead of arriving at the
                 # source all at once; the wait budget is the same wall clock
@@ -679,7 +822,7 @@ class QueryCapturingClientWrapper:
                 _q_ms = (_time.monotonic() - _q_start) * 1000.0
                 rows = len(result) if hasattr(result, '__len__') else None
                 result_bytes = estimate_result_size_bytes(result)
-                self._consume_data_bytes_quota(query, result_bytes, rows)
+                self._consume_data_bytes_quota(capture, result_bytes, rows)
                 if rows is not None:
                     span.set_attribute("datasource.result_rows", rows)
                 span.set_attribute("datasource.result_bytes", result_bytes)
@@ -688,7 +831,7 @@ class QueryCapturingClientWrapper:
                     "query_ms": round(_q_ms, 1),
                     "rows": rows,
                     "result_bytes": result_bytes,
-                    "sql": query[:500] if isinstance(query, str) else None,
+                    "sql": capture[:500] if isinstance(capture, str) else None,
                 })
                 return result
             except QueryTimeoutError as e:
@@ -697,7 +840,7 @@ class QueryCapturingClientWrapper:
                     "index": idx,
                     "query_ms": round(_q_ms, 1),
                     "rows": None,
-                    "sql": query[:500] if isinstance(query, str) else None,
+                    "sql": capture[:500] if isinstance(capture, str) else None,
                     "error": str(e)[:200],
                     "error_type": "timeout",
                     "timeout_seconds": self._query_timeout_seconds,
@@ -714,7 +857,7 @@ class QueryCapturingClientWrapper:
                     "index": idx,
                     "query_ms": round(_q_ms, 1),
                     "rows": None,
-                    "sql": query[:500] if isinstance(query, str) else None,
+                    "sql": capture[:500] if isinstance(capture, str) else None,
                     "error": str(e)[:200],
                 })
                 span.set_status(StatusCode.ERROR, str(e))
@@ -739,7 +882,12 @@ class QueryCapturingClientWrapper:
 
         def runner():
             try:
-                holder["value"] = self._original.execute_query(query, *args, **kwargs)
+                if query is _NO_QUERY:
+                    # Keyword-only client call — there was no positional to
+                    # forward (args is necessarily empty in this case).
+                    holder["value"] = self._original.execute_query(**kwargs)
+                else:
+                    holder["value"] = self._original.execute_query(query, *args, **kwargs)
             except BaseException as exc:
                 holder["exc"] = exc
 
@@ -878,13 +1026,15 @@ class QueryCapturingClientWrapper:
             "sql": query[:500] if isinstance(query, str) else None,
         }
 
-    def query(self, query: str, *args, **kwargs):
+    def query(self, query=_NO_QUERY, *args, **kwargs):
         """Alias for execute_query.
 
         Model-generated code often calls `.query(...)` instead of
         `.execute_query(...)`. Route it through our own `execute_query` so the
         call is still captured, timed, and metered — delegating via __getattr__
         would hit the raw client and bypass all of that instrumentation.
+        Passing the _NO_QUERY sentinel through positionally is deliberate:
+        execute_query recognizes it as "keyword-only call".
         """
         return self.execute_query(query, *args, **kwargs)
 
@@ -975,7 +1125,8 @@ class StreamingCodeExecutor:
     def execute_code(self, *, code: str, ds_clients: Dict, excel_files: List,
                      captured_timings: Optional[List[dict]] = None,
                      captured_queries: Optional[List[str]] = None,
-                     loadables: Optional[Dict] = None) -> Tuple[pd.DataFrame, str, List[str]]:
+                     loadables: Optional[Dict] = None,
+                     params: Optional[Dict] = None) -> Tuple[pd.DataFrame, str, List[str]]:
         """Execute Python code and return the resulting DataFrame, captured stdout log, and executed queries.
 
         captured_timings: if provided, per-query wall-clock timings are appended to this list.
@@ -997,8 +1148,20 @@ class StreamingCodeExecutor:
             span.set_attribute("code_execution.clients", len(ds_clients or {}))
             span.set_attribute("code_execution.excel_files", len(excel_files or []))
 
-            # Security: Validate Python code and SQL strings before execution
-            validate_python_code(code)
+            # Security: Validate Python code and SQL strings before execution.
+            # sklearn/scipy are org-gated: when training is off they are
+            # rejected here, with a reason, instead of failing mid-run.
+            _ml_enabled, _ = ml_training_settings(self.organization_settings)
+            validate_python_code(
+                code,
+                extra_forbidden_modules=frozenset() if _ml_enabled else ML_TRAINING_MODULES,
+            )
+            # Param values must never travel through string formatting — the
+            # rendering wrapper is the only place values meet SQL.
+            from app.ai.code_execution.query_params import check_params_not_formatted
+            _params_fmt_error = check_params_not_formatted(code)
+            if _params_fmt_error:
+                raise UnsafePythonError(_params_fmt_error)
 
             output_log = ""
             executed_queries: List[str] = captured_queries if captured_queries is not None else []
@@ -1066,6 +1229,7 @@ class StreamingCodeExecutor:
                     df = self._invoke_generate_df(
                         generate_df, wrapped_clients, excel_files, http_client,
                         load_step=load_step, load_entity=load_entity,
+                        params=params,
                     )
                     output_log = stdout_capture.getvalue()
                     lock_span.set_attribute("code_execution.lock_held_ms", round((_time.monotonic() - capture_started_at) * 1000.0, 3))
@@ -1176,19 +1340,22 @@ class StreamingCodeExecutor:
         fn: Callable, wrapped_clients: Dict, excel_files: List,
         http_client: Optional[SafeHttpClient],
         load_step: Optional[Callable] = None, load_entity: Optional[Callable] = None,
+        params: Optional[Dict] = None,
     ):
         """Call generate_df, binding injectables by parameter name.
 
         `ds_clients` and `excel_files` are always passed positionally. Any of
-        `http`, `load_step`, `load_entity` are passed by keyword only when the
-        function declares a parameter of that name — so legacy two-arg
+        `http`, `load_step`, `load_entity`, `params` are passed by keyword only
+        when the function declares a parameter of that name — so legacy two-arg
         `(ds_clients, excel_files)` and three-arg `(…, http)` signatures keep
-        working unchanged.
+        working unchanged. `params` is always a dict (possibly empty) when the
+        function asks for it, so `params.get(...)` never explodes.
         """
         injectables = {
             "http": http_client,
             "load_step": load_step,
             "load_entity": load_entity,
+            "params": dict(params or {}),
         }
         try:
             names = set(inspect.signature(fn).parameters.keys())
@@ -1200,7 +1367,8 @@ class StreamingCodeExecutor:
     async def execute_code_async(self, *, code: str, ds_clients: Dict, excel_files: List,
                                  captured_timings: Optional[List[dict]] = None,
                                  captured_queries: Optional[List[str]] = None,
-                                 loadables: Optional[Dict] = None) -> Tuple[pd.DataFrame, str, List[str]]:
+                                 loadables: Optional[Dict] = None,
+                                 params: Optional[Dict] = None) -> Tuple[pd.DataFrame, str, List[str]]:
         """Run execute_code in a thread so it doesn't block the event loop."""
         loop = asyncio.get_running_loop()
         if self.usage_context is not None:
@@ -1220,6 +1388,7 @@ class StreamingCodeExecutor:
                     captured_timings=captured_timings,
                     captured_queries=captured_queries,
                     loadables=loadables,
+                    params=params,
                 )
 
             result = await loop.run_in_executor(
@@ -1550,9 +1719,13 @@ class StreamingCodeExecutor:
         code_generator_fn: Callable = None,
         sigkill_event=None,
         loadable_resolver_fn: Optional[Callable] = None,
+        params: Optional[Dict] = None,
     ):
         """
         V2: Typed context-based generator. Yields the same event shapes as v1.
+
+        `params`: resolved parameter values injected into generate_df when the
+        generated code declares a `params` argument.
         """
         retries = 0
         # Respect explicit values (including 0→1). `or 2` was swallowing
@@ -1588,22 +1761,30 @@ class StreamingCodeExecutor:
                     break
                 # Call code generator with typed context and legacy params populated from context
                 _t_codegen = _time.monotonic()
-                final_code = await code_generator_fn(
-                    data_model={},
-                    prompt=derived_prompt,
-                    interpreted_prompt=derived_interpreted_prompt,
-                    schemas=derived_schemas,
-                    ds_clients=ds_clients,
-                    excel_files=excel_files,
-                    code_and_error_messages=code_and_error_messages,
-                    memories="",
-                    previous_messages="",
-                    retries=retries,
-                    prev_data_model_code_pair=None,
-                    sigkill_event=sigkill_event,
-                    code_context_builder=None,
-                    context=ctx,
-                )
+                async for _codegen_event in _await_with_progress_heartbeat(
+                    code_generator_fn(
+                        data_model={},
+                        prompt=derived_prompt,
+                        interpreted_prompt=derived_interpreted_prompt,
+                        schemas=derived_schemas,
+                        ds_clients=ds_clients,
+                        excel_files=excel_files,
+                        code_and_error_messages=code_and_error_messages,
+                        memories="",
+                        previous_messages="",
+                        retries=retries,
+                        prev_data_model_code_pair=None,
+                        sigkill_event=sigkill_event,
+                        code_context_builder=None,
+                        context=ctx,
+                    ),
+                    stage="code_generation",
+                    attempt=retries,
+                ):
+                    if _codegen_event["type"] == "_result":
+                        final_code = _codegen_event["value"]
+                    else:
+                        yield _codegen_event
                 codegen_ms = round((_time.monotonic() - _t_codegen) * 1000.0, 1)
                 yield {"type": "progress", "payload": {"stage": "code_generated", "attempt": retries, "code": final_code, "timing": False}}
             except Exception as e:
@@ -1651,11 +1832,23 @@ class StreamingCodeExecutor:
                 # scope so the failure branch can surface the failing SQL / DB error.
                 query_timings.clear()
                 executed_queries.clear()
-                exec_df, execution_log, _ = await self.execute_code_async(
-                    code=final_code, ds_clients=ds_clients, excel_files=excel_files,
-                    captured_timings=query_timings, captured_queries=executed_queries,
-                    loadables=loadables,
-                )
+                async for _execution_event in _await_with_progress_heartbeat(
+                    self.execute_code_async(
+                        code=final_code,
+                        ds_clients=ds_clients,
+                        excel_files=excel_files,
+                        captured_timings=query_timings,
+                        captured_queries=executed_queries,
+                        loadables=loadables,
+                        params=params,
+                    ),
+                    stage="data_query_execution",
+                    attempt=retries,
+                ):
+                    if _execution_event["type"] == "_result":
+                        exec_df, execution_log, _ = _execution_event["value"]
+                    else:
+                        yield _execution_event
                 execution_ms = round((_time.monotonic() - _t_exec) * 1000.0, 1)
                 yield {
                     "type": "progress",

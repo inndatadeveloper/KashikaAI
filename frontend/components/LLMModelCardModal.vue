@@ -23,6 +23,42 @@
             </div>
 
             <div class="mt-4 divide-y divide-gray-100 dark:divide-gray-800 border-y border-gray-100 dark:border-gray-800">
+                <!-- Model ID. Editable only for custom models on providers whose
+                     ids the admin owns (Azure deployments, Bedrock model ids,
+                     self-hosted OpenAI-compatible models) — see
+                     EDITABLE_MODEL_ID_PROVIDER_TYPES on the backend. Everywhere
+                     else the id is the model-catalog key, so editing it would
+                     detach the row from its pricing and context window. -->
+                <div v-if="canEditModelId" class="flex items-center justify-between py-2.5 gap-4">
+                    <UTooltip :text="$t('settings.llms.modelIdEditTooltip')">
+                        <span class="text-sm text-gray-700 dark:text-gray-300 underline decoration-dotted decoration-gray-300 underline-offset-2">{{ $t('settings.llms.modelIdLabel') }}</span>
+                    </UTooltip>
+                    <input
+                        v-model="modelIdDraft"
+                        type="text"
+                        maxlength="200"
+                        :placeholder="model.model_id"
+                        data-testid="card-model-id-input"
+                        class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-48 text-sm text-end focus:outline-none focus:border-blue-500"
+                    />
+                </div>
+                <!-- Display name. Custom models only — a preset's name is owned by
+                     the model catalog and is re-applied on every models-list load,
+                     so the backend rejects renaming one. Empty = fall back to the
+                     model_id (what custom models were always named before). -->
+                <div v-if="model.is_custom" class="flex items-center justify-between py-2.5 gap-4">
+                    <UTooltip :text="$t('settings.llms.displayNameTooltip')">
+                        <span class="text-sm text-gray-700 dark:text-gray-300 underline decoration-dotted decoration-gray-300 underline-offset-2">{{ $t('settings.llms.displayNameLabel') }}</span>
+                    </UTooltip>
+                    <input
+                        v-model="nameDraft"
+                        type="text"
+                        maxlength="120"
+                        :placeholder="effectiveModelId"
+                        data-testid="card-name-input"
+                        class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-48 text-sm text-end focus:outline-none focus:border-blue-500"
+                    />
+                </div>
                 <!-- Enabled -->
                 <div class="flex items-center justify-between py-2.5">
                     <span class="text-sm text-gray-700 dark:text-gray-300">{{ $t('settings.llms.enabledLabel') }}</span>
@@ -103,7 +139,30 @@
                             type="number" min="1" step="1000"
                             :placeholder="$t('settings.llms.contextPlaceholder')"
                             data-testid="card-context-input"
-                            class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-28 text-sm text-end focus:outline-none focus:border-blue-500"
+                            class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-36 text-sm text-end focus:outline-none focus:border-blue-500"
+                        />
+                    </div>
+                </div>
+                <!-- Temperature. Deliberately tri-state: empty = no temperature
+                     parameter is sent and the provider's default applies. The
+                     input must never be pre-filled with a number — saving an
+                     untouched dialog must not silently set one. -->
+                <div class="flex items-center justify-between py-2.5">
+                    <UTooltip :text="$t('settings.llms.temperatureTooltip')">
+                        <span class="text-sm text-gray-700 dark:text-gray-300 underline decoration-dotted decoration-gray-300 underline-offset-2">{{ $t('settings.llms.colTemperature') }}</span>
+                    </UTooltip>
+                    <div class="flex items-center gap-1.5">
+                        <UTooltip v-if="model.config?.temperature != null" :text="$t('settings.llms.temperatureResetTooltip')">
+                            <button type="button" class="text-gray-400 hover:text-gray-600" data-testid="card-temperature-reset" @click="resetTemperature">
+                                <UIcon name="i-heroicons-arrow-uturn-left" class="w-3.5 h-3.5" />
+                            </button>
+                        </UTooltip>
+                        <input
+                            v-model="temperatureDraft"
+                            type="number" min="0" max="2" step="0.1"
+                            :placeholder="$t('settings.llms.temperaturePlaceholder')"
+                            data-testid="card-temperature-input"
+                            class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-36 text-sm text-end focus:outline-none focus:border-blue-500"
                         />
                     </div>
                 </div>
@@ -177,6 +236,7 @@ const props = defineProps<{
 const emit = defineEmits(['update:modelValue', 'updated', 'deleted']);
 
 const { t } = useI18n();
+const { getErrorMessage } = useErrorMessage();
 const toast = useToast();
 
 const open = computed({
@@ -184,10 +244,16 @@ const open = computed({
     set: (value: boolean) => emit('update:modelValue', value),
 });
 
+// Custom models only; blank means "use the model_id" (see effectiveName).
+const nameDraft = ref<string>('');
 const enabledDraft = ref(false);
 const visionDraft = ref(false);
 const imageGenDraft = ref(false);
+const modelIdDraft = ref('');
 const contextDraft = ref<number | null>(null);
+// String draft so "" (provider default) stays distinct from 0 (an explicit,
+// valid temperature).
+const temperatureDraft = ref<string>('');
 const costInDraft = ref<number | null>(null);
 const costOutDraft = ref<number | null>(null);
 const confirmingDelete = ref(false);
@@ -196,11 +262,38 @@ const saving = ref(false);
 
 const deleteBlocked = computed(() => !!props.model && (props.model.is_default || props.model.is_small_default));
 
+// Mirrors EDITABLE_MODEL_ID_PROVIDER_TYPES in backend/app/models/llm_provider.py.
+const EDITABLE_MODEL_ID_PROVIDER_TYPES = ['azure', 'custom', 'bedrock'];
+const canEditModelId = computed(() =>
+    !!props.model?.is_custom
+    && EDITABLE_MODEL_ID_PROVIDER_TYPES.includes(props.model?.provider?.provider_type)
+);
+
+// Same blank-resets-to-current gesture as the name field: an empty box means
+// "leave it alone" rather than an attempt to save an empty id.
+const effectiveModelId = computed(() =>
+    modelIdDraft.value.trim() || props.model?.model_id || ''
+);
+const modelIdChanged = computed(() =>
+    canEditModelId.value && effectiveModelId.value !== props.model?.model_id
+);
+
+// A blank input resolves to the model_id, so clearing the field is the "reset
+// to default" gesture and never produces a phantom dirty state. It resolves
+// against the id being saved, so clearing the name during an id edit does not
+// pin the model to the id it is moving away from.
+const effectiveName = computed(() =>
+    nameDraft.value.trim() || effectiveModelId.value
+);
+
 const syncDrafts = () => {
+    nameDraft.value = props.model?.name ?? '';
+    modelIdDraft.value = props.model?.model_id ?? '';
     enabledDraft.value = !!props.model?.is_enabled;
     visionDraft.value = !!props.model?.supports_vision;
     imageGenDraft.value = !!props.model?.supports_image_generation;
     contextDraft.value = props.model?.context_window_tokens ?? null;
+    temperatureDraft.value = props.model?.config?.temperature != null ? String(props.model.config.temperature) : '';
     costInDraft.value = props.model?.input_cost_per_million_tokens_usd ?? null;
     costOutDraft.value = props.model?.output_cost_per_million_tokens_usd ?? null;
 };
@@ -215,10 +308,13 @@ watch(() => [props.modelValue, props.model?.id], () => {
 const isDirty = computed(() => {
     if (!props.model) return false;
     const norm = (v: any) => (v == null || v === '' ? null : Number(v));
-    return enabledDraft.value !== !!props.model.is_enabled
+    return modelIdChanged.value
+        || (props.model.is_custom && effectiveName.value !== props.model.name)
+        || enabledDraft.value !== !!props.model.is_enabled
         || visionDraft.value !== !!props.model.supports_vision
         || imageGenDraft.value !== !!props.model.supports_image_generation
         || norm(contextDraft.value) !== norm(props.model.context_window_tokens)
+        || norm(temperatureDraft.value) !== norm(props.model.config?.temperature)
         || norm(costInDraft.value) !== norm(props.model.input_cost_per_million_tokens_usd)
         || norm(costOutDraft.value) !== norm(props.model.output_cost_per_million_tokens_usd);
 });
@@ -243,6 +339,15 @@ const setDefault = async (small: boolean) => {
     }
 };
 
+const resetTemperature = async () => {
+    // No query param = clear the override; the client stops sending temperature.
+    const response = await useMyFetch(`/llm/models/${props.model.id}/set_temperature`, { method: 'POST' });
+    if (response.status.value === 'success') {
+        emit('updated');
+        nextTick(() => { temperatureDraft.value = ''; });
+    } else fail('Could not update temperature');
+};
+
 const resetContextWindow = async () => {
     const response = await useMyFetch(`/llm/models/${props.model.id}/set_context_window`, { method: 'POST' });
     if (response.status.value === 'success') {
@@ -264,6 +369,12 @@ const save = async () => {
         fail('Context window must be a positive number of tokens');
         return;
     }
+    const temp = norm(temperatureDraft.value);
+    const temperatureChanged = temp !== norm(model.config?.temperature);
+    if (temperatureChanged && temp != null && (!Number.isFinite(temp) || temp < 0 || temp > 2)) {
+        fail('Temperature must be between 0 and 2');
+        return;
+    }
     const inC = norm(costInDraft.value), outC = norm(costOutDraft.value);
     const pricingChanged = inC !== norm(model.input_cost_per_million_tokens_usd) || outC !== norm(model.output_cost_per_million_tokens_usd);
     if (pricingChanged && ((inC != null && inC < 0) || (outC != null && outC < 0))) {
@@ -271,8 +382,33 @@ const save = async () => {
         return;
     }
 
+    const nameChanged = !!model.is_custom && effectiveName.value !== model.name;
+    const idChanged = modelIdChanged.value;
+
     saving.value = true;
     try {
+        // One PATCH for both fields: the backend resolves the name fallback
+        // against the incoming model_id, so sending them together keeps a
+        // model named after its id in sync with the new id.
+        if (nameChanged || idChanged) {
+            const response = await useMyFetch(`/llm/models/${model.id}`, {
+                method: 'PATCH',
+                body: {
+                    ...(nameChanged ? { name: effectiveName.value } : {}),
+                    ...(idChanged ? { model_id: effectiveModelId.value } : {}),
+                },
+            });
+            if (response.status.value !== 'success') {
+                // The model_id guards ship an error_code, so getErrorMessage
+                // resolves them against the locale catalog. Anything untagged
+                // (the rename guard, a 500) still falls back to the server
+                // string and then to the per-field message below.
+                const errAny = response.error as any;
+                const err = (errAny && (errAny.value || errAny)) || {};
+                fail(getErrorMessage(err, idChanged ? t('settings.llms.modelIdError') : t('settings.llms.displayNameError')));
+                return;
+            }
+        }
         if (enabledDraft.value !== !!model.is_enabled) {
             const response = await useMyFetch(`/llm/models/${model.id}/toggle`, { method: 'POST', query: { enabled: enabledDraft.value } });
             if (response.status.value !== 'success') { fail('Could not update model status'); return; }
@@ -290,6 +426,14 @@ const save = async () => {
                 method: 'POST', query: { tokens: Math.floor(tokens as number) }
             });
             if (response.status.value !== 'success') { fail('Could not update context window'); return; }
+        }
+        if (temperatureChanged) {
+            // Empty draft clears the override (no query param); the client then
+            // sends no temperature at all.
+            const response = await useMyFetch(`/llm/models/${model.id}/set_temperature`, {
+                method: 'POST', ...(temp != null ? { query: { temperature: temp } } : {})
+            });
+            if (response.status.value !== 'success') { fail('Could not update temperature'); return; }
         }
         if (pricingChanged) {
             const response = await useMyFetch(`/llm/models/${model.id}/pricing`, {

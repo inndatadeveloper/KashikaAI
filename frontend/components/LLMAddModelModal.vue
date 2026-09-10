@@ -64,6 +64,25 @@
                         class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded-lg px-2.5 py-1.5 w-56 text-sm text-end focus:outline-none focus:border-blue-500"
                     />
                 </div>
+                <!-- Display name. Optional: blank keeps the old behavior of showing
+                     the model_id as the name. Uses displayNameHint, not
+                     displayNameTooltip: everything added through this dialog is a
+                     custom model (is_custom: true) whatever provider is selected —
+                     a fine-tuned OpenAI id belongs here too — so the "custom models
+                     only" caveat would just confuse. -->
+                <div class="flex items-center justify-between py-2.5 gap-4">
+                    <UTooltip :text="$t('settings.llms.displayNameHint')">
+                        <span class="text-sm text-gray-700 dark:text-gray-300 underline decoration-dotted decoration-gray-300 underline-offset-2">{{ $t('settings.llms.displayNameLabel') }}</span>
+                    </UTooltip>
+                    <input
+                        v-model="displayName"
+                        type="text"
+                        maxlength="120"
+                        :placeholder="modelId.trim() || $t('settings.llms.displayNamePlaceholder')"
+                        data-testid="add-model-name-input"
+                        class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded-lg px-2.5 py-1.5 w-56 text-sm text-end focus:outline-none focus:border-blue-500"
+                    />
+                </div>
                 <!-- Vision -->
                 <div class="flex items-center justify-between py-2.5">
                     <UTooltip :text="$t('settings.llms.visionTooltip')">
@@ -88,7 +107,21 @@
                         type="number" min="1" step="1000"
                         :placeholder="$t('settings.llms.contextPlaceholder')"
                         data-testid="add-model-context-input"
-                        class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-28 text-sm text-end focus:outline-none focus:border-blue-500"
+                        class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-36 text-sm text-end focus:outline-none focus:border-blue-500"
+                    />
+                </div>
+                <!-- Temperature. Tri-state on purpose: empty = no temperature
+                     parameter is ever sent (provider default). Never pre-fill. -->
+                <div class="flex items-center justify-between py-2.5">
+                    <UTooltip :text="$t('settings.llms.temperatureTooltip')">
+                        <span class="text-sm text-gray-700 dark:text-gray-300 underline decoration-dotted decoration-gray-300 underline-offset-2">{{ $t('settings.llms.colTemperature') }}</span>
+                    </UTooltip>
+                    <input
+                        v-model="temperature"
+                        type="number" min="0" max="2" step="0.1"
+                        :placeholder="$t('settings.llms.temperaturePlaceholder')"
+                        data-testid="add-model-temperature-input"
+                        class="border border-gray-300 dark:border-gray-600 dark:bg-gray-800 rounded px-2 py-1 w-36 text-sm text-end focus:outline-none focus:border-blue-500"
                     />
                 </div>
                 <!-- Cost -->
@@ -157,9 +190,14 @@ const open = computed({
 const selectedProviderId = ref<string | null>(null);
 const providerListOpen = ref(false);
 const modelId = ref('');
+// Optional display label. Blank falls back to the model_id at submit time,
+// which is what custom models were always named before this field existed.
+const displayName = ref('');
 const supportsVision = ref(false);
 const supportsImageGeneration = ref(false);
 const contextWindowTokens = ref<number | null>(null);
+// String draft so "" (provider default) stays distinct from 0 (explicit).
+const temperature = ref<string>('');
 const costIn = ref<number | null>(null);
 const costOut = ref<number | null>(null);
 const isSubmitting = ref(false);
@@ -167,9 +205,11 @@ const isSubmitting = ref(false);
 watch(open, (isOpen) => {
     if (isOpen) {
         modelId.value = '';
+        displayName.value = '';
         supportsVision.value = false;
         supportsImageGeneration.value = false;
         contextWindowTokens.value = null;
+        temperature.value = '';
         costIn.value = null;
         costOut.value = null;
         providerListOpen.value = false;
@@ -200,6 +240,11 @@ const submit = async () => {
     }
 
     const norm = (v: any) => (v == null || v === '' ? null : Number(v));
+    const temp = norm(temperature.value);
+    if (temp != null && (!Number.isFinite(temp) || temp < 0 || temp > 2)) {
+        toast.add({ title: 'Error', description: 'Temperature must be between 0 and 2', color: 'red' });
+        return;
+    }
     isSubmitting.value = true;
     try {
         const response = await useMyFetch('/llm/models', {
@@ -207,7 +252,7 @@ const submit = async () => {
             body: {
                 provider_id: provider.id,
                 model_id: id,
-                name: id,
+                name: displayName.value.trim() || id,
                 is_custom: true,
                 supports_vision: supportsVision.value,
                 supports_vision_override: supportsVision.value ? true : null,
@@ -217,6 +262,8 @@ const submit = async () => {
                 context_window_tokens_override: norm(contextWindowTokens.value),
                 input_cost_per_million_tokens_usd: norm(costIn.value),
                 output_cost_per_million_tokens_usd: norm(costOut.value),
+                // Empty field → no config key → no temperature is ever sent.
+                config: temp != null ? { temperature: temp } : null,
             },
         });
         if (response.status.value === 'success') {

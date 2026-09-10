@@ -15,6 +15,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 
 from .base import BaseSchema
+from app.ee.encryption import EncryptedJSON
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,15 @@ class ToolExecution(BaseSchema):
     agent_execution = relationship('AgentExecution', back_populates='tool_executions')
 
     plan_decision_id = Column(String(36), ForeignKey('plan_decisions.id'), nullable=True)
+
+    # Native provider call identity. These fields make a tool turn replayable
+    # after a worker/process boundary without copying the whole transcript into
+    # a second JSON blob. Historical rows leave them NULL and are assigned a
+    # stable synthetic call id by the context loader.
+    provider_call_id = Column(String, nullable=True)
+    provider_name = Column(String, nullable=True)
+    provider_signature = Column(String, nullable=True)
+    action_index = Column(Integer, nullable=True)
 
     tool_name = Column(String, nullable=False)
     tool_action = Column(String, nullable=True)
@@ -46,10 +56,12 @@ class ToolExecution(BaseSchema):
     sub_timings_json = Column(JSON, nullable=True)
 
     result_summary = Column(String, nullable=True)
-    result_json = Column(JSON, nullable=True)
+    result_json = Column(EncryptedJSON, nullable=True)
     # Immutable, bounded projection consumed by conversation history. The full
-    # result_json remains untouched for the UI/audit trail.
-    context_summary_json = Column(JSON(none_as_null=True), nullable=True)
+    # result_json remains untouched for the UI/audit trail. Row-heavy tools use
+    # specialized output shapes; ordinary tools prefer the exact model-visible
+    # observation and fall back to a generic result projection when needed.
+    context_summary_json = Column(EncryptedJSON(none_as_null=True), nullable=True)
     artifact_refs_json = Column(JSON, nullable=True)
 
     created_widget_id = Column(String(36), ForeignKey('widgets.id'), nullable=True)
@@ -62,8 +74,15 @@ class ToolExecution(BaseSchema):
 
 
 def before_write_tool_context_summary(mapper, connection, target):
-    """Snapshot row-heavy tool context when its canonical result is written."""
+    """Fill a missing projection when only the canonical result is available.
+
+    Agent execution paths snapshot the richer model-visible observation before
+    the flush. Never replace that snapshot with a projection rebuilt from the
+    tool's different output shape.
+    """
     try:
+        if target.context_summary_json is not None:
+            return
         state = inspect(target)
         if state.attrs.result_json.history.has_changes():
             from app.ai.persisted_summary import build_tool_context_summary
@@ -74,7 +93,6 @@ def before_write_tool_context_summary(mapper, connection, target):
             )
     except Exception as exc:
         # Tool persistence is canonical; a derived optimization is fail-open.
-        target.context_summary_json = None
         logger.warning(
             "Failed to build context summary for tool execution %s: %s",
             target.id,

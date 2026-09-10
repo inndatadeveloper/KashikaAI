@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -207,11 +207,11 @@ class BusinessObjectsCredentials(BaseModel):
         description="",
         json_schema_extra={"ui:type": "password"},
     )
-    auth_type: str = Field(
+    auth_type: Literal["secEnterprise", "secLDAP", "secWinAD", "secSAPR3"] = Field(
         "secEnterprise",
         title="Authentication Type",
         description="CMS authentication plugin: secEnterprise (native), secLDAP, secWinAD (Active Directory), or secSAPR3 (SAP).",
-        json_schema_extra={"ui:type": "string"},
+        json_schema_extra={"ui:type": "select", "ui:options": ["secEnterprise", "secLDAP", "secWinAD", "secSAPR3"]},
     )
 
 
@@ -295,6 +295,12 @@ class PostgreSQLConfig(BaseModel):
         title="Schema",
         description="Optional schema or comma-separated list of schemas",
         json_schema_extra={"ui:type": "string"}
+    )
+    sslmode: str = Field(
+        "prefer",
+        title="SSL Mode",
+        description="libpq sslmode: disable, allow, prefer, require, verify-ca, verify-full. Use 'require' for IAM-authenticated connections (e.g. AWS RDS), which reject unencrypted logins.",
+        json_schema_extra={"ui:type": "select", "ui:options": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]}
     )
 
 
@@ -523,6 +529,50 @@ class SalesforceConfig(BaseModel):
     objects: Optional[str] = Field(None, title="Objects", description="Optional comma-separated objects to index (e.g. Account,Contact,MyObj__c). Leave blank to auto-discover.", json_schema_extra={"ui:type": "string"})
 
 
+# monday.com
+class MondayApiTokenCredentials(BaseModel):
+    """Service API token, plus an optional OAuth app for per-user sign-in
+    (mirrors ServiceNowCredentials). The API token drives catalog indexing and
+    system-scope queries; the `oauth_*` fields — from an app created in
+    monday.com's Developer Center — enable the "Sign in with monday.com"
+    per-user flow and are consumed only by the OAuth authorize/token endpoints
+    (construct_client strips `oauth_`-prefixed keys before they reach the
+    client)."""
+    api_token: str = Field(
+        ...,
+        title="API Token",
+        description="A monday.com API token (avatar → Developers → My access tokens). Use a dedicated service user's token so shared queries don't depend on one person's account.",
+        json_schema_extra={"ui:type": "password"},
+    )
+    oauth_client_id: Optional[str] = Field(
+        None,
+        title="OAuth Client ID",
+        description="Client ID of an app created in monday.com's Developer Center — enables per-user sign-in",
+        json_schema_extra={"ui:type": "string"},
+    )
+    oauth_client_secret: Optional[str] = Field(
+        None,
+        title="OAuth Client Secret",
+        description="Client Secret of the monday.com app",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class MondayConfig(BaseModel):
+    workspaces: Optional[str] = Field(
+        None,
+        title="Workspaces",
+        description="Optional comma-separated workspace names or ids to index. Leave blank for all workspaces the token can see. Use \"Main workspace\" to select boards in monday's legacy Main workspace.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    boards: Optional[str] = Field(
+        None,
+        title="Boards",
+        description="Optional comma-separated board names or ids to index. Leave blank to index every visible board.",
+        json_schema_extra={"ui:type": "textarea"},
+    )
+
+
 # ServiceNow
 class ServiceNowCredentials(BaseModel):
     """Service-account basic auth, plus an optional OAuth client for per-user
@@ -591,6 +641,27 @@ class ServiceNowConfig(BaseModel):
             "as plain sys_id strings with no foreign keys."
         ),
         json_schema_extra={"ui:type": "boolean"}
+    )
+    enable_attachments: bool = Field(
+        True,
+        title="Enable Attachments",
+        description=(
+            "Expose record attachments (e.g. Knowledge Base article files) through the "
+            "file tools (list/read/search). Downloads go through the Attachment API "
+            "(/api/now/attachment) and respect the instance's ACLs for the "
+            "authenticated identity."
+        ),
+        json_schema_extra={"ui:type": "boolean"}
+    )
+    attachment_tables: Optional[str] = Field(
+        "kb_knowledge",
+        title="Attachment Tables",
+        description=(
+            "Comma-separated list of tables whose attachments are exposed. Defaults to "
+            "kb_knowledge (Knowledge Base articles). Add e.g. incident,change_request "
+            "to expose those records' attachments too."
+        ),
+        json_schema_extra={"ui:type": "string"}
     )
 
 
@@ -718,6 +789,53 @@ class PriorityErpConfig(BaseModel):
     )
 
 
+# AppDynamics (Cisco / Splunk AppDynamics)
+class AppDynamicsUserPassCredentials(BaseModel):
+    username: str = Field(
+        ...,
+        title="Username",
+        description="The account name above is appended automatically unless the username already contains \"@\".",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
+
+
+class AppDynamicsApiClientCredentials(BaseModel):
+    client_name: str = Field(
+        ...,
+        title="API Client Name",
+        description="Name of an API Client created under Settings → Administration → API Clients.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    client_secret: str = Field(
+        ...,
+        title="Client Secret",
+        description="The API Client's secret. Short-lived OAuth tokens are fetched and refreshed automatically.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class AppDynamicsConfig(BaseModel):
+    controller_url: str = Field(
+        ...,
+        title="Controller URL",
+        description="Your AppDynamics controller URL, e.g. https://appd.acme.com:8090 (on-prem) or https://acme.saas.appdynamics.com.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    account_name: str = Field(
+        "customer1",
+        title="Account Name",
+        description="The controller account. On-premises single-tenant controllers use \"customer1\".",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the controller's TLS certificate. Disable only for self-signed or private-CA certs on trusted networks (e.g. on-prem controllers).",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+
+
 # Zabbix
 class ZabbixTokenCredentials(BaseModel):
     api_token: str = Field(
@@ -736,6 +854,70 @@ class ZabbixUserPassCredentials(BaseModel):
         json_schema_extra={"ui:type": "string"},
     )
     password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
+
+
+class KubernetesAccessFileCredentials(BaseModel):
+    access_file: str = Field(
+        ...,
+        title="Cluster access file",
+        description=(
+            "Paste the output of print_access_file.sh (step 2 of the setup guide). It embeds the API "
+            "server URL, the cluster CA and the read-only service-account token. Personal kubeconfigs "
+            "(exec plugins, client certificates) are not accepted."
+        ),
+        json_schema_extra={"ui:type": "textarea"},
+    )
+
+
+class KubernetesConfig(BaseModel):
+    namespaces: str = Field(
+        "",
+        title="Namespaces",
+        description="Optional allowlist, comma-separated (e.g. payments, inventory). Leave empty to expose every namespace the token can see.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify TLS",
+        description="Always on in practice — the cluster CA from the access file is used. Disable only for a dev cluster whose CA is missing from the file.",
+        json_schema_extra={"ui:type": "boolean", "ui:hidden": True},
+    )
+    discover_crds: bool = Field(
+        True,
+        title="Discover custom resources",
+        description="Expose populated CustomResourceDefinitions as crd::<group>/<Kind> tables.",
+        json_schema_extra={"ui:type": "boolean", "ui:hidden": True},
+    )
+    max_crd_tables: int = Field(
+        40, ge=0, le=500,
+        title="Max CRD tables",
+        description="Cap on discovered custom-resource tables; the rest stay queryable by name.",
+        json_schema_extra={"ui:type": "number", "ui:hidden": True},
+    )
+    log_tail_default: int = Field(
+        500, ge=1, le=100000,
+        title="Default log lines",
+        description="tail_lines when a logs query omits it.",
+        json_schema_extra={"ui:type": "number", "ui:hidden": True},
+    )
+    log_tail_max: int = Field(
+        5000, ge=1, le=100000,
+        title="Max log lines",
+        description="Hard cap on log lines per pod per query.",
+        json_schema_extra={"ui:type": "number", "ui:hidden": True},
+    )
+    max_log_pods: int = Field(
+        10, ge=1, le=100,
+        title="Max pods per logs query",
+        description="Fan-out cap when logs are queried by label selector.",
+        json_schema_extra={"ui:type": "number", "ui:hidden": True},
+    )
+    request_timeout: int = Field(
+        60, ge=1, le=600,
+        title="Request timeout (s)",
+        description="Seconds per API call.",
+        json_schema_extra={"ui:type": "number", "ui:hidden": True},
+    )
 
 
 class ZabbixConfig(BaseModel):
@@ -757,6 +939,60 @@ class ZabbixConfig(BaseModel):
         le=365,
         title="History Window (days)",
         description="Default lookback window applied when querying metric history/trends without an explicit time range.",
+        json_schema_extra={"ui:type": "number"},
+    )
+
+
+# VMware Aria Operations (vRealize Operations / VCF Operations)
+class AriaOperationsUserPassCredentials(BaseModel):
+    username: str = Field(
+        ...,
+        title="Username",
+        description="A local or LDAP/AD user with at least the ReadOnly role. Basic auth is disabled on 8.18; a session token is acquired automatically.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
+
+
+class AriaOperationsConfig(BaseModel):
+    url: str = Field(
+        ...,
+        title="Aria Operations URL",
+        description="The appliance URL, e.g. https://aria-ops.acme.local (the /suite-api/api path is appended automatically).",
+        json_schema_extra={"ui:type": "string"},
+    )
+    auth_source: str = Field(
+        "LOCAL",
+        title="Auth Source",
+        description="LOCAL for local users, or the name of the LDAP/AD/vIDM source as configured under Administration → Authentication Sources.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the appliance's TLS certificate. Disable only for self-signed certificates on trusted networks; prefer a CA bundle.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    ca_bundle: Optional[str] = Field(
+        None,
+        title="CA Bundle Path (optional)",
+        description="Path on the server to a PEM bundle for a private CA, so TLS verification can stay on.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    history_window_days: int = Field(
+        7,
+        ge=1,
+        le=180,
+        title="History Window (days)",
+        description="Default lookback window for alerts/symptoms when a query gives no explicit time range.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    max_metric_tables: int = Field(
+        40,
+        ge=0,
+        le=500,
+        title="Max Discovered Metric Tables",
+        description="How many per-object-type wide metric tables (metrics::<Adapter>/<Kind>) to discover, largest kinds first. 0 disables discovery.",
         json_schema_extra={"ui:type": "number"},
     )
 
@@ -819,12 +1055,6 @@ class MssqlKerberosDelegatedCredentials(BaseModel):
         title="Use Kerberos SSO",
         description="Queries run under your own Active Directory identity via Kerberos Constrained Delegation.",
         json_schema_extra={"ui:type": "boolean"},
-    )
-    kerberos_impersonate: Optional[str] = Field(
-        None,
-        title="Active Directory Principal (UPN)",
-        description="Your AD user principal name, e.g. jdoe@corp.example.com. Leave blank to use your login identity.",
-        json_schema_extra={"ui:type": "string"},
     )
 
     @model_validator(mode="after")
@@ -947,6 +1177,65 @@ class AWSAthenaConfig(BaseModel):
     workgroup: str = Field("primary", title="Workgroup", description="", json_schema_extra={"ui:type": "string"})
     s3_output_location: Optional[str] = Field(None, title="S3 Output Location", description="Leave blank if your workgroup has a default output location", json_schema_extra={"ui:type": "string"})
     data_source: str = Field("AwsDataCatalog", title="Data Source", description="", json_schema_extra={"ui:type": "string"})
+
+
+# AWS CloudWatch — log groups (Logs Insights) + metrics.
+# Credentials mirror the S3/Athena idiom so boto3 session construction is shared:
+# static keys, keys + STS assume-role, or the default credential chain.
+class AWSCloudWatchKeyCredentials(BaseModel):
+    access_key: str = Field(..., title="Access Key", description="AWS access key id.", json_schema_extra={"ui:type": "string"})
+    secret_key: str = Field(..., title="Secret Key", description="AWS secret access key.", json_schema_extra={"ui:type": "password"})
+    session_token: Optional[str] = Field(None, title="Session Token", description="Optional session token for temporary credentials.", json_schema_extra={"ui:type": "password"})
+
+
+class AWSCloudWatchRoleCredentials(BaseModel):
+    role_arn: str = Field(..., title="Role ARN", description="ARN of the IAM role to assume (STS) for CloudWatch access.", json_schema_extra={"ui:type": "string"})
+    access_key: Optional[str] = Field(None, title="Access Key", description="Optional — access key id used to assume the role. Leave blank to use the instance profile / IRSA.", json_schema_extra={"ui:type": "string"})
+    secret_key: Optional[str] = Field(None, title="Secret Key", description="Optional — secret access key used to assume the role. Leave blank to use the instance profile / IRSA.", json_schema_extra={"ui:type": "password"})
+
+
+class AWSCloudWatchDefaultCredentials(BaseModel):
+    """No credentials required — boto3 resolves via its default chain (env vars,
+    shared config, instance profile, EKS IRSA)."""
+    class Config:
+        extra = "allow"
+
+
+class AWSCloudWatchConfig(BaseModel):
+    region: str = Field(
+        ...,
+        title="Region",
+        description="AWS region to read CloudWatch from (e.g. 'eu-west-1'). Log groups and metrics are per-region.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    log_group_prefix: Optional[str] = Field(
+        None,
+        title="Log Group Prefix",
+        description="Only discover log groups whose name starts with this (e.g. '/aws/lambda/'). Strongly recommended — accounts routinely have thousands. Leave blank to index every log group in the region.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    metric_namespaces: Optional[str] = Field(
+        None,
+        title="Metric Namespaces",
+        description="Comma-separated CloudWatch namespaces to index as tables (e.g. 'AWS/EC2,AWS/RDS'). Leave blank to skip metrics and index log groups only.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    discovery_window_hours: int = Field(
+        24,
+        ge=1,
+        le=720,
+        title="Discovery Window (hours)",
+        description="How far back to sample log events when inferring a log group's columns. Larger windows find more fields but cost more to scan.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    max_sampled_log_groups: int = Field(
+        25,
+        ge=0,
+        le=500,
+        title="Max Sampled Log Groups",
+        description="Cap on how many log groups (ranked by stored bytes) get their fields sampled during indexing. The rest are still listed, with the built-in @-fields only. Keeps reindexing cheap — Logs Insights bills on bytes scanned.",
+        json_schema_extra={"ui:type": "number"},
+    )
 
 
 # Vertica
@@ -1352,6 +1641,18 @@ class ElasticsearchConfig(BaseModel):
         description="Optional comma-separated index names or globs to expose (e.g. logs-*,metrics-*). Default: all non-system indices.",
         json_schema_extra={"ui:type": "string"},
     )
+    kibana_url: Optional[str] = Field(
+        None,
+        title="Kibana URL",
+        description=(
+            "Optional Kibana base URL (e.g. https://kibana.example.com:5601). "
+            "When set, the connection also catalogs Kibana dashboards and saved "
+            "searches so the agent can reuse the team's curated investigation "
+            "queries. Authenticates with this connection's Elasticsearch "
+            "credentials (API key or username/password)."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
 
 
 # Azure Data Explorer (Kusto)
@@ -1451,6 +1752,18 @@ class PrometheusConfig(BaseModel):
         title="Metric Name Filter",
         description="Optional prefix to bound metric discovery on large instances (e.g. 'node_' or 'http_'). Leave blank to index all metrics.",
         json_schema_extra={"ui:type": "string"},
+    )
+    discovery_lookback_hours: Optional[float] = Field(
+        None,
+        title="Discovery Lookback (hours)",
+        description="How far back schema discovery looks for a metric's labels. Defaults to 1 hour, which keeps indexing cheap on high-churn instances. Raise it only if a metric is scraped less often than that and its labels are being missed.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    timeout: Optional[int] = Field(
+        None,
+        title="Request Timeout (seconds)",
+        description="Per-request timeout for the Prometheus HTTP API. Defaults to 30. Raise it for a slow or heavily loaded instance.",
+        json_schema_extra={"ui:type": "number"},
     )
 
 
@@ -1870,6 +2183,69 @@ class SharePointConfig(BaseModel):
             "library with more than this is truncated — scope it with the folder "
             "path or include patterns instead of raising this."
         ),
+        json_schema_extra={"ui:type": "number"},
+    )
+
+
+# SharePoint Server uses Windows auth and its own REST API, not Graph.
+class SharePointOnpremConfig(SharePointConfig):
+    site_url: str = Field(..., title="Site URL", description="SharePoint Server site URL, including /sites/name. Not the Central Administration URL.", json_schema_extra={"ui:type": "string"})
+    allow_http: bool = Field(False, title="Allow HTTP (test labs only)", description="Allow unencrypted HTTP for an isolated lab. Use HTTPS with a trusted certificate for customer deployments.", json_schema_extra={"ui:type": "boolean"})
+    max_file_size_mb: int = Field(50, ge=1, le=250, title="Max file size (MB)", description="Reject oversized downloads before parsing; files are never silently truncated.", json_schema_extra={"ui:type": "number"})
+    max_catalog_objects: int = Field(5000, ge=1, le=50000, title="Max Files", json_schema_extra={"ui:type": "number"})
+
+
+class SharePointOnpremNtlmCredentials(BaseModel):
+    username: str = Field(..., min_length=1, title="Domain username", description="DOMAIN\\username or user@domain. Use a read-only account scoped to the intended libraries.", json_schema_extra={"ui:type": "string"})
+    password: str = Field(..., min_length=1, title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class SharePointOnpremKerberosCredentials(BaseModel):
+    kerberos: bool = Field(True, json_schema_extra={"ui:hidden": True})
+    principal: Optional[str] = Field(None, title="Service principal", description="Optional service-account UPN. Administrators must mount krb5.conf and the client keytab (KRB5_CLIENT_KTNAME), or provide a ticket cache. This authenticates as the service account, not as the signed-in BOW user.", json_schema_extra={"ui:type": "string"})
+
+    @model_validator(mode="after")
+    def require_kerberos(self):
+        if not self.kerberos:
+            raise ValueError("Kerberos must be enabled for this authentication variant.")
+        return self
+
+
+# SharePoint Lists (Microsoft Graph — same auth as SharePoint, but surfaces
+# the site's LISTS as queryable tables instead of its libraries as files).
+class SharePointListsCredentials(SharePointCredentials):
+    """SharePoint Lists uses the same Microsoft Graph auth as SharePoint."""
+    pass
+
+
+class SharePointListsConfig(BaseModel):
+    site_url: str = Field(
+        ...,
+        title="Site URL",
+        description="Full SharePoint site URL, e.g. https://contoso.sharepoint.com/sites/Finance",
+        json_schema_extra={"ui:type": "string"}
+    )
+    lists: Optional[str] = Field(
+        "*",
+        title="Lists",
+        description=(
+            "Lists to expose as tables. Use '*' (default) for ALL lists on the "
+            "site, or a comma-separated set of list names to restrict the "
+            "connection (e.g. 'Expenses 2025, Vendors'). Document libraries are "
+            "never included — use the SharePoint (files) connector for those."
+        ),
+        json_schema_extra={"ui:type": "string"}
+    )
+    include_hidden: bool = Field(
+        False,
+        title="Include Hidden Lists",
+        description="Also expose lists SharePoint marks as hidden (site plumbing). Usually off.",
+        json_schema_extra={"ui:type": "boolean"}
+    )
+    max_items: int = Field(
+        20000,
+        title="Max Rows Per Query",
+        description="Safety cap on how many list items a single query may fetch.",
         json_schema_extra={"ui:type": "number"},
     )
 
@@ -2326,6 +2702,22 @@ class QVDConfig(BaseModel):
         ...,
         title="File Paths",
         description="QVD file paths or glob patterns (one per line). e.g., /data/*.qvd",
+        json_schema_extra={"ui:type": "textarea"}
+    )
+
+
+# Power BI (.pbix) Files
+class PBIXCredentials(BaseModel):
+    """No credentials needed - file system access only."""
+    class Config:
+        extra = "allow"
+
+
+class PBIXConfig(BaseModel):
+    file_paths: str = Field(
+        ...,
+        title="File Paths",
+        description="Power BI (.pbix) file paths or glob patterns (one per line). e.g., /data/*.pbix",
         json_schema_extra={"ui:type": "textarea"}
     )
 
@@ -3244,6 +3636,9 @@ __all__ = [
     # SharePoint / OneDrive / Google Drive (file connectors)
     "SharePointCredentials",
     "SharePointConfig",
+    "SharePointOnpremConfig",
+    "SharePointOnpremNtlmCredentials",
+    "SharePointOnpremKerberosCredentials",
     "OneDriveCredentials",
     "OneDriveConfig",
     "GoogleDriveCredentials",

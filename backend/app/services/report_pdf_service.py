@@ -26,8 +26,13 @@ import asyncio
 import json
 import logging
 import math
+import os
+import re
+import signal
+import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from app.services.artifact_libs import get_inline_scripts
 
@@ -38,6 +43,56 @@ _CSS_PX_PER_IN = 96
 # A4 portrait, in inches.
 _PAPER_IN = (8.27, 11.69)
 _MARGIN_IN = 0.4
+
+# Documents are not dashboards: they print portrait, at document margins, and
+# they never shrink to fit one sheet — a report is as long as it is. 20mm is
+# Word's own default and mirrors the `@page` rule in pages/print/doc.vue; the
+# two must agree or the layout width the charts are sized at is not the width
+# they are printed at.
+_DOC_MARGIN_IN = 20 / 25.4
+
+# The paper page signals that the markdown is laid out; charts settle after.
+_DOC_READY_SELECTOR = "html[data-bow-doc-ready]"
+
+# A chart figure carries `doc-viz--tall` (DocVizEmbed.vue) and is done when
+# ECharts has put a canvas in it. Waiting on this instead of a fixed sleep is
+# what keeps a half-drawn chart out of the export.
+_DOC_CHARTS_READY_JS = """
+() => {
+  const figures = document.querySelectorAll('.doc-viz--tall');
+  for (let i = 0; i < figures.length; i++) {
+    if (!figures[i].querySelector('canvas, svg')) return false;
+  }
+  return true;
+}
+"""
+
+# `_PREPARE_PRINT_JS` keeps whole anything that fits a sheet, which is right
+# for a chart and wrong for a table: a table that will not fit the remaining
+# space then jumps to the next page and leaves a hole where it was. Word breaks
+# tables and repeats their header (`thead { display: table-header-group }`), and
+# a document should read the same way. Rows stay unbroken either way.
+_DOC_TABLE_BREAKS_JS = """
+() => {
+  let n = 0;
+  const tables = document.querySelectorAll('.bow-doc table');
+  for (let i = 0; i < tables.length; i++) {
+    const table = tables[i];
+    table.style.removeProperty('break-inside');
+    // The card/figure a table sits in was marked too; a wrapper that also
+    // holds a chart or an image keeps its rule.
+    let el = table.parentElement;
+    while (el && !el.classList.contains('bow-doc')) {
+      if (!el.querySelector('canvas, img')) el.style.removeProperty('break-inside');
+      el = el.parentElement;
+    }
+    n++;
+  }
+  return n;
+}
+"""
+
+_FILE_PLACEHOLDER_RE = re.compile(r"\{\{\s*file:\s*([0-9a-fA-F-]{8,64})\s*(?:\|[^}]*)?\}\}")
 
 
 def _page_geometry(landscape: bool) -> tuple[float, float, int, int]:
@@ -52,6 +107,54 @@ def _page_geometry(landscape: bool) -> tuple[float, float, int, int]:
     content_w = round((w_in - 2 * _MARGIN_IN) * _CSS_PX_PER_IN)
     content_h = round((h_in - 2 * _MARGIN_IN) * _CSS_PX_PER_IN)
     return w_in, h_in, content_w, content_h
+
+
+def _doc_page_geometry() -> tuple[int, int]:
+    """The printable box of a document page, in CSS pixels.
+
+    This is the width the paper page is laid out at, so a chart is measured for
+    the sheet it lands on rather than for a desktop window.
+    """
+    w_in, h_in = _PAPER_IN
+    return (
+        round((w_in - 2 * _DOC_MARGIN_IN) * _CSS_PX_PER_IN),
+        round((h_in - 2 * _DOC_MARGIN_IN) * _CSS_PX_PER_IN),
+    )
+
+
+def _chromium_executable() -> Optional[str]:
+    """Explicit Chromium path, where the deployment provides one.
+
+    Same convention as every other headless launch in the app (artifact render
+    validation, thumbnails, jsx_transpile): images that ship a system Chromium
+    instead of Playwright's own download point BOW_CHROMIUM_EXECUTABLE at it.
+    """
+    return os.environ.get("BOW_CHROMIUM_EXECUTABLE") or None
+
+
+def _render_origin() -> str:
+    """Origin the headless browser loads this deployment's own pages from.
+
+    The standard image serves the SPA from this very process (SERVE_FRONTEND=1,
+    see app/core/spa.py), so the app's configured base_url doubles as an
+    internal address — with one fix: `0.0.0.0` is an address to LISTEN on, not
+    one to connect to. Deployments that split the frontend off, or put an
+    authenticating proxy in front of it, set BOW_RENDER_ORIGIN to whatever the
+    backend can actually reach.
+    """
+    override = (os.environ.get("BOW_RENDER_ORIGIN") or "").strip()
+    if override:
+        return override.rstrip("/")
+
+    from app.settings.config import settings
+
+    base = (getattr(settings.bow_config, "base_url", None) or "http://127.0.0.1:3000").strip()
+    parts = urlsplit(base if "//" in base else f"http://{base}")
+    host = parts.hostname or "127.0.0.1"
+    if host in ("0.0.0.0", "::", "[::]"):
+        host = "127.0.0.1"
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme or "http", netloc, "", "", "")).rstrip("/")
 
 
 # Runs in the page right before measuring/printing. Takes the printable page
@@ -193,6 +296,57 @@ _PRINT_CSS = """
 """
 
 
+def _kill_chromium_tree(marker: str) -> int:
+    """SIGKILL the Chromium launched with `marker` in its argv, descendants first.
+
+    When a render times out, the task cancellation can interrupt Playwright's
+    own teardown, and even a clean teardown cannot stop a renderer whose main
+    thread is spinning in JS: it never services the shutdown IPC, survives its
+    parent's death, reparents to init and burns a core forever. So the process
+    tree has to be walked and killed leaf-first while the parent links are
+    still intact. /proc-based and best-effort: on hosts without /proc (deploys
+    run on Linux) this is a silent no-op.
+    """
+    killed = 0
+    try:
+        children_by_parent: dict[int, list[int]] = {}
+        marked: list[int] = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
+                stat = Path(f"/proc/{pid}/stat").read_text()
+            except OSError:
+                continue
+            try:
+                # Field 4 of /proc/pid/stat, after the parenthesised comm
+                # (which may itself contain spaces).
+                ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            except (IndexError, ValueError):
+                continue
+            children_by_parent.setdefault(ppid, []).append(pid)
+            if marker in cmdline:
+                marked.append(pid)
+
+        def _descendants(pid: int):
+            for child in children_by_parent.get(pid, []):
+                yield from _descendants(child)
+                yield child
+
+        for root in marked:
+            for pid in [*_descendants(root), root]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return killed
+
+
 class ReportPdfService:
     """Generates PDF snapshots of artifacts using headless Chromium."""
 
@@ -211,6 +365,12 @@ class ReportPdfService:
     OVERFLOW_GUTTER_PX = 32
     # Seconds to let ECharts re-render after each layout change.
     SETTLE_SECONDS = 1.2
+    # Hard wall-clock cap on one Chromium render. The individual Playwright
+    # calls each have their own timeout, but page.pdf() does not — a wedged
+    # renderer (huge canvas at device_scale_factor=2, OOMing tab) would
+    # otherwise hang the awaiting request forever, and with it every caller
+    # queued on the per-report export lock.
+    RENDER_TIMEOUT_SECONDS = 150
 
     def __init__(self):
         self.UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -227,21 +387,173 @@ class ReportPdfService:
             Relative path to the PDF file (e.g. "pdfs/{id}.pdf"), or None on failure.
         """
         try:
-            from playwright.async_api import async_playwright
+            from playwright.async_api import async_playwright  # noqa: F401
         except ImportError:
             logger.warning("Playwright not installed, skipping PDF generation")
             return None
+
+        return await self._bounded_render(
+            artifact_id,
+            lambda marker: self._generate_pdf_inner(artifact_id, html_content, marker),
+        )
+
+    async def _bounded_render(self, artifact_id: str, make_render) -> Optional[str]:
+        """Run one Chromium render under the wall-clock cap, killing the leak.
+
+        Shared by the dashboard and document renderers: the timeout is the
+        interesting part, because cancellation interrupts Playwright's teardown
+        and a wedged renderer survives even a clean one.
+        """
+        # Unique argv marker so a timed-out render's Chromium tree can be
+        # found and killed (see _kill_chromium_tree). Chromium ignores unknown
+        # switches.
+        marker = f"--bow-pdf-export={uuid.uuid4().hex}"
+        try:
+            return await asyncio.wait_for(
+                make_render(marker), timeout=self.RENDER_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "PDF render for artifact %s exceeded %ss; aborting",
+                artifact_id, self.RENDER_TIMEOUT_SECONDS,
+            )
+            killed = await asyncio.to_thread(_kill_chromium_tree, marker)
+            if killed:
+                logger.info(
+                    "Killed %s leftover Chromium processes for artifact %s",
+                    killed, artifact_id,
+                )
+            return None
+        except Exception as e:
+            logger.exception(f"Failed to generate PDF for artifact {artifact_id}: {e}")
+            await asyncio.to_thread(_kill_chromium_tree, marker)
+            return None
+
+    async def generate_doc_pdf(
+        self, artifact_id: str, doc: dict[str, Any]
+    ) -> Optional[str]:
+        """Render a document artifact to PDF via the app's own paper page.
+
+        Returns the relative path ("pdfs/{id}.pdf"), or None on failure.
+        """
+        try:
+            from playwright.async_api import async_playwright  # noqa: F401
+        except ImportError:
+            logger.warning("Playwright not installed, skipping PDF generation")
+            return None
+
+        return await self._bounded_render(
+            artifact_id,
+            lambda marker: self._generate_doc_pdf_inner(artifact_id, doc, marker),
+        )
+
+    async def _generate_doc_pdf_inner(
+        self, artifact_id: str, doc: dict[str, Any], marker: str
+    ) -> Optional[str]:
+        """Print frontend/pages/print/doc.vue with this document's data.
+
+        The doc's own renderer is DocViewer.vue — markdown-it, the ECharts
+        wrapper every chart in the app uses, mermaid. Reproducing that
+        server-side would be a second renderer to keep in step, so the export
+        drives the real one: inject the data, load the standalone paper page,
+        settle it, print it. No app shell is involved, which is the whole point
+        — printing the shell is what produced a narrow ribbon of text down the
+        right margin of twenty sheets.
+        """
+        from playwright.async_api import async_playwright
+
+        pdf_path = self.UPLOADS_DIR / f"{artifact_id}.pdf"
+        content_w, content_h = _doc_page_geometry()
+        url = f"{_render_origin()}/print/doc"
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True, args=[marker], executable_path=_chromium_executable()
+                )
+                # Lay out at the printable width from the start so ECharts
+                # bakes the paper's width into its canvas, and at 2x so those
+                # canvases are not the one blurry thing on the page.
+                page = await browser.new_page(
+                    viewport={"width": content_w, "height": content_h},
+                    device_scale_factor=2,
+                )
+                await page.emulate_media(media="print", color_scheme="light")
+
+                # Injected BEFORE navigation: the page renders from this and
+                # fetches nothing, so the route needs no session — and can
+                # never serve a document to whoever opens it directly.
+                await page.add_init_script(
+                    f"window.__BOW_DOC__ = {json.dumps(doc, default=str)};"
+                )
+
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if response is not None and not response.ok:
+                    logger.warning(
+                        "Doc PDF: %s returned HTTP %s for artifact %s",
+                        url, response.status, artifact_id,
+                    )
+                    await browser.close()
+                    return None
+
+                await page.wait_for_selector(_DOC_READY_SELECTOR, timeout=30000)
+                try:
+                    await page.wait_for_function(_DOC_CHARTS_READY_JS, timeout=30000)
+                except Exception:
+                    logger.warning(
+                        "Doc PDF: charts did not finish rendering for artifact %s",
+                        artifact_id,
+                    )
+
+                # The same print preparation the dashboard export uses: expand
+                # what clips, unstick sticky headers, and keep whole anything
+                # that fits a sheet.
+                await page.add_style_tag(content=_PRINT_CSS)
+                await self._settle(page, content_h)
+                try:
+                    await page.evaluate(_DOC_TABLE_BREAKS_JS)
+                except Exception as e:
+                    logger.warning("Doc PDF: could not free table page breaks: %s", e)
+
+                # No fit-to-page search here. A document is as long as it is;
+                # shrinking it to one sheet is what a dashboard wants, not a
+                # report someone is going to read.
+                pdf_bytes = await page.pdf(
+                    prefer_css_page_size=True,
+                    print_background=True,
+                )
+                await browser.close()
+
+            pdf_path.write_bytes(pdf_bytes)
+            logger.info(
+                "Rendered doc PDF for artifact %s: layout_width=%spx", artifact_id, content_w
+            )
+            return f"pdfs/{artifact_id}.pdf"
+
+        except Exception as e:
+            logger.exception(f"Failed to generate doc PDF for artifact {artifact_id}: {e}")
+            return None
+
+    async def _generate_pdf_inner(
+        self, artifact_id: str, html_content: str, marker: str
+    ) -> Optional[str]:
+        """The actual render. Callers go through generate_pdf, which bounds this
+        with RENDER_TIMEOUT_SECONDS and turns any failure into None."""
+        from playwright.async_api import async_playwright
 
         pdf_path = self.UPLOADS_DIR / f"{artifact_id}.pdf"
 
         # Dashboards are authored as wide grids, so a landscape sheet needs the
         # least shrink to hold one. (Only page-mode artifacts reach this path;
-        # decks convert from their .pptx and docs are refused.)
+        # decks convert from their .pptx and docs print through
+        # _generate_doc_pdf_inner, portrait and unshrunk.)
         paper_w_in, paper_h_in, content_w, content_h = _page_geometry(landscape=True)
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(
+                    headless=True, args=[marker], executable_path=_chromium_executable()
+                )
                 # Lay out at the printable width from the start: responsive
                 # breakpoints and every JS-measured chart size are then computed
                 # for the paper, not for a desktop window that does not exist.
@@ -436,18 +748,18 @@ class ReportPdfService:
                     )
                     return None
 
-                # Prefer the dashboard. A deck can still be exported (via its
-                # .pptx, see _render_slides_pdf), but a report that has both
-                # should send the dashboard: that is what the report view shows.
+                # Prefer the dashboard: a report that has one shows it, and
+                # that is what a report-level PDF should be. A deck falls back
+                # to its .pptx (_render_slides_pdf) and a document to its paper
+                # page (_render_doc_pdf), so a report made only of one of those
+                # still exports rather than silently producing nothing.
                 artifact = None
-                for wanted_mode in ("page", "slides"):
+                for wanted_mode in ("page", "slides", "doc"):
                     stmt = (
                         select(Artifact)
                         .where(
                             Artifact.report_id == report_id,
                             Artifact.deleted_at.is_(None),
-                            # Docs export via generate_for_artifact with the
-                            # doc's id, never as the report-level PDF.
                             Artifact.mode == wanted_mode,
                         )
                         .order_by(Artifact.created_at.desc())
@@ -505,17 +817,57 @@ class ReportPdfService:
             return await self._render_slides_pdf(artifact)
 
         if mode == "doc":
-            # Docs are markdown + {{viz:...}} placeholders rendered client-side
-            # by DocViewer.vue; there is no server-side renderer for them, and
-            # the HTML path below would emit an empty page (docs have no
-            # content['code']). Fail instead of attaching a blank PDF.
-            logger.warning(
-                "PDF export is not supported for doc artifact %s "
-                "(no server-side markdown renderer)", artifact.id,
-            )
-            return None
+            # A doc is markdown + {{viz:...}} placeholders, rendered by
+            # DocViewer.vue. It has no content['code'] for the HTML path below,
+            # and its own renderer is the frontend's — so print that.
+            return await self._render_doc_pdf(db, artifact)
 
         return await self._render_page_pdf(db, artifact)
+
+    async def _render_doc_pdf(self, db, artifact) -> Optional[str]:
+        """Collect a document's data and print it on paper.
+
+        Returns the absolute filesystem path to the PDF, or None on failure.
+        """
+        from app.services.artifact_payload import collect_visualizations
+
+        markdown = (artifact.content or {}).get("markdown") or ""
+        if not markdown.strip():
+            logger.warning("Doc artifact %s has no markdown to render", artifact.id)
+            return None
+
+        doc = {
+            "title": artifact.title or "Document",
+            "markdown": markdown,
+            # Same collection (and same ordering) the dashboard export uses, so
+            # a {{viz:id}} binds to exactly the rows the viewer sees.
+            "visualizations": await collect_visualizations(db, artifact),
+            "files": await self._doc_file_datauris(db, markdown),
+        }
+        rel_path = await self.generate_doc_pdf(str(artifact.id), doc)
+        if rel_path:
+            return str(self.UPLOADS_DIR / f"{artifact.id}.pdf")
+        return None
+
+    async def _doc_file_datauris(self, db, markdown: str) -> dict[str, str]:
+        """Embedded images by file id, as data: URIs.
+
+        A doc references files by placeholder rather than recording them in
+        content['files'] the way a dashboard does, so the ids come from the
+        markdown itself. The headless browser has no session to fetch them with
+        — without this every {{file:...}} would print as "image unavailable".
+        """
+        from app.ai.tools.implementations._artifact_images import build_file_datauris
+
+        ids = list(dict.fromkeys(_FILE_PLACEHOLDER_RE.findall(markdown)))
+        if not ids:
+            return {}
+        try:
+            entries = await build_file_datauris(db, [{"id": fid} for fid in ids])
+        except Exception as e:
+            logger.warning("Doc PDF: could not inline embedded files: %s", e)
+            return {}
+        return {e["id"]: e["dataUri"] for e in entries if e.get("dataUri")}
 
     async def _render_slides_pdf(self, artifact) -> Optional[str]:
         """Convert a slides artifact's generated .pptx to PDF via LibreOffice."""
@@ -560,86 +912,15 @@ class ReportPdfService:
 
         Returns the absolute filesystem path to the PDF, or None on failure.
         """
-        from app.ai.tools.implementations._artifact_images import build_file_datauris
-        from app.models.report import Report
-        from app.models.visualization import Visualization
-        from app.models.query import Query
-        from app.models.step import Step
-        from sqlalchemy import select
-        from sqlalchemy.orm import selectinload
+        from app.services.artifact_payload import collect_artifact_payload
 
-        report = await db.get(Report, artifact.report_id)
-        if not report:
+        payload = await collect_artifact_payload(db, artifact)
+        if payload is None:
             return None
 
-        # Get visualization data for the artifact's report
-        viz_stmt = (
-            select(Visualization)
-            .options(selectinload(Visualization.query))
-            .where(Visualization.report_id == artifact.report_id)
-        )
-        viz_result = await db.execute(viz_stmt)
-        visualizations = viz_result.scalars().all()
-
-        # Dashboard code addresses visualizations BY INDEX (viz[0], viz[1], ...),
-        # and that index is defined by the artifact's ORDERED
-        # content["visualization_ids"]. Mirror the live client
-        # (frontend/components/dashboard/ArtifactFrame.vue): scope to this
-        # artifact's visualizations and order them by that list, appending any
-        # stragglers last. Without this, window.ARTIFACT_DATA would be a
-        # report-wide, unordered superset and every index-based lookup in the
-        # dashboard would bind to the wrong visualization — producing missing
-        # numbers and empty chart series in the exported/emailed PDF.
-        viz_ids = (artifact.content or {}).get("visualization_ids") or []
-        if viz_ids:
-            viz_by_id = {str(v.id): v for v in visualizations}
-            ordered = [viz_by_id[vid] for vid in viz_ids if vid in viz_by_id]
-            ordered_id_set = set(viz_ids)
-            ordered.extend(v for v in visualizations if str(v.id) not in ordered_id_set)
-            visualizations = ordered
-
-        viz_data = []
-        for viz in visualizations:
-            if not viz.query_id:
-                continue
-            query = await db.get(Query, viz.query_id)
-            if not query:
-                continue
-
-            step = None
-            if query.default_step_id:
-                step = await db.get(Step, query.default_step_id)
-            if not step:
-                step_result = await db.execute(
-                    select(Step).where(Step.query_id == query.id).order_by(Step.created_at.desc()).limit(1)
-                )
-                step = step_result.scalar_one_or_none()
-
-            viz_data.append({
-                "id": str(viz.id),
-                "title": viz.title or query.title or "Untitled",
-                "view": viz.view or {},
-                "rows": step.data.get("rows", []) if step and step.data else [],
-                "columns": step.data.get("columns", []) if step and step.data else [],
-                "dataModel": step.data_model or {} if step else {},
-            })
-
-        # Embedded images/PDFs are fetched by the live viewer over an
-        # authenticated /files/{id}/content route the headless browser cannot
-        # use; without inlining them here every <BowFile> in the artifact
-        # renders as a placeholder in the export.
-        files_data = await build_file_datauris(
-            db, (artifact.content or {}).get("files") or []
-        )
-
-        artifact_code = artifact.content.get("code", "")
         html_content = self._build_pdf_html(
-            report_id=str(report.id),
-            report_title=report.title,
-            report_theme=report.theme_name,
-            artifact_code=artifact_code,
-            visualizations=viz_data,
-            files=files_data,
+            artifact_data=payload,
+            artifact_code=artifact.content.get("code", ""),
             mode=artifact.mode or "page",
         )
 
@@ -655,24 +936,17 @@ class ReportPdfService:
 
     def _build_pdf_html(
         self,
-        report_id: str,
-        report_title: Optional[str],
-        report_theme: Optional[str],
+        artifact_data: dict,
         artifact_code: str,
-        visualizations: list,
-        files: Optional[list] = None,
         mode: str = "page",
     ) -> str:
-        """Build the standalone HTML the headless browser renders for print."""
-        artifact_data = {
-            "report": {
-                "id": report_id,
-                "title": report_title,
-                "theme": report_theme,
-            },
-            "visualizations": visualizations,
-            "files": files or [],
-        }
+        """Build the standalone HTML the headless browser renders for print.
+
+        artifact_data comes from services.artifact_payload.collect_artifact_payload
+        — shared with the standalone HTML export so both stay in step. PDF
+        exports are shareable documents, so it renders anonymously
+        (current_user is None).
+        """
         data_json = json.dumps(artifact_data, default=str)
 
         page_scripts = get_inline_scripts(mode="page")

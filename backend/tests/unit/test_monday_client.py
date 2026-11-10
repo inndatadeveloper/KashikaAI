@@ -19,6 +19,7 @@ import json
 import pandas as pd
 import pytest
 
+from tests.utils.egress_fakes import one_shot
 from app.data_sources.clients.monday_client import MondayClient
 
 
@@ -33,6 +34,7 @@ BOARD_MAIN = {
     "board_kind": "public",
     "items_count": 3,
     "workspace": {"id": "9", "name": "Sales"},
+    "url": "https://acme.monday.com/boards/111",
     "columns": [
         {"id": "name", "title": "Name", "type": "name", "settings_str": "{}"},
         {"id": "color_1", "title": "Status", "type": "status", "settings_str": STATUS_SETTINGS},
@@ -79,7 +81,8 @@ BOARD_MULTI_LEVEL = {
 
 
 def item(item_id, name, values):
-    return {"id": str(item_id), "name": name, "group": {"title": "Main"}, "column_values": values}
+    return {"id": str(item_id), "name": name, "group": {"title": "Main"},
+            "url": f"https://acme.monday.com/boards/111/pulses/{item_id}", "column_values": values}
 
 
 ITEMS_PAGE_1 = {
@@ -136,7 +139,7 @@ def fake_post(monkeypatch, responder):
         calls.append(json)
         return responder(json["query"], json.get("variables") or {})
 
-    monkeypatch.setattr("app.data_sources.clients.monday_client.requests.post", post)
+    monkeypatch.setattr("app.data_sources.clients.monday_client.pinned_request", one_shot(post))
     return calls
 
 
@@ -216,7 +219,9 @@ def test_no_credentials():
 
 def test_get_schemas_shape(monkeypatch):
     fake_post(monkeypatch, boards_responder(ALL_BOARDS))
-    tables = MondayClient(api_token="t").get_schemas()
+    events = []
+    tables = MondayClient(api_token="t").get_schemas(progress_callback=lambda *e: events.append(e))
+    assert any(e[0] == 'boards' and e[2] > 0 for e in events)
     names = {t.name for t in tables}
     # subitem board dropped; duplicate names disambiguated with the board id
     assert names == {"Sales Pipeline", "Accounts", "Tasks [444]", "Tasks [555]"}
@@ -224,7 +229,10 @@ def test_get_schemas_shape(monkeypatch):
     main = next(t for t in tables if t.name == "Sales Pipeline")
     columns = {c.name: c for c in main.columns}
     # base columns + board columns named by title; "name"-type column not duplicated
-    assert list(columns)[:3] == ["item_id", "name", "group"]
+    assert list(columns)[:4] == ["item_id", "name", "group", "item_url"]
+    # the board link is published so the agent can cite it for aggregates
+    assert main.metadata_json["board_url"] == "https://acme.monday.com/boards/111"
+    assert "url: https://acme.monday.com/boards/111" in main.description
     assert columns["Amount"].dtype == "float"
     assert columns["Approved"].dtype == "bool"
     assert columns["Priority"].dtype == "int"
@@ -271,7 +279,7 @@ def test_get_schemas_discovers_classic_and_multi_level_boards(monkeypatch):
             boards.append(BOARD_MULTI_LEVEL)
         return FakeResponse({"data": {"boards": boards if variables["page"] == 1 else []}})
 
-    monkeypatch.setattr("app.data_sources.clients.monday_client.requests.post", post)
+    monkeypatch.setattr("app.data_sources.clients.monday_client.pinned_request", one_shot(post))
 
     tables = MondayClient(api_token="t").get_schemas()
 
@@ -407,13 +415,14 @@ def test_execute_query_flattening_and_pagination(monkeypatch):
     fake_post(monkeypatch, boards_responder(ALL_BOARDS))
     df = MondayClient(api_token="t").execute_query(json.dumps({"board": "Sales Pipeline", "limit": 10}))
     assert list(df.columns) == [
-        "item_id", "name", "group", "Status", "Amount", "Due Date", "Approved", "Priority",
+        "item_id", "name", "group", "item_url", "Status", "Amount", "Due Date", "Approved", "Priority",
         "Account", "Account (item_ids)",
     ]
     # both pages fetched through the cursor
     assert len(df) == 3
     row = df.iloc[0]
     assert row["item_id"] == 1
+    assert row["item_url"] == "https://acme.monday.com/boards/111/pulses/1"
     assert row["Amount"] == 1200.5
     assert row["Approved"] is True or row["Approved"] == True  # noqa: E712
     assert row["Priority"] == 4
@@ -456,10 +465,10 @@ def test_execute_query_accepts_base_columns_in_selection(monkeypatch):
     calls = fake_post(monkeypatch, boards_responder(ALL_BOARDS))
     df = MondayClient(api_token="t").execute_query(json.dumps({
         "board": "Sales Pipeline",
-        "columns": ["item_id", "name", "group", "Status"],
+        "columns": ["item_id", "name", "group", "item_url", "Status"],
         "limit": 3,
     }))
-    assert list(df.columns) == ["item_id", "name", "group", "Status"]
+    assert list(df.columns) == ["item_id", "name", "group", "item_url", "Status"]
     items_call = next(c for c in calls if "items_page" in c["query"])
     assert items_call["variables"]["cols"] == ["color_1"]  # only the board column is fetched
 
@@ -543,7 +552,7 @@ def test_execute_query_item_ids_companion_selectable_and_joinable(monkeypatch):
     fake_post(monkeypatch, responder)
     df = MondayClient(api_token="t").execute_query(json.dumps(
         {"board": "Linked Board", "columns": ["Account (item_ids)"], "limit": 5}))
-    assert list(df.columns) == ["item_id", "name", "group", "Account", "Account (item_ids)"]
+    assert list(df.columns) == ["item_id", "name", "group", "item_url", "Account", "Account (item_ids)"]
 
     accounts = pd.DataFrame({"item_id": [10, 11], "name": ["Acme", "Globex"]})
     joined = (df.explode("Account (item_ids)")
@@ -584,7 +593,7 @@ def test_execute_query_empty_result_columns(monkeypatch):
         json.dumps({"board": "Sales Pipeline", "columns": ["Amount"], "limit": 5})
     )
     assert df.empty
-    assert list(df.columns) == ["item_id", "name", "group", "Amount"]
+    assert list(df.columns) == ["item_id", "name", "group", "item_url", "Amount"]
 
 
 # ── throttling ──────────────────────────────────────────────────────────────

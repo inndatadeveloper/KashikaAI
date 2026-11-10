@@ -2,6 +2,8 @@
 Message Context Builder - Ports proven logic from agent._build_messages_context()
 """
 import json
+from app.ai.context.artifact_digest import ARTIFACT_DIGEST_TOOLS, digest_artifact
+from app.ai.context.hidden_data import hide_data_for_replay
 from types import SimpleNamespace
 from typing import Optional, List, Dict, Any
 
@@ -34,12 +36,46 @@ from app.ai.context.summary_write_through import (
 from app.ai.persisted_summary import (
     TOOL_CONTEXT_KIND_FIELD,
     TOOL_CONTEXT_OBSERVATION_KIND,
+    _clamp_row,
+    build_tool_context_summary,
     tool_context_for_replay,
 )
 
 
 _COMPACTION_OBSERVATION_MAX_CHARS_PER_TOOL = 3_000
 _COMPACTION_OBSERVATION_MAX_CHARS_TOTAL = 24_000
+
+# On artifact_chat threads (the dashboard bubble and app conversations) a
+# follow-up turn sees the rows behind its earlier answer, not just the first
+# one: at most this many whole rows, within this many JSON characters. Every
+# other report keeps the single-row history.
+HISTORY_RESULT_ROWS_ARTIFACT_CHAT = 10
+HISTORY_RESULT_ROWS_MAX_CHARS = 2000
+
+
+def _rows_json(rows: list) -> str:
+    """Rows as the prompt shows them (durable_transcript renders the same way)."""
+    return json.dumps(rows, default=str, ensure_ascii=False, separators=(",", ":"))
+
+
+def _history_rows(rows: Any, max_rows: int) -> list:
+    """The first ``max_rows`` whole rows whose rendered JSON fits the
+    character budget. Trailing rows are dropped; a row is never cut."""
+    if not isinstance(rows, list):
+        return []
+    kept = list(rows[:max_rows])
+    while kept and len(_rows_json(kept)) > HISTORY_RESULT_ROWS_MAX_CHARS:
+        kept.pop()
+    return kept
+
+
+def _preview_history_rows(projection: Any, max_rows: int) -> list:
+    """Clamped, budgeted rows from a create_data projection's data_preview."""
+    preview = projection.get("data_preview") if isinstance(projection, dict) else None
+    rows = preview.get("rows") if isinstance(preview, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return _history_rows([_clamp_row(row) for row in rows], max_rows)
 
 
 def _json_value(value: Any) -> Any:
@@ -55,12 +91,13 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _compaction_observation_text(tool_execution: Any) -> str:
+def _compaction_observation_text(tool_execution: Any, allow_llm_see_data: bool = True) -> str:
     """Bound the exact observation for the background rolling summarizer.
 
     Only new, explicitly tagged snapshots qualify. Historical result
     projections and row-heavy specialized summaries keep their existing
     digest paths, so this cannot rehydrate raw canonical result payloads.
+    Observations captured while data was visible are hidden once it is not.
     """
     summary = getattr(tool_execution, "context_summary_json", None)
     if not (
@@ -72,6 +109,8 @@ def _compaction_observation_text(tool_execution: Any) -> str:
     observation = tool_context_for_replay(summary)
     if not isinstance(observation, dict):
         return ""
+    if not allow_llm_see_data:
+        observation = hide_data_for_replay(observation, getattr(tool_execution, "tool_name", None))
     try:
         rendered = json.dumps(
             observation,
@@ -96,12 +135,19 @@ def _is_postgres_session(db: AsyncSession) -> bool:
         return False
 
 
-def _digest_data_result(rj: dict, allow_llm_see_data: bool, *, applied_params: dict | None = None) -> str:
+def _digest_data_result(
+    rj: dict,
+    allow_llm_see_data: bool,
+    *,
+    applied_params: dict | None = None,
+    max_rows: int = 1,
+) -> str:
     """One history digest for every tool whose result carries a
     ``data_preview`` (create_data, describe_entity): shape, column names,
-    chart type, viz id, the top row when data may be shown, and — for
-    parameterized results — the values it ran with, so a later turn can reuse
-    the result instead of reading or rebuilding it."""
+    chart type, viz id, the top row (or, with ``max_rows`` > 1, the first
+    rows within ``HISTORY_RESULT_ROWS_MAX_CHARS``) when data may be shown,
+    and — for parameterized results — the values it ran with, so a later turn
+    can reuse the result instead of reading or rebuilding it."""
     if not isinstance(rj, dict):
         return ""
     preview = rj.get('data_preview') or {}
@@ -143,6 +189,14 @@ def _digest_data_result(rj: dict, allow_llm_see_data: bool, *, applied_params: d
             parts.append(f"viz_id: {viz_ids[0]}")
     except Exception:
         pass
+    if allow_llm_see_data and max_rows > 1:
+        shown = _history_rows(preview_rows or rows, max_rows)
+        if shown:
+            try:
+                parts.append(f"rows (first {len(shown)} of {row_count}): {_rows_json(shown)}")
+                return "; ".join(parts)
+            except Exception:
+                pass
     if allow_llm_see_data:
         sample_row = preview_rows[0] if preview_rows else (rows[0] if rows else None)
         if sample_row:
@@ -356,6 +410,62 @@ def _digest_eval_tool(tool_execution) -> str:
             return f"rejected: {output.get('rejected_reason') or output.get('message') or 'unknown'}"
         return f"run_id: {output.get('run_id')}; status={output.get('status')}"
 
+    return ""
+
+
+SUB_AGENT_TOOL_NAMES = ("delegate", "read_sub_agent", "stop_sub_agent", "message_sub_agent")
+
+
+def _not_sub_agent_child(stmt):
+    """Keep sub-agent children out of the parent's history.
+
+    A child runs on hidden completions of the same report
+    (trigger_source='sub_agent', docs/design/sub-agents.md A3); its goal prompt
+    and in-flight tool calls are not the parent's conversation, and a live
+    run showed the parent reading the children's pending calls as its own
+    "outcome_unknown" results. NULL-safe: trigger_source is NULL on
+    ordinary rows."""
+    return stmt.filter(
+        (Completion.trigger_source.is_(None)) | (Completion.trigger_source != "sub_agent")
+    )
+
+
+def _digest_sub_agent_tool(tool_execution) -> str:
+    """One-line handle for a sub-agent tool call. `delegate` reads the record the
+    wave tracker wrote back onto the row when the child finished (result_json
+    = receipt + record); until then it reads as running. The full records
+    live in the fan-in turn's hidden prompt, so this stays a handle."""
+    rj = tool_execution.result_json if isinstance(tool_execution.result_json, dict) else {}
+    name = tool_execution.tool_name
+    if name == "delegate":
+        sid = rj.get("sub_agent_id")
+        if not sid:
+            return f"refused: {rj.get('refused') or 'not started'}"
+        rec = rj.get("record") if isinstance(rj.get("record"), dict) else {}
+        status = rj.get("status") or "running"
+        bits = [f"sub_agent {sid}", f"\"{(rj.get('title') or '')[:60]}\""]
+        if rec.get("outcome"):
+            conf = rec.get("confidence")
+            bits.append(f"{rec['outcome']}" + (f" ({conf})" if conf is not None else ""))
+        else:
+            bits.append(status)
+        if rj.get("steps_used") is not None:
+            bits.append(f"{rj['steps_used']} steps")
+        if rec.get("summary"):
+            bits.append(str(rec["summary"])[:160])
+        return " — ".join(bits)
+    if name == "read_sub_agent":
+        bits = [f"sub_agent {rj.get('sub_agent_id')}", f"\"{(rj.get('title') or '')[:60]}\"", str(rj.get("status") or "")]
+        rec = rj.get("record") if isinstance(rj.get("record"), dict) else {}
+        if rec.get("outcome"):
+            bits.append(f"{rec['outcome']} ({rec.get('confidence')})")
+        elif rj.get("steps_used") is not None:
+            bits.append(f"{rj['steps_used']} steps")
+        return " — ".join(b for b in bits if b)
+    if name == "message_sub_agent":
+        return f"message {rj.get('message_id')} to {rj.get('recipient')} — {rj.get('status')} — {str(rj.get('body') or '')[:300]}"
+    if name == "stop_sub_agent":
+        return f"sub_agent {rj.get('sub_agent_id')} → {rj.get('status')}"
     return ""
 
 
@@ -867,6 +977,9 @@ class MessageContextBuilder:
         # refreshes. This matters for old read_query rows whose full JSON can
         # take PostgreSQL seconds to parse even when SQL returns only a digest.
         self._terminal_tool_context_cache: Dict[str, Any] = {}
+        # (execution id, max rows) -> the artifact_chat history rows of a
+        # terminal create_data call; see _with_history_rows.
+        self._history_rows_cache: Dict[tuple, list] = {}
         # Populated from the same batched block/tool query used to render the
         # conversation. AgentV2 adopts it once at run start, so durable replay
         # adds no query to the critical path.
@@ -896,6 +1009,7 @@ class MessageContextBuilder:
                 .filter(Completion.report_id == self.report.id)
                 .filter(Completion.deleted_at.is_(None))
                 .filter(Completion.message_type != COMPACTION_MESSAGE_TYPE)
+                .filter((Completion.trigger_source.is_(None)) | (Completion.trigger_source != "sub_agent"))
                 .order_by(Completion.created_at.asc())
                 .limit(PROTECT_FIRST_N)
             )).scalars().all()
@@ -1031,6 +1145,81 @@ class MessageContextBuilder:
         """Load one execution through the same bounded batch path as build()."""
         loaded = await self._load_tool_executions_for_context([str(tool_execution_id)])
         return loaded.get(str(tool_execution_id))
+
+    def _history_max_rows(self, allow_llm_see_data: bool) -> int:
+        if allow_llm_see_data and getattr(self.report, "report_type", None) == "artifact_chat":
+            return HISTORY_RESULT_ROWS_ARTIFACT_CHAT
+        return 1
+
+    async def _with_history_rows(
+        self, tool_exec_by_id: Dict[str, Any], max_rows: int
+    ) -> Dict[str, Any]:
+        """Give create_data history its earlier rows on artifact_chat threads.
+
+        The stored context summary keeps one create_data row. When
+        ``max_rows`` > 1, read the bounded ``data_preview`` rows from the
+        result and return copies of those executions whose summary and
+        result carry them. The loaded executions — the reuse cache and
+        everything persisted — are never modified.
+        """
+        if max_rows <= 1:
+            return tool_exec_by_id
+        ids = [
+            execution_id
+            for execution_id, execution in tool_exec_by_id.items()
+            if getattr(execution, "tool_name", None) == "create_data"
+            and getattr(execution, "status", None) == "success"
+        ]
+        if not ids:
+            return tool_exec_by_id
+        rows_by_id = {
+            execution_id: self._history_rows_cache[(execution_id, max_rows)]
+            for execution_id in ids
+            if (execution_id, max_rows) in self._history_rows_cache
+        }
+        missing = [execution_id for execution_id in ids if execution_id not in rows_by_id]
+        if missing:
+            try:
+                projections = await self._load_create_data_result_projections(missing)
+            except Exception:
+                projections = None
+            for execution_id in missing if projections is not None else ():
+                try:
+                    rows = _preview_history_rows(projections.get(execution_id), max_rows)
+                except Exception:
+                    rows = []
+                rows_by_id[execution_id] = rows
+                # Terminal executions never change, so their rows are read
+                # once per builder (the planner rebuilds history several
+                # times per loop iteration).
+                if tool_exec_by_id[execution_id].status in TERMINAL_TOOL_EXECUTION_STATUSES:
+                    self._history_rows_cache[(execution_id, max_rows)] = rows
+        enriched = dict(tool_exec_by_id)
+        for execution_id, rows in rows_by_id.items():
+            if len(rows) <= 1:
+                continue
+            execution = tool_exec_by_id[execution_id]
+            try:
+                summary = tool_context_for_replay(execution.context_summary_json)
+                if not isinstance(summary, dict):
+                    summary = build_tool_context_summary(
+                        "create_data", execution.result_json
+                    )
+                if not isinstance(summary, dict):
+                    continue
+                preview = summary.get("data_preview")
+                body = dict(summary)
+                body["data_preview"] = {
+                    **(preview if isinstance(preview, dict) else {}),
+                    "rows": list(rows),
+                }
+                enriched[execution_id] = SimpleNamespace(
+                    **{**vars(execution), "context_summary_json": body, "result_json": body}
+                )
+            except Exception:
+                # Malformed history data keeps today's history, never fails it.
+                continue
+        return enriched
 
     async def _load_tool_executions_for_context(
         self,
@@ -1318,7 +1507,11 @@ class MessageContextBuilder:
             if not preview.get("columns") and isinstance(data_columns, list):
                 preview["columns"] = data_columns
             data_first_row = _json_value(row.data_first_row)
-            if not preview.get("rows") and data_first_row is not None:
+            if (
+                not preview.get("rows")
+                and not preview.get("data_hidden")
+                and data_first_row is not None
+            ):
                 # Preserve the historical digest contract: before previews
                 # were stored, create_data history showed the first result
                 # row. Project exactly that row rather than hydrating the full
@@ -1442,13 +1635,14 @@ class MessageContextBuilder:
                 allow_llm_see_data = settings_dict.get("allow_llm_see_data", {}).get("value", True)
             except:
                 allow_llm_see_data = False  # Default to True if settings unavailable
+        history_max_rows = self._history_max_rows(allow_llm_see_data)
                     
         # Fetch only the most recent window instead of ALL completions then
         # slicing [-max_messages:] in Python (was O(conversation length) every
         # iteration). +1 covers dropping a trailing in-progress user completion.
         # Queued prompts are not part of the conversation yet — they run later.
         summary_text, watermark_created_at = await self._compaction_state()
-        completions_query = (
+        completions_query = _not_sub_agent_child(
             select(Completion)
             .options(lazyload("*"))
             .filter(Completion.report_id == self.report.id)
@@ -1558,6 +1752,13 @@ class MessageContextBuilder:
                     # Add tool execution details if available
                     if block.tool_execution_id:
                         tool_execution = await self._load_tool_execution_for_context(block.tool_execution_id)
+                        if tool_execution is not None:
+                            tool_execution = (
+                                await self._with_history_rows(
+                                    {str(block.tool_execution_id): tool_execution},
+                                    history_max_rows,
+                                )
+                            )[str(block.tool_execution_id)]
                         
                         if tool_execution:
                             tool_info = f"Tool: {tool_execution.tool_name}"
@@ -1596,7 +1797,7 @@ class MessageContextBuilder:
                                     tool_info += " - " + "; ".join(digest_parts)
                                 # Digest for create_data results (same style as create_widget)
                                 elif tool_execution.tool_name == 'create_data' and tool_execution.result_json:
-                                    digest = _digest_data_result(tool_execution.result_json or {}, allow_llm_see_data)
+                                    digest = _digest_data_result(tool_execution.result_json or {}, allow_llm_see_data, max_rows=history_max_rows)
                                     if digest:
                                         tool_info += " - " + digest
                                 # Digest for describe_entity results: the entity plus the
@@ -1606,7 +1807,20 @@ class MessageContextBuilder:
                                     digest_parts = []
                                     if rj.get('title'):
                                         digest_parts.append(f"entity: {rj.get('title')}")
-                                    digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None)
+                                    digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None, max_rows=history_max_rows)
+                                    if digest:
+                                        digest_parts.append(digest)
+                                    if digest_parts:
+                                        tool_info += " - " + "; ".join(digest_parts)
+                                # run_query: the query plus the shape/values digest,
+                                # so a later turn knows a slice for these values
+                                # already exists instead of re-running it.
+                                elif tool_execution.tool_name == 'run_query' and tool_execution.result_json:
+                                    rj = tool_execution.result_json or {}
+                                    digest_parts = []
+                                    if rj.get('title'):
+                                        digest_parts.append(f"ran query: {rj.get('title')}")
+                                    digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None, max_rows=history_max_rows)
                                     if digest:
                                         digest_parts.append(digest)
                                     if digest_parts:
@@ -1637,56 +1851,10 @@ class MessageContextBuilder:
                                             pass
                                     if names:
                                         tool_info += f" - tables: {', '.join(names)}"
-                                elif tool_execution.tool_name == 'create_artifact' and tool_execution.result_json:
-                                    rj = tool_execution.result_json or {}
-                                    digest_parts = []
-                                    if rj.get('title'):
-                                        digest_parts.append(f"artifact: {rj.get('title')}")
-                                    if rj.get('mode'):
-                                        digest_parts.append(f"mode: {rj.get('mode')}")
-                                    if rj.get('artifact_id'):
-                                        digest_parts.append(f"artifact_id: {rj.get('artifact_id')}")
-                                    # Surface visualization_ids used to build the artifact
-                                    viz_ids = rj.get('visualization_ids') or []
-                                    if viz_ids:
-                                        digest_parts.append(f"viz_ids: {', '.join(viz_ids)}")
-                                    if digest_parts:
-                                        tool_info += " - " + "; ".join(digest_parts)
-                                elif tool_execution.tool_name == 'edit_artifact' and tool_execution.result_json:
-                                    rj = tool_execution.result_json or {}
-                                    digest_parts = []
-                                    if rj.get('title'):
-                                        digest_parts.append(f"artifact: {rj.get('title')}")
-                                    if rj.get('mode'):
-                                        digest_parts.append(f"mode: {rj.get('mode')}")
-                                    if rj.get('artifact_id'):
-                                        digest_parts.append(f"artifact_id: {rj.get('artifact_id')}")
-                                    # Surface visualization_ids (top-level or nested in artifact_preview)
-                                    viz_ids = rj.get('visualization_ids') or (rj.get('artifact_preview') or {}).get('visualization_ids') or []
-                                    if viz_ids:
-                                        digest_parts.append(f"viz_ids: {', '.join(viz_ids)}")
-                                    if rj.get('version'):
-                                        digest_parts.append(f"v{rj.get('version')}")
-                                    if rj.get('diff_applied') is not None:
-                                        digest_parts.append("diff" if rj.get('diff_applied') else "rewrite")
-                                    if digest_parts:
-                                        tool_info += " - " + "; ".join(digest_parts)
-                                elif tool_execution.tool_name == 'read_artifact' and tool_execution.result_json:
-                                    rj = tool_execution.result_json or {}
-                                    digest_parts = []
-                                    if rj.get('title'):
-                                        digest_parts.append(f"artifact: {rj.get('title')}")
-                                    if rj.get('mode'):
-                                        digest_parts.append(f"mode: {rj.get('mode')}")
-                                    if rj.get('artifact_id'):
-                                        digest_parts.append(f"artifact_id: {rj.get('artifact_id')}")
-                                    viz_ids = rj.get('visualization_ids') or []
-                                    if viz_ids:
-                                        digest_parts.append(f"viz_ids: {', '.join(viz_ids)}")
-                                    if rj.get('version'):
-                                        digest_parts.append(f"v{rj.get('version')}")
-                                    if digest_parts:
-                                        tool_info += " - " + "; ".join(digest_parts)
+                                elif tool_execution.tool_name in ARTIFACT_DIGEST_TOOLS:
+                                    digest = digest_artifact(tool_execution)
+                                    if digest:
+                                        tool_info += ' - ' + digest
                                 elif tool_execution.tool_name == 'inspect_data' and tool_execution.result_json:
                                     rj = tool_execution.result_json or {}
                                     digest_parts = []
@@ -1701,7 +1869,7 @@ class MessageContextBuilder:
                                         digest_parts.append(f"{dur}ms")
                                     if digest_parts:
                                         tool_info += " - " + "; ".join(digest_parts)
-                                elif tool_execution.tool_name == 'search_mcps' and tool_execution.result_json:
+                                elif tool_execution.tool_name in ('search_mcps', 'search_tools') and tool_execution.result_json:
                                     rj = tool_execution.result_json or {}
                                     obs = rj.get('observation') or rj
                                     digest_parts = []
@@ -1731,6 +1899,10 @@ class MessageContextBuilder:
                                         tool_info += " - " + digest
                                 elif tool_execution.tool_name in EVAL_TOOL_NAMES and tool_execution.result_json:
                                     digest = _digest_eval_tool(tool_execution)
+                                    if digest:
+                                        tool_info += " - " + digest
+                                elif tool_execution.tool_name in SUB_AGENT_TOOL_NAMES and tool_execution.result_json:
+                                    digest = _digest_sub_agent_tool(tool_execution)
                                     if digest:
                                         tool_info += " - " + digest
                                 elif tool_execution.tool_name in ('write_officejs_code', 'write_to_excel', 'read_excel_range', 'read_excel_as_csv') and tool_execution.result_json:
@@ -1770,29 +1942,11 @@ class MessageContextBuilder:
                                         digest_parts.append(f"columns: {cols}")
                                     # Include a data sample from execution log
                                     exec_log = rj.get('execution_log') or ''
-                                    if exec_log:
+                                    if exec_log and allow_llm_see_data:
                                         sample_lines = exec_log.strip().split('\n')[:8]
                                         digest_parts.append(f"sample:\n" + "\n".join(sample_lines))
                                     if obs.get('success') is False:
                                         digest_parts.append("FAILED")
-                                    if digest_parts:
-                                        tool_info += " - " + "; ".join(digest_parts)
-                                elif tool_execution.tool_name == 'list_agent_executions' and tool_execution.result_json:
-                                    rj = tool_execution.result_json or {}
-                                    obs = rj.get('observation') or rj
-                                    digest_parts = []
-                                    summary = obs.get('summary') or ''
-                                    if summary:
-                                        digest_parts.append(summary)
-                                    else:
-                                        arts = obs.get('artifacts') or []
-                                        if arts:
-                                            art = arts[0]
-                                            count = art.get('count')
-                                            total = art.get('total')
-                                            filt = art.get('filter') or 'all'
-                                            if count is not None:
-                                                digest_parts.append(f"Listed {count} (filter={filt}, total={total})")
                                     if digest_parts:
                                         tool_info += " - " + "; ".join(digest_parts)
                                 elif tool_execution.tool_name == 'web_fetch' and tool_execution.result_json:
@@ -1957,22 +2111,23 @@ class MessageContextBuilder:
                 allow_llm_see_data = settings_dict.get("allow_llm_see_data", {}).get("value", True)
             except Exception:
                 allow_llm_see_data = False
+        history_max_rows = self._history_max_rows(allow_llm_see_data)
 
         summary_text = None
         if completion_ids is not None:
-            report_completions = (await self.db.execute(
+            report_completions = (await self.db.execute(_not_sub_agent_child(
                 select(Completion)
                 .options(lazyload("*"))
                 .filter(Completion.id.in_([str(cid) for cid in completion_ids]))
                 .order_by(Completion.created_at.asc())
-            )).scalars().all()
+            ))).scalars().all()
             report_completions = list(report_completions)
         else:
             # Most-recent window only (was fetch-all + slice in Python),
             # scoped past the compaction watermark when one exists.
             # Queued prompts are not part of the conversation yet — they run later.
             summary_text, watermark_created_at = await self._compaction_state()
-            completions_query = (
+            completions_query = _not_sub_agent_child(
                 select(Completion)
                 .options(lazyload("*"))
                 .filter(Completion.report_id == self.report.id)
@@ -2144,6 +2299,9 @@ class MessageContextBuilder:
                     )
                 except Exception:
                     tool_exec_by_id = {}
+                tool_exec_by_id = await self._with_history_rows(
+                    tool_exec_by_id, history_max_rows
+                )
 
         # The live planner consumes provider-native tool turns below. The
         # rolling compactor intentionally uses the textual fold path instead,
@@ -2163,7 +2321,7 @@ class MessageContextBuilder:
                     )
                     tool_execution = tool_exec_by_id.get(execution_id)
                     rendered = (
-                        _compaction_observation_text(tool_execution)
+                        _compaction_observation_text(tool_execution, allow_llm_see_data)
                         if tool_execution is not None
                         else ""
                     )
@@ -2196,6 +2354,7 @@ class MessageContextBuilder:
                     completions=completions_to_process,
                     blocks_by_completion=blocks_by_completion,
                     tool_exec_by_id=tool_exec_by_id,
+                    allow_llm_see_data=allow_llm_see_data,
                 )
             except Exception:
                 from app.ai.context.transcript import Transcript
@@ -2351,7 +2510,7 @@ class MessageContextBuilder:
                                             pass
                                 tool_info += " - " + "; ".join(digest_parts)
                             elif tool_execution.status == 'success' and tool_execution.tool_name == 'create_data' and tool_execution.result_json:
-                                digest = _digest_data_result(tool_execution.result_json or {}, allow_llm_see_data)
+                                digest = _digest_data_result(tool_execution.result_json or {}, allow_llm_see_data, max_rows=history_max_rows)
                                 if digest:
                                     tool_info += " - " + digest
                             elif tool_execution.status == 'success' and tool_execution.tool_name == 'describe_entity' and tool_execution.result_json:
@@ -2361,7 +2520,18 @@ class MessageContextBuilder:
                                 digest_parts = []
                                 if rj.get('title'):
                                     digest_parts.append(f"entity: {rj.get('title')}")
-                                digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None)
+                                digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None, max_rows=history_max_rows)
+                                if digest:
+                                    digest_parts.append(digest)
+                                if digest_parts:
+                                    tool_info += " - " + "; ".join(digest_parts)
+                            elif tool_execution.status == 'success' and tool_execution.tool_name == 'run_query' and tool_execution.result_json:
+                                # run_query: the query plus the shape/values digest.
+                                rj = tool_execution.result_json or {}
+                                digest_parts = []
+                                if rj.get('title'):
+                                    digest_parts.append(f"ran query: {rj.get('title')}")
+                                digest = _digest_data_result(rj, allow_llm_see_data, applied_params=rj.get('applied_params') or None, max_rows=history_max_rows)
                                 if digest:
                                     digest_parts.append(digest)
                                 if digest_parts:
@@ -2392,56 +2562,10 @@ class MessageContextBuilder:
                                         pass
                                 if names:
                                     tool_info += f" - tables: {', '.join(names)}"
-                            elif tool_execution.status == 'success' and tool_execution.tool_name == 'create_artifact' and tool_execution.result_json:
-                                rj = tool_execution.result_json or {}
-                                digest_parts = []
-                                if rj.get('title'):
-                                    digest_parts.append(f"artifact: {rj.get('title')}")
-                                if rj.get('mode'):
-                                    digest_parts.append(f"mode: {rj.get('mode')}")
-                                if rj.get('artifact_id'):
-                                    digest_parts.append(f"artifact_id: {rj.get('artifact_id')}")
-                                # Surface visualization_ids used to build the artifact
-                                viz_ids = rj.get('visualization_ids') or []
-                                if viz_ids:
-                                    digest_parts.append(f"viz_ids: {', '.join(viz_ids)}")
-                                if digest_parts:
-                                    tool_info += " - " + "; ".join(digest_parts)
-                            elif tool_execution.status == 'success' and tool_execution.tool_name == 'edit_artifact' and tool_execution.result_json:
-                                rj = tool_execution.result_json or {}
-                                digest_parts = []
-                                if rj.get('title'):
-                                    digest_parts.append(f"artifact: {rj.get('title')}")
-                                if rj.get('mode'):
-                                    digest_parts.append(f"mode: {rj.get('mode')}")
-                                if rj.get('artifact_id'):
-                                    digest_parts.append(f"artifact_id: {rj.get('artifact_id')}")
-                                # Surface visualization_ids (top-level or nested in artifact_preview)
-                                viz_ids = rj.get('visualization_ids') or (rj.get('artifact_preview') or {}).get('visualization_ids') or []
-                                if viz_ids:
-                                    digest_parts.append(f"viz_ids: {', '.join(viz_ids)}")
-                                if rj.get('version'):
-                                    digest_parts.append(f"v{rj.get('version')}")
-                                if rj.get('diff_applied') is not None:
-                                    digest_parts.append("diff" if rj.get('diff_applied') else "rewrite")
-                                if digest_parts:
-                                    tool_info += " - " + "; ".join(digest_parts)
-                            elif tool_execution.status == 'success' and tool_execution.tool_name == 'read_artifact' and tool_execution.result_json:
-                                rj = tool_execution.result_json or {}
-                                digest_parts = []
-                                if rj.get('title'):
-                                    digest_parts.append(f"artifact: {rj.get('title')}")
-                                if rj.get('mode'):
-                                    digest_parts.append(f"mode: {rj.get('mode')}")
-                                if rj.get('artifact_id'):
-                                    digest_parts.append(f"artifact_id: {rj.get('artifact_id')}")
-                                viz_ids = rj.get('visualization_ids') or []
-                                if viz_ids:
-                                    digest_parts.append(f"viz_ids: {', '.join(viz_ids)}")
-                                if rj.get('version'):
-                                    digest_parts.append(f"v{rj.get('version')}")
-                                if digest_parts:
-                                    tool_info += " - " + "; ".join(digest_parts)
+                            elif tool_execution.tool_name in ARTIFACT_DIGEST_TOOLS:
+                                digest = digest_artifact(tool_execution)
+                                if digest:
+                                    tool_info += ' - ' + digest
                             elif tool_execution.tool_name == 'inspect_data' and tool_execution.result_json:
                                 rj = tool_execution.result_json or {}
                                 digest_parts = []
@@ -2456,7 +2580,7 @@ class MessageContextBuilder:
                                     digest_parts.append(f"{dur}ms")
                                 if digest_parts:
                                     tool_info += " - " + "; ".join(digest_parts)
-                            elif tool_execution.tool_name == 'search_mcps' and tool_execution.result_json:
+                            elif tool_execution.tool_name in ('search_mcps', 'search_tools') and tool_execution.result_json:
                                 rj = tool_execution.result_json or {}
                                 obs = rj.get('observation') or rj
                                 digest_parts = []
@@ -2525,29 +2649,11 @@ class MessageContextBuilder:
                                     digest_parts.append(f"columns: {cols}")
                                 # Include a data sample from execution log
                                 exec_log = rj.get('execution_log') or ''
-                                if exec_log:
+                                if exec_log and allow_llm_see_data:
                                     sample_lines = exec_log.strip().split('\n')[:8]
                                     digest_parts.append(f"sample:\n" + "\n".join(sample_lines))
                                 if obs.get('success') is False:
                                     digest_parts.append("FAILED")
-                                if digest_parts:
-                                    tool_info += " - " + "; ".join(digest_parts)
-                            elif tool_execution.tool_name == 'list_agent_executions' and tool_execution.result_json:
-                                rj = tool_execution.result_json or {}
-                                obs = rj.get('observation') or rj
-                                digest_parts = []
-                                summary = obs.get('summary') or ''
-                                if summary:
-                                    digest_parts.append(summary)
-                                else:
-                                    arts = obs.get('artifacts') or []
-                                    if arts:
-                                        art = arts[0]
-                                        count = art.get('count')
-                                        total = art.get('total')
-                                        filt = art.get('filter') or 'all'
-                                        if count is not None:
-                                            digest_parts.append(f"Listed {count} (filter={filt}, total={total})")
                                 if digest_parts:
                                     tool_info += " - " + "; ".join(digest_parts)
                             elif tool_execution.tool_name == 'web_fetch' and tool_execution.result_json:
@@ -2673,13 +2779,13 @@ class MessageContextBuilder:
             return "\n".join(parts)
         
         # Get recent messages
-        report_completions = await self.db.execute(
+        report_completions = await self.db.execute(_not_sub_agent_child(
             select(Completion)
             .options(lazyload("*"))
             .filter(Completion.report_id == self.report.id)
             .order_by(Completion.created_at.desc())
             .limit(max_messages)
-        )
+        ))
         recent_messages = report_completions.scalars().all()
         
         if recent_messages:
@@ -2727,8 +2833,9 @@ def _project_create_data_result(result_json: Any) -> Dict[str, Any]:
     preview = dict(preview) if isinstance(preview, dict) else {}
     if not preview.get("columns") and isinstance(columns, list):
         preview["columns"] = columns
-    if not preview.get("rows") and rows:
-        # Historical digest contract: show only the first result row.
+    if not preview.get("rows") and not preview.get("data_hidden") and rows:
+        # Historical digest contract: show only the first result row (never
+        # when the run hid data from the model).
         preview["rows"] = [rows[0]]
     if preview.get("row_count") is None and rows is not None:
         preview["row_count"] = len(rows)

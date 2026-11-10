@@ -35,6 +35,7 @@ What gets extracted (the Power BI connector is the bar):
 """
 
 from __future__ import annotations
+from app.data_sources.clients.progress import discovery_progress, discovery_items, IndexingCancelled
 
 import asyncio
 import logging
@@ -42,16 +43,19 @@ import os
 import re
 import secrets
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
+from app.core.egress import pinned_session
 
 from app.ai.prompt_formatters import ForeignKey, ServiceFormatter, Table, TableColumn
 from app.data_sources.clients._qix_common import (
     QixSession,
+    apply_field_selections,
     build_hypercube_def,
     build_ssl_context,
     fetch_hypercube_pages,
@@ -202,6 +206,7 @@ class QlikSenseOnPremClient(DataSourceClient):
         max_apps: Optional[int] = None,
         max_concurrency: int = 4,
         timeout_sec: int = 60,
+        app_filter: Optional[str] = None,
     ):
         self.server_url = (server_url or "").strip().rstrip("/")
         self.host = self._parse_host(self.server_url)
@@ -218,8 +223,11 @@ class QlikSenseOnPremClient(DataSourceClient):
         # stays deliberately lower than the Cloud client's default of 10.
         self.max_concurrency = max(1, int(max_concurrency or 4))
 
-        self.user_directory = (user_directory or "").strip() or _DEFAULT_USER_DIRECTORY
-        self.user_id = (user_id or "").strip() or None
+        # Private + read-only properties: when a connection's identity mapping
+        # pins the member's Qlik account, generated code (barred from
+        # ``_``-prefixed attributes) must not be able to reassign it.
+        self._user_directory = (user_directory or "").strip() or _DEFAULT_USER_DIRECTORY
+        self._user_id = (user_id or "").strip() or None
 
         self._client_cert_pem = client_cert or None
         self._client_key_pem = client_key or None
@@ -230,17 +238,30 @@ class QlikSenseOnPremClient(DataSourceClient):
         if stream_filter:
             tokens = {t.strip() for t in str(stream_filter).split(",") if t.strip()}
             self._stream_filter = tokens or None
+        app_tokens = {t.strip() for t in (app_filter or "").split(",") if t.strip()}
+        self._app_filter = {t.casefold() for t in app_tokens} or None
 
         # A fresh nonce per client instance. Any 16 alphanumeric characters are
         # valid; what matters is that the query-string and header copies match.
         self._xrfkey = secrets.token_hex(8)
 
         self._http: Optional[requests.Session] = None
+        # `Stream/App` keys of the apps the last get_schemas could not read.
+        self._unread_app_keys: List[str] = []
         self._stream_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._query_app_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
         self._temp_dir: Optional[str] = None
         self._cert_path: Optional[str] = None
         self._key_path: Optional[str] = None
         self._ca_path: Optional[str] = None
+
+    @property
+    def user_directory(self) -> str:
+        return self._user_directory
+
+    @property
+    def user_id(self) -> Optional[str]:
+        return self._user_id
 
     @staticmethod
     def _parse_host(server_url: str) -> str:
@@ -302,6 +323,8 @@ class QlikSenseOnPremClient(DataSourceClient):
         if self._client_key_password:
             try:
                 key_pem = self._decrypt_key(key_pem)
+            except IndexingCancelled:
+                raise
             except Exception as e:
                 raise RuntimeError(f"Could not decrypt the Qlik client key with the given password: {e}")
 
@@ -313,13 +336,15 @@ class QlikSenseOnPremClient(DataSourceClient):
     def _verify_arg(self):
         """What to hand `requests` as `verify=`.
 
-        A pasted root.pem always wins: QSEoW signs its service certificates with
-        its own root, so verifying against that root is the only way to get real
-        TLS verification on a default install.
+        `verify_ssl` decides whether to verify at all — turning it off must work
+        even with a root.pem saved. When on, a pasted root.pem is the trust
+        store: QSEoW signs its service certificates with its own root, so
+        verifying against that root is the only way to get real TLS
+        verification on a default install.
         """
-        if self._ca_path:
-            return self._ca_path
-        return self.verify_ssl
+        if not self.verify_ssl:
+            return False
+        return self._ca_path or True
 
     def close(self) -> None:
         """Drop the HTTP session and shred the materialized certificate files."""
@@ -351,7 +376,7 @@ class QlikSenseOnPremClient(DataSourceClient):
             raise RuntimeError("server_url is required (e.g. https://qlik.corp.example.com)")
         self._ensure_cert_files()
         if self._http is None:
-            self._http = requests.Session()
+            self._http = pinned_session()
 
     def _acting_user(self, app: Optional[Dict[str, Any]] = None) -> str:
         """The value for X-Qlik-User on this request.
@@ -396,7 +421,8 @@ class QlikSenseOnPremClient(DataSourceClient):
             raise RuntimeError(
                 f"TLS failed talking to QRS at {url}: {e}. A default QSEoW install signs its "
                 "service certificates with its own root — paste root.pem into Root CA "
-                "Certificate, or turn off Verify SSL."
+                "Certificate and use the hostname the certificate was issued for as the "
+                "Server URL, or turn off Verify SSL."
             )
         if resp.status_code >= 300:
             raise RuntimeError(
@@ -410,6 +436,13 @@ class QlikSenseOnPremClient(DataSourceClient):
             raise RuntimeError(f"Invalid JSON from Qlik QRS ({url}): {e}")
 
     def test_connection(self) -> Dict[str, Any]:
+        """Health probe: QRS reachable, certificate accepted, apps listable.
+
+        Kept deliberately light — the status sweep runs this every few
+        minutes. It reads ``about``, a stream count and the *condensed* app
+        list; the full app and stream objects (owners, tags, custom
+        properties for every app on the site) are only needed for indexing.
+        """
         try:
             self.connect()
         except Exception as e:
@@ -423,7 +456,8 @@ class QlikSenseOnPremClient(DataSourceClient):
         version = (about or {}).get("buildVersion") or "unknown"
 
         try:
-            streams = self._qrs_get("stream/full") or []
+            count = self._qrs_get("stream/count") or {}
+            stream_count = int((count or {}).get("value") or 0)
         except Exception as e:
             return {
                 "success": False,
@@ -432,7 +466,7 @@ class QlikSenseOnPremClient(DataSourceClient):
             }
 
         try:
-            apps = self.list_apps()
+            apps = self._apps_from_rows(self._qrs_get("app") or [])
         except Exception as e:
             return {
                 "success": False,
@@ -444,12 +478,12 @@ class QlikSenseOnPremClient(DataSourceClient):
         if apps:
             msg = (
                 f"Connected to Qlik Sense Enterprise {version} as '{acting}'. "
-                f"{len(streams)} stream(s), {len(apps)} app(s) visible."
+                f"{stream_count} stream(s), {len(apps)} app(s) visible."
             )
         else:
             msg = (
                 f"Connected to Qlik Sense Enterprise {version} as '{acting}', but no apps are "
-                "visible. Check the stream filter, and that this identity has read access to "
+                "visible. Check the app filter, stream filter, and that this identity has read access to "
                 "the streams you expect."
             )
         return {
@@ -457,7 +491,7 @@ class QlikSenseOnPremClient(DataSourceClient):
             "message": msg,
             "version": version,
             "user": acting,
-            "stream_count": len(streams),
+            "stream_count": stream_count,
             "app_count": len(apps),
         }
 
@@ -497,14 +531,34 @@ class QlikSenseOnPremClient(DataSourceClient):
         return self._stream_cache
 
     def list_apps(self) -> List[Dict[str, Any]]:
-        """Enumerate apps via /qrs/app/full, honouring the stream filter.
+        """Enumerate apps via /qrs/app/full, honouring stream and app filters.
 
         The app dicts use the same key names as the Cloud client's (`space_id` /
         `space_name` carry the stream) so the shared helpers in `_qix_common`
         and the `Stream/App/Table` naming both fall out without a translation
         layer.
         """
-        rows = self._qrs_get("app/full") or []
+        apps = self._scoped_apps(refresh=True)
+        return apps[:self.max_apps] if self.max_apps else apps
+
+    def _scoped_apps(self, *, refresh: bool = False) -> List[Dict[str, Any]]:
+        """Briefly reuse owner metadata; indexing caps never restrict queries.
+
+        Cache only successful reads, on this identity-bound client instance.
+        Expired reads fail closed on QRS errors; Engine still enforces access.
+        """
+        if not refresh and self._query_app_cache is not None:
+            fetched_at, apps = self._query_app_cache
+            if time.monotonic() - fetched_at < 30:
+                return apps
+        apps = self._apps_from_rows(self._qrs_get("app/full") or [], apply_cap=False)
+        self._query_app_cache = (time.monotonic(), apps)
+        return apps
+
+    def _apps_from_rows(self, rows: Any, *, apply_cap: bool = True) -> List[Dict[str, Any]]:
+        """Apply published/stream/app filters before the max_apps cap to QRS app
+        rows. Works on both ``app/full`` and condensed ``app`` rows — the
+        condensed form lacks the descriptive fields, which then stay empty."""
         apps: List[Dict[str, Any]] = []
         for row in rows:
             if not isinstance(row, dict):
@@ -517,6 +571,9 @@ class QlikSenseOnPremClient(DataSourceClient):
             stream_name = stream.get("name") or ""
             if self._stream_filter is not None:
                 if stream_id not in self._stream_filter and stream_name not in self._stream_filter:
+                    continue
+            if self._app_filter is not None:
+                if (row.get("id") or "").casefold() not in self._app_filter and (row.get("name") or "").casefold() not in self._app_filter:
                     continue
             apps.append({
                 "id": row.get("id"),
@@ -540,7 +597,7 @@ class QlikSenseOnPremClient(DataSourceClient):
         # Newest reload first, so a max_apps cap keeps the apps most likely to
         # hold current data rather than an arbitrary slice.
         apps.sort(key=lambda a: (a.get("last_reload") or ""), reverse=True)
-        if self.max_apps:
+        if apply_cap and self.max_apps:
             apps = apps[: self.max_apps]
         return apps
 
@@ -1103,6 +1160,7 @@ class QlikSenseOnPremClient(DataSourceClient):
             payload = asyncio.run(self._read_app_async(app, user))
         except Exception as e:
             logger.warning("Qlik on-prem app crawl failed for %s (%s): %s", app.get("name"), app.get("id"), e)
+            self._mark_unread(app_key)
             meta = dict(self._app_meta(app))
             meta.update({"status": "error", "error": str(e)[:500], "impersonatedUser": user})
             return [Table(
@@ -1133,6 +1191,9 @@ class QlikSenseOnPremClient(DataSourceClient):
                 "Qlik app '%s' (%s) has no data model and no master items (hasData=%s)",
                 app.get("name"), app.get("id"), payload.get("has_data"),
             )
+            # Usually an app that was never reloaded, but an app caught
+            # mid-reload looks the same — so its earlier tables are kept.
+            self._mark_unread(app_key)
             meta = dict(self._app_meta(app, payload))
             meta.update({"status": "empty"})
             return [Table(
@@ -1149,19 +1210,36 @@ class QlikSenseOnPremClient(DataSourceClient):
             )]
         return tables
 
-    def get_schemas(self) -> List[Table]:
+    def _mark_unread(self, app_key: str) -> None:
+        if app_key:
+            self._unread_app_keys.append(app_key)
+
+    def unindexed_table_prefixes(self) -> List[str]:
+        return list(self._unread_app_keys)
+
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
+        self._unread_app_keys = []
         apps = self.list_apps()
         if not apps:
             return []
         tables: List[Table] = []
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
-            futures = {pool.submit(self._crawl_app, app): app for app in apps}
-            for fut in as_completed(futures):
-                try:
-                    tables.extend(fut.result() or [])
-                except Exception as e:
-                    app = futures[fut]
-                    logger.warning("Unhandled Qlik crawl exception for %s: %s", app.get("id"), e)
+            try:
+                futures = {pool.submit(self._crawl_app, app): app for app in apps}
+                for fut in discovery_items(as_completed(futures), 'applications', label=lambda fut: futures[fut].get('name') or futures[fut].get('id'), total=len(futures)):
+                    try:
+                        tables.extend(fut.result() or [])
+                    except IndexingCancelled:
+                        raise
+                    except Exception as e:
+                        app = futures[fut]
+                        logger.warning("Unhandled Qlik crawl exception for %s: %s", app.get("id"), e)
+                        self._mark_unread(self._app_key(app))
+            except IndexingCancelled:
+                for pending in futures:
+                    pending.cancel()
+                raise
         return tables
 
     def get_schema(self, table_name: str) -> Table:
@@ -1187,35 +1265,37 @@ class QlikSenseOnPremClient(DataSourceClient):
     def _resolve_app(self, target: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Turn 'Stream/App', 'Stream/App/Table', 'App' or a GUID into an app id.
 
-        Returns the id plus the app row when one was found, since the row is
-        what decides which user the Engine session should act as.
+        Requires a unique app in the configured filter scope, without the
+        discovery-only max_apps cap. Returns the
+        id and its row, which decides which user the Engine should act as.
         """
         if not target:
             raise ValueError("app is required")
-        if _GUID_RE.match(target):
-            # Already an app id — skip the listing round-trip entirely.
-            return target, None
-
-        try:
-            apps = self.list_apps()
-        except Exception as e:
-            logger.debug("list_apps() failed while resolving %r: %s", target, e)
-            return target, None
-
-        candidates = [target]
-        # "Stream/App/Table" — drop the table segment and match the app.
-        parts = target.split("/")
-        if len(parts) >= 3:
-            candidates.append("/".join(parts[:2]))
-        if len(parts) >= 2:
-            candidates.append(parts[-2])
-        candidates.append(parts[-1])
-
-        for candidate in candidates:
-            for app in apps:
-                if candidate in (self._app_key(app), app.get("name"), app.get("id")):
-                    return app.get("id") or target, app
-        return target, None
+        # Resolve IDs too: dropping the row drops its owner and silently changes
+        # X-Qlik-User to sa_repository. Listing failures must remain failures.
+        apps = self._scoped_apps()
+        target_id = target.split("/", 1)[0]
+        if _GUID_RE.fullmatch(target_id):
+            matches = [a for a in apps if (a.get("id") or "").lower() == target_id.lower()]
+        elif "/" not in target:
+            matches = [a for a in apps if target in (a.get("id"), a.get("name"))]
+        else:
+            # Prefer exact qualified names/IDs, then the longest app prefix of
+            # a full table path. Never strip a supplied stream and try elsewhere.
+            matches = [a for a in apps if target in (self._app_key(a), a.get("id"))]
+            if not matches:
+                matches = [a for a in apps if target.startswith(self._app_key(a) + "/")]
+                if matches:
+                    longest = max(len(self._app_key(a)) for a in matches)
+                    matches = [a for a in matches if len(self._app_key(a)) == longest]
+        if len(matches) > 1:
+            raise ValueError(f"Qlik app {target!r} is ambiguous; use its full Stream/App name or app ID")
+        if not matches:
+            raise ValueError(
+                f"Qlik app {target!r} was not found in the configured app/stream scope. "
+                "Use the full table name from describe_tables and check the connection's filters and access."
+            )
+        return matches[0]["id"], matches[0]
 
     def execute_query(
         self,
@@ -1235,7 +1315,8 @@ class QlikSenseOnPremClient(DataSourceClient):
             dimensions: Qlik field names to group by.
             measures: ``{"expr": "Sum([Sales])", "alias": "Total"}`` dicts.
             filters: ``{field: [values]}``, applied as Qlik selections before
-                the cube is built, so they propagate associatively.
+                the cube is built, so they propagate associatively. Values
+                must be non-empty lists of strings or finite numbers.
             max_rows: row cap; paging is handled internally.
         """
         target = app or table_name
@@ -1268,13 +1349,7 @@ class QlikSenseOnPremClient(DataSourceClient):
             if doc_handle is None:
                 raise RuntimeError("Qlik OpenDoc did not return a document handle")
 
-            for field, values in selections:
-                await qix.rpc(doc_handle, "SelectInField", [
-                    field,
-                    {"qMatchMode": 0, "qSoftLock": False,
-                     "qValues": [{"qText": str(v)} for v in (values or [])]},
-                    False,
-                ])
+            await apply_field_selections(qix, doc_handle, selections)
 
             session = await qix.rpc(doc_handle, "CreateSessionObject", [{
                 "qInfo": {"qType": "bow-hypercube"},
@@ -1331,6 +1406,11 @@ analysis the app's authors agreed on, which a raw `Sum()` will not reproduce.
 
 Signature: `execute_query(app, dimensions, measures, filters=None, max_rows=10000)`
 
+Filter values must retain their Qlik types: send numeric years/IDs as numbers,
+and textual IDs (including leading zeros) as strings. Dual/date fields may
+require verified numeric Qlik values rather than formatted date text; never
+guess date serials or silently drop a filter when selection fails.
+
 ```python
 # Total sales by region
 df = client.execute_query(
@@ -1366,6 +1446,13 @@ df = client.execute_query(
 
 ### Key Query Rules
 
+- For inspection, use the same hypercube API with `max_rows=3` and explicit
+  dimensions or measures. Do not send SQL or infer that a connection/app error
+  means the data is empty or the business logic is wrong.
+- Preserve the full table path from `describe_tables` and its data source ID.
+  `No active tables matched` is a BOW catalog-resolution error, not a Qlik data
+  result: re-check the active catalog and source before one corrected retry.
+  `create_data` uses this same connection; it cannot bypass an unavailable app.
 - **Field names are case-sensitive** and must match the schema exactly. Wrap
   anything containing a space in square brackets: `Sum([Net Sales])`.
 - **Measures are Qlik expressions, not SQL** — `Sum(...)`, `Count(distinct ...)`,

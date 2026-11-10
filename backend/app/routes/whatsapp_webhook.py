@@ -1,3 +1,4 @@
+import logging
 """WhatsApp Cloud API webhook.
 
 Mirrors slack_webhook.py's style:
@@ -154,12 +155,14 @@ async def whatsapp_webhook(
             return {"ok": True}
 
         result = await platform_manager.handle_incoming_message(
-            db, "whatsapp", platform.organization_id, event_data
+            db, "whatsapp", platform.organization_id, event_data,
+            platform_id=str(platform.id),
         )
         return {"ok": True, "result": result}
 
     except HTTPException:
         raise
-    except Exception as e:
-        print(f"Error in WhatsApp webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        # Unauthenticated caller: log the detail, return nothing about it.
+        logging.getLogger(__name__).exception("Error in WhatsApp webhook")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")

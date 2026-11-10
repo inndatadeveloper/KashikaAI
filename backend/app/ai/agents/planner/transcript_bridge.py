@@ -17,17 +17,21 @@ consistent within a single request, which they are.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
+from dataclasses import asdict
 from typing import Any, Optional
 
 from app.ai.context.parts import (
     Outcome,
     ToolCallPart,
     ToolResultPart,
+    Turn,
     estimate_tokens,
 )
 from app.ai.context.transcript import Transcript
+from app.ai.llm.types import ImageInput
 
 # Observation keys that are bookkeeping/UI rather than model-visible result.
 _METADATA_KEYS = {"images", "images_provided_as_vision"}
@@ -148,6 +152,20 @@ def _digest_of(tool_name: str, observation: dict) -> Optional[str]:
     return f"{tool_name} — " + "; ".join(bits)
 
 
+def _detached(turns: list) -> list:
+    """Per-request copies of the live transcript's turns.
+
+    Rendering a request mutates what it is handed: the volatile head is
+    appended to the last turn and the decay ladder rewrites result tiers. On
+    the live turns both stuck — every iteration left another copy of the head
+    (conversation history included) behind, so the request grew by one history
+    per step, and a render-time trim silently became permanent. Copying the
+    turn and its parts keeps the request free to change; decay the loop applied
+    to the live transcript itself (context overflow) is carried by the copy.
+    """
+    return [Turn(role=turn.role, parts=[copy.copy(p) for p in turn.parts]) for turn in turns]
+
+
 def build_transcript(planner_input: Any, static_context: str, ask: str) -> Transcript:
     """Return the run's transcript, prefixed with static context and the ask.
 
@@ -164,6 +182,21 @@ def build_transcript(planner_input: Any, static_context: str, ask: str) -> Trans
     if static_context:
         t.add_user_text(static_context)
 
+    # On the transcript path AgentV2 supplies only uploads here; tool images
+    # already belong to their own results. Keep references on the original ask
+    # on EVERY render, rather than moving them onto the newest tool-result turn.
+    images = [
+        asdict(img) if isinstance(img, ImageInput) else img
+        for img in getattr(planner_input, "images", None) or []
+    ]
+    if images:
+        ask += (
+            "\n<uploaded_images>Images supplied with this original user request. "
+            "They remain reference material throughout this run, not new uploads "
+            "or evidence of the state after subsequent edits. Use later tool "
+            "results and their artifact versions to assess changes.</uploaded_images>"
+        )
+
     live = getattr(planner_input, "transcript", None)
     if live is not None and getattr(live, "turns", None):
         history_count = max(
@@ -173,15 +206,15 @@ def build_transcript(planner_input: Any, static_context: str, ask: str) -> Trans
                 len(live.turns),
             ),
         )
-        t.turns.extend(live.turns[:history_count])
+        t.turns.extend(_detached(live.turns[:history_count]))
         if ask:
-            t.add_user_text(ask)
-        t.turns.extend(live.turns[history_count:])
+            t.add_user_text(ask, images=images)
+        t.turns.extend(_detached(live.turns[history_count:]))
         t.repair()
         return t
 
     if ask:
-        t.add_user_text(ask)
+        t.add_user_text(ask, images=images)
 
     observations = list(getattr(planner_input, "past_observations", None) or [])
 

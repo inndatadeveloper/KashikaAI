@@ -75,6 +75,42 @@ SETTLED_HUNK_KEY = "__settled__"
 VOIDED_HUNK_KEY = "__voided__"
 
 
+async def _resolve_reference_data_source(db, data_source_id):
+    """Display fields for the agent an instruction reference points at.
+
+    Returns None when the agent is gone. Loads every connection in the
+    relationship's order so ``data_source_icon_token`` matches the icon the same
+    agent shows in the agents explorer and the data tools — the two call sites
+    this replaces each took one unordered join row, so a multi-connection agent
+    could get a different icon here than anywhere else.
+    """
+    from app.models.connection import Connection
+    from app.models.domain_connection import domain_connection
+    from app.schemas.agent_icon import resolve_agent_icon_token
+
+    rows = await db.execute(
+        select(DataSource.name, DataSource.icon, Connection.type, Connection.config)
+        .select_from(DataSource)
+        .outerjoin(domain_connection, domain_connection.c.data_source_id == DataSource.id)
+        .outerjoin(Connection, domain_connection.c.connection_id == Connection.id)
+        .where(DataSource.id == data_source_id)
+        .order_by(Connection.created_at, Connection.id)
+    )
+    found = rows.all()
+    if not found:
+        return None
+
+    name, icon = found[0][0], found[0][1]
+    # outerjoin yields one all-NULL connection row for an agent with none.
+    conns = [{"type": r[2], "config": r[3]} for r in found if r[2] is not None]
+    return {
+        "data_source_name": name,
+        "data_source_type": conns[0]["type"] if conns else None,
+        "data_source_icon": icon,
+        "data_source_icon_token": resolve_agent_icon_token(icon, conns),
+    }
+
+
 class InstructionService:
     def __init__(self):
         self.reference_service = InstructionReferenceService()
@@ -788,10 +824,17 @@ class InstructionService:
             "pending_instruction_ids": sorted(pending_ids),
         }
 
-    async def search_knowledge(self, db, organization, current_user, q: str, limit: int = 20) -> dict:
+    async def search_knowledge(
+        self, db, organization, current_user, q: str, limit: int = 20,
+        data_source_id: Optional[str] = None, show_all: bool = False,
+    ) -> dict:
         """Cross-entity search for the /agents 'Search everything' box. Returns a
         grouped shape (distinct from the instruction list): matching agents
-        (data sources) AND matching instructions, each visibility-scoped."""
+        (data sources) AND matching instructions, each visibility-scoped.
+
+        With `data_source_id` the search is scoped to that agent: only
+        instructions attached to it (as its tree group lists them — global ones
+        live in their own group), and no agents."""
         from app.services.data_source_service import DataSourceService
 
         q = (q or "").strip()
@@ -803,15 +846,30 @@ class InstructionService:
             db=db, organization=organization, current_user=current_user,
             skip=0, limit=limit, search=q,
             include_own=True, include_drafts=True, include_archived=True,
+            data_source_ids=[data_source_id] if data_source_id else None,
+            include_global=False,
         )
         instructions = inst_resp.get("items", [])
+        if data_source_id:
+            return {"agents": [], "instructions": instructions}
 
         # Agents: filter the caller's visible data sources by name (small list).
+        # show_all mirrors the /agents tree's "Show all agents" toggle so that an
+        # admin who sees an agent there only via show-all (not an explicit
+        # membership) can still find it here. get_active_data_sources gates
+        # show_all behind can_view_all_data_sources, so a non-admin can't widen
+        # the result by passing the flag.
         ql = q.lower()
         agents_all = await DataSourceService().get_active_data_sources(
-            db, organization, current_user, include_unconnected=True
+            db, organization, current_user, include_unconnected=True, show_all=show_all
         )
-        agents = [a for a in agents_all if ql in (getattr(a, "name", "") or "").lower()][:limit]
+        matched = [a for a in agents_all if ql in (getattr(a, "name", "") or "").lower()]
+        # Sort by name BEFORE applying the limit, so the capped set is the
+        # alphabetically-first matches and the "Agents" results group reads in
+        # the same A–Z order as the /agents tree (case-insensitive to match the
+        # tree's locale-aware client sort).
+        matched.sort(key=lambda a: (getattr(a, "name", "") or "").lower())
+        agents = matched[:limit]
 
         return {"agents": agents, "instructions": instructions}
 
@@ -1372,6 +1430,15 @@ class InstructionService:
             # Already resolved (not in the draft anymore) — nothing to accept.
             return await self.get_instruction(db, instruction.id, organization, current_user)
 
+        # The shared draft's pin is only trustworthy if it is one of THIS
+        # instruction's versions. A pin to another instruction's version would
+        # promote foreign text as this instruction's live content. Check it
+        # before anything is written so a refusal leaves no orphan build.
+        from app.models.instruction_version import InstructionVersion as _IV
+        staged = await db.get(_IV, staged_version_id)
+        if staged is None or str(staged.instruction_id) != str(instruction.id):
+            return None
+
         user_permissions = await self._get_user_permissions(db, current_user, organization)
 
         # 1) Promote the staged version as an isolated build-of-one so ONLY this
@@ -1591,6 +1658,67 @@ class InstructionService:
         txt = await self._build_instruction_text(db, str(base_id), instruction_id)
         return txt or ""
 
+    async def _build_base_version_id(self, db: AsyncSession, build, instruction_id: str) -> Optional[str]:
+        """Version id this build's change to `instruction_id` was written
+        against — the same baseline `_build_base_text` resolves (stamped
+        base_version_id, else the fork point). None for a brand-new
+        instruction."""
+        from app.models.build_content import BuildContent
+
+        base_vid = (await db.execute(
+            select(BuildContent.base_version_id).where(
+                BuildContent.build_id == str(build.id),
+                BuildContent.instruction_id == str(instruction_id),
+            )
+        )).scalar()
+        if base_vid:
+            return str(base_vid)
+        base_id = getattr(build, "base_build_id", None)
+        if not base_id:
+            return None
+        vid = (await db.execute(
+            select(BuildContent.instruction_version_id).where(
+                BuildContent.build_id == str(base_id),
+                BuildContent.instruction_id == str(instruction_id),
+            )
+        )).scalar()
+        return str(vid) if vid else None
+
+    async def _version_field_metas(self, db: AsyncSession, version_ids) -> dict:
+        """{version_id: reviewable field metadata} for the given versions, in
+        one query (see app.services.field_changes)."""
+        from app.models.instruction_version import InstructionVersion as _IV
+        from app.services.field_changes import field_meta
+        ids = sorted({str(v) for v in (version_ids or ()) if v})
+        out: dict = {}
+        # Chunked: the org-wide pending sweep passes one id per open proposal.
+        for i in range(0, len(ids), 500):
+            for vid, st, lm in (await db.execute(
+                select(_IV.id, _IV.status, _IV.load_mode).where(_IV.id.in_(ids[i:i + 500]))
+            )).all():
+                out[str(vid)] = field_meta(st, lm)
+        return out
+
+    async def _live_field_changes_by_row(self, db: AsyncSession, rows, instruction_id: str, main_vid) -> list:
+        """Unresolved field changes per `_pending_suggestion_builds` row, in row
+        order — the field counterpart of the per-row rebased hunks the accept
+        and reject paths validate a selection against."""
+        from app.services.field_changes import field_changes_against_main
+        base_vids = [await self._build_base_version_id(db, b, instruction_id) for b, _t, _v in rows]
+        metas = await self._version_field_metas(
+            db, [v for _b, _t, v in rows] + base_vids + [main_vid],
+        )
+        main_meta = metas.get(str(main_vid)) if main_vid else None
+        return [
+            field_changes_against_main(
+                metas.get(str(bv)) if bv else None,
+                metas.get(str(pv)),
+                main_meta,
+                self._rejected_keys(build, instruction_id),
+            )
+            for (build, _t, pv), bv in zip(rows, base_vids)
+        ]
+
     async def review_hunks(self, db: AsyncSession, instruction_id: str, *, organization: Organization, current_user: User):
         """Per-instruction tracked changes. For each pending suggestion, compute
         its INTENT hunks (diff base->proposed), then keep only those that (a)
@@ -1656,6 +1784,7 @@ class InstructionService:
             stamped_text[str(bid)] = txt or ""
 
         live_rows = []
+        base_vid_of_build: dict = {}
         for build, proposed_text, proposed_vid in rows:
             bid = str(build.id)
             base_id = str(build.base_build_id) if getattr(build, "base_build_id", None) else None
@@ -1667,6 +1796,7 @@ class InstructionService:
             )
             if effective_base_vid == str(proposed_vid):
                 continue
+            base_vid_of_build[bid] = effective_base_vid
             # Settled suggestions (fully resolved by an accept/reject while main
             # and the proposal were exactly these versions) yield no unrejected
             # hunks by construction — skip the rebase instead of re-proving it.
@@ -1758,9 +1888,30 @@ class InstructionService:
         async with _HUNK_CPU:
             shown_by_row = await asyncio.to_thread(_rebase_all)
 
+        # Field-level changes (status, load_mode) have no text, so they never
+        # show up as a hunk. Compare each suggestion's metadata 3-way against
+        # its baseline and main; a status-only suggestion is reviewable here
+        # rather than reading as "nothing pending". No main version means the
+        # instruction is not live yet — a create, reviewed as its text.
+        from app.services.field_changes import field_changes_against_main
+        metas = await self._version_field_metas(
+            db,
+            [v for _b, _t, v, _bt in live_rows]
+            + list(base_vid_of_build.values())
+            + [main_vid],
+        )
+        main_meta = metas.get(str(main_vid)) if main_vid else None
+
         suggestions = []
         for (build, proposed_text, proposed_vid, base_text), shown in zip(live_rows, shown_by_row):
-            if not shown:
+            base_vid = base_vid_of_build.get(str(build.id))
+            fields = field_changes_against_main(
+                metas.get(str(base_vid)) if base_vid else None,
+                metas.get(str(proposed_vid)),
+                main_meta,
+                self._rejected_keys(build, instruction_id),
+            )
+            if not shown and not fields:
                 continue
             trace = None
             if getattr(build, "agent_execution_id", None):
@@ -1778,6 +1929,7 @@ class InstructionService:
                 "report_id": (trace or {}).get("report_id"),
                 "completion_id": (trace or {}).get("completion_id"),
                 "hunks": shown,
+                "field_changes": fields,
             })
         # Display names of this instruction's references, so the review UI can
         # chip multi-word @mentions ("@Sales Orders") the same way the read-only
@@ -1962,12 +2114,14 @@ class InstructionService:
             )
 
         changed_rows = []
+        base_vid_of: dict = {}
         for iid, proposed_vid, build, proposed in sug_rows:
             effective_base_vid = stamped_version.get((str(build.id), str(iid)))
             if effective_base_vid is None and build.base_build_id:
                 effective_base_vid = base_version.get((str(build.base_build_id), str(iid)))
             if effective_base_vid == str(proposed_vid):
                 continue
+            base_vid_of[(str(build.id), str(iid))] = effective_base_vid
             changed_rows.append((iid, build, proposed, proposed_vid))
         sug_rows = changed_rows
         if not sug_rows:
@@ -2014,6 +2168,27 @@ class InstructionService:
                     main_text[str(iid)] = txt or ""
                     main_vid[str(iid)] = str(vid) if vid else None
 
+        # (3b) Field metadata for every proposal, its baseline and main — a
+        #      status-only suggestion has no text change, so the text checks
+        #      below would wave it through as "nothing pending".
+        from app.services.field_changes import field_changes_against_main
+        metas = await self._version_field_metas(
+            db,
+            [v for _i, _b, _t, v in sug_rows]
+            + list(base_vid_of.values())
+            + list(main_vid.values()),
+        )
+
+        def _has_live_field_change(build, iid: str, proposed_vid) -> bool:
+            mv = main_vid.get(iid)
+            bv = base_vid_of.get((str(build.id), iid))
+            return bool(field_changes_against_main(
+                metas.get(str(bv)) if bv else None,
+                metas.get(str(proposed_vid)),
+                metas.get(str(mv)) if mv else None,
+                self._rejected_keys(build, iid),
+            ))
+
         # (4) Pure-Python pass — no awaits in the loop.
         # Process conclusive unchanged-main suggestions first. Once one such row
         # marks an instruction pending, every other suggestion for that instruction
@@ -2054,6 +2229,9 @@ class InstructionService:
                 # The instruction was deleted — this proposal is void for good.
                 if self._voided_marker_matches(build, iid):
                     continue
+                if _has_live_field_change(build, iid, proposed_vid):
+                    pending.add(iid)
+                    continue
                 bt = _base_of(build, iid)
                 mt = main_text.get(iid, "")
                 pt = proposed or ""
@@ -2078,6 +2256,9 @@ class InstructionService:
                 continue
             # The instruction was deleted — this proposal is void for good.
             if self._voided_marker_matches(build, iid):
+                continue
+            if _has_live_field_change(build, iid, proposed_vid):
+                pending.add(iid)
                 continue
             rejected = self._rejected_keys(build, iid)
             bt = _base_of(build, iid)
@@ -2337,6 +2518,7 @@ class InstructionService:
         """
         from sqlalchemy.orm.attributes import flag_modified
         from app.services.text_hunks import has_live_hunk_against_main, RebasedHunkCache
+        from app.services.field_changes import field_changes_against_main, has_field_intent
         iid = str(instruction.id)
         main_text, main_vid, _meta = await self._main_text_of(db, instruction)
         mv = str(main_vid) if main_vid else None
@@ -2347,11 +2529,20 @@ class InstructionService:
                 continue
             pt = proposed_text or ""
             base_text = await self._build_base_text(db, build, iid)
-            if pt == (base_text or ""):
+            base_vid = await self._build_base_version_id(db, build, iid)
+            metas = await self._version_field_metas(db, [proposed_vid, base_vid, main_vid])
+            base_meta = metas.get(str(base_vid)) if base_vid else None
+            proposed_meta = metas.get(str(proposed_vid))
+            if pt == (base_text or "") and not has_field_intent(base_meta, proposed_meta):
                 continue  # carry-over: no intended change to settle
             pv = str(proposed_vid) if proposed_vid else None
             if self._settled_marker_matches(build, iid, pv):
                 continue  # already stamped for this exact state
+            if field_changes_against_main(
+                base_meta, proposed_meta, metas.get(mv) if mv else None,
+                self._rejected_keys(build, iid),
+            ):
+                continue  # a field change (e.g. status) is still up for review
             if has_live_hunk_against_main(base_text, pt, main_text,
                                           self._rejected_keys(build, iid), cache=cache):
                 continue  # still something to review — keep proposing it
@@ -2379,6 +2570,7 @@ class InstructionService:
         verified patch into a stale overwrite.
         """
         from app.services.text_hunks import hunk_is_resolved, rebased_hunks_against_main
+        from app.services.field_changes import field_change_summary, is_field_key
         user_permissions = await self._get_user_permissions(db, current_user, organization)
         instruction = await self._get_instruction_by_id(db, instruction_id, organization)
         if not instruction:
@@ -2418,6 +2610,9 @@ class InstructionService:
                 self._rejected_keys(build, instruction_id),
             ))
         row_build_ids = [str(build.id) for build, _text, _vid in rows]
+        field_inputs = await self._live_field_changes_by_row(
+            db, rows, instruction_id, main_vid,
+        )
 
         def _validate_and_apply():
             # Returns (new_text, picked, fail_status); fail_status is None on
@@ -2432,7 +2627,7 @@ class InstructionService:
                     for h in rebased_hunks_against_main(base_text, proposed_text, main_text)
                     if not hunk_is_resolved(h, rejected)
                 ]
-                for h in rhs:
+                for h in rhs + field_inputs[idx]:
                     pair = (bid, h["key"])
                     if pair in available:
                         return None, None, "invalid_selection"  # ambiguous key collision: fail closed
@@ -2441,6 +2636,15 @@ class InstructionService:
             if any(pair not in available for pair in requested):
                 return None, None, "stale"
             picked = [available[pair] for pair in requested]
+            # Field changes carry no text span; they are applied to the new
+            # version's metadata below. Two picks setting one field to
+            # different values cannot both be honoured — fail closed.
+            field_picks = [p for p in picked if is_field_key(p[1]["key"])]
+            picked = [p for p in picked if not is_field_key(p[1]["key"])]
+            seen_fields: dict = {}
+            for _idx, fc in field_picks:
+                if seen_fields.setdefault(fc["field"], fc["to"]) != fc["to"]:
+                    return None, None, "invalid_selection"
 
             # The UI suppresses overlapping suggestions because it cannot show
             # both actions truthfully at one location. Enforce the same contract
@@ -2465,26 +2669,41 @@ class InstructionService:
                 if main_text[start:end] != h["before"]:
                     return None, None, "stale"
                 text = text[:start] + h["after"] + text[end:]
-            return text, picked, None
+            return text, picked + field_picks, None
 
         async with _HUNK_CPU:
             new_text, picked, fail_status = await asyncio.to_thread(_validate_and_apply)
         if fail_status is not None:
             return None, fail_status
-        if new_text is None or picked is None or new_text == main_text:
+        if new_text is None or picked is None:
+            return None, "stale"
+        accepted_fields = {
+            h["field"]: h["to"] for _idx, h in picked if is_field_key(h["key"])
+        }
+        if new_text == main_text and not accepted_fields:
             return None, "stale"
 
         accepted = [
-            (rows[idx][0], h["key"], h.get("after"))
+            (rows[idx][0], h["key"],
+             field_change_summary(h) if is_field_key(h["key"]) else h.get("after"))
             for idx, h in picked
         ]
+        # Metadata comes from MAIN (the reviewer accepts hunks onto the live
+        # instruction, not the suggestion's whole snapshot), except for the
+        # field changes the reviewer explicitly accepted.
+        new_status = accepted_fields.get(
+            "status", (meta_src.status if meta_src else "published") or "published"
+        )
         new_version = await self.version_service.create_version_from_data(
             db, instruction_id=instruction.id, text=new_text,
             title=(meta_src.title if meta_src else getattr(instruction, "title", None)),
             description=(meta_src.description if meta_src else getattr(instruction, "description", None)),
             structured_data=(meta_src.structured_data if meta_src else None), formatted_content=None,
-            status=(meta_src.status if meta_src else "published") or "published",
-            load_mode=(meta_src.load_mode if meta_src else getattr(instruction, "load_mode", "always")) or "always",
+            status=new_status,
+            load_mode=accepted_fields.get(
+                "load_mode",
+                (meta_src.load_mode if meta_src else getattr(instruction, "load_mode", "always")) or "always",
+            ),
             references_json=(meta_src.references_json if meta_src else None),
             data_source_ids=(meta_src.data_source_ids if meta_src else None),
             label_ids=(meta_src.label_ids if meta_src else None),
@@ -2520,6 +2739,18 @@ class InstructionService:
                 failed_build.status = "rejected"
                 await db.commit()
             return None, "stale"
+
+        # promote_build only ever flips a row TO published (see its status
+        # note), so an accepted deactivation is applied to the live row here,
+        # after the compare-and-swap succeeded — never for a lost race.
+        if "status" in accepted_fields:
+            from sqlalchemy import update as sql_update
+            await db.execute(
+                sql_update(Instruction)
+                .where(Instruction.id == str(instruction.id))
+                .values(status=new_status)
+            )
+            await db.commit()
 
         # Only write review decisions after the compare-and-swap promotion
         # succeeds. A failed or racing action therefore remains retryable and
@@ -2727,6 +2958,7 @@ class InstructionService:
             hunk_is_resolved,
             rebased_hunks_against_main,
         )
+        from app.services.field_changes import field_change_summary, is_field_key
         instruction = await self._get_instruction_by_id(db, instruction_id, organization)
         if not instruction:
             return None, "not_found"
@@ -2762,6 +2994,9 @@ class InstructionService:
             for build, proposed_text, _v in rows
         ]
         row_build_ids = [str(build.id) for build, _text, _vid in rows]
+        field_inputs = await self._live_field_changes_by_row(
+            db, rows, instruction_id, main_vid,
+        )
 
         def _selected_live_hunks():
             # Returns (selected, fail_status) — same status split as
@@ -2769,11 +3004,13 @@ class InstructionService:
             cache = RebasedHunkCache()
             available: dict[tuple[str, str], tuple[int, dict]] = {}
             for idx, (base_text, proposed_text, rejected) in enumerate(rebase_inputs):
-                for h in rebased_hunks_against_main(
-                    base_text, proposed_text, main_text, cache=cache
-                ):
-                    if hunk_is_resolved(h, rejected):
-                        continue
+                live = [
+                    h for h in rebased_hunks_against_main(
+                        base_text, proposed_text, main_text, cache=cache
+                    )
+                    if not hunk_is_resolved(h, rejected)
+                ]
+                for h in live + field_inputs[idx]:
                     pair = (row_build_ids[idx], h["key"])
                     if pair in available:
                         return None, "invalid_selection"
@@ -2793,7 +3030,8 @@ class InstructionService:
             await self._record_resolved_hunk(
                 db, build, instruction_id, h["key"], "reject", commit=False
             )
-            verdicts.append((build, "reject", h.get("after"), h["key"]))
+            snippet = field_change_summary(h) if is_field_key(h["key"]) else h.get("after")
+            verdicts.append((build, "reject", snippet, h["key"]))
         await db.commit()
         # Every live hunk in scope is now rejected — nothing is left to propose,
         # so stamp the settled rows. Without this a build whose hunks all
@@ -2869,7 +3107,8 @@ class InstructionService:
         data_source_context = await self._build_data_source_context(
             db,
             organization,
-            instruction_data.data_source_ids or []
+            instruction_data.data_source_ids or [],
+            current_user=current_user,
         )
 
         instructions_builder = InstructionContextBuilder(db, organization)
@@ -3876,10 +4115,16 @@ class InstructionService:
         )
 
     async def _get_instruction_by_id(self, db: AsyncSession, instruction_id: str, organization: Organization) -> Instruction:
-        """Get instruction by ID with proper error handling"""
+        """Get instruction by ID with proper error handling.
+
+        Eager-loads ``data_sources``: the edit-tier decision reads them, and an
+        async session can't lazy-load. It used to work only when the caller had
+        already loaded the row in the same session (the REST route does; an
+        MCP caller whose session was committed in between did not).
+        """
         
         result = await db.execute(
-            select(Instruction).where(
+            select(Instruction).options(selectinload(Instruction.data_sources)).where(
                 and_(
                     Instruction.id == instruction_id,
                     Instruction.organization_id == organization.id,
@@ -4525,6 +4770,7 @@ class InstructionService:
             instructions/*.md   one file per live instruction, YAML frontmatter
             agent.yaml          the agent manifest (config, tables, tools, members)
             evals/*.yaml        one file per test suite scoped to this agent
+            queries/*.yaml      one file per saved query (Entity) scoped to this agent
 
         Each instruction's frontmatter carries the metadata that
         ``instruction_sync_service`` reads back (title, category, status,
@@ -4559,6 +4805,12 @@ class InstructionService:
         # export is per-agent. Paged rather than one capped call, so an agent
         # with more instructions than any single page can't silently export a
         # partial archive (a truncated backup reads as a complete one).
+        # include_drafts / include_archived mirror the flags the /agents tree
+        # sends when it lists an agent's instructions (KnowledgeExplorer.loadGroup)
+        # and the flags its badge count uses (get_instruction_counts). Without
+        # them the bundle silently drops draft/archived instructions the user sees
+        # in the UI, so the download count came up short of the badge (the "106 in
+        # the agent, 103 in the zip" report).
         items = []
         page_size = 500
         skip = 0
@@ -4569,6 +4821,8 @@ class InstructionService:
                 data_source_ids=[data_source_id],
                 include_global=False,
                 include_own=True,
+                include_drafts=True,
+                include_archived=True,
                 live=True,
             )
             batch = result.get("items", [])
@@ -4601,9 +4855,52 @@ class InstructionService:
                 label = dtext or f"{otype}:{oid}"
                 refs_by_instruction.setdefault(str(iid), []).append(label)
 
+        # Folder layout: recreate the agent's instruction directories so each
+        # markdown file lands in the same folder it sits in under the agent
+        # (InstructionDirectory + its placements), instead of a flat dump. Only
+        # this agent's scope is considered — an instruction shared with another
+        # agent keeps whatever folder it has HERE. No placement => repo root.
+        from app.models.instruction_directory import (
+            InstructionDirectory,
+            InstructionDirectoryPlacement,
+        )
+        dir_by_id: dict = {}
+        for did, dname, dparent in (await db.execute(
+            select(
+                InstructionDirectory.id,
+                InstructionDirectory.name,
+                InstructionDirectory.parent_id,
+            ).where(InstructionDirectory.data_source_id == data_source_id)
+        )).all():
+            dir_by_id[str(did)] = (dname, str(dparent) if dparent else None)
+        dir_for_instruction: dict = {}
+        if inst_ids and dir_by_id:
+            for iid, did in (await db.execute(
+                select(
+                    InstructionDirectoryPlacement.instruction_id,
+                    InstructionDirectoryPlacement.directory_id,
+                ).where(InstructionDirectoryPlacement.instruction_id.in_(inst_ids))
+            )).all():
+                # Keep only placements in THIS agent's directory scope.
+                if str(did) in dir_by_id:
+                    dir_for_instruction[str(iid)] = str(did)
+
         def _slug(value: str) -> str:
             value = re.sub(r"[^\w\s-]", "", value or "").strip().replace(" ", "-").lower()
             return value
+
+        def _dir_path(directory_id: str) -> str:
+            """Slash-joined slug path from the scope root to this directory,
+            walking parent_id. Guards against a cycle in the parent chain."""
+            parts: list[str] = []
+            seen: set[str] = set()
+            cur = directory_id
+            while cur and cur in dir_by_id and cur not in seen:
+                seen.add(cur)
+                dname, dparent = dir_by_id[cur]
+                parts.append(_slug(dname) or "folder")
+                cur = dparent
+            return "/".join(reversed(parts))
 
         buf = io.BytesIO()
         used_names: set[str] = set()
@@ -4619,14 +4916,21 @@ class InstructionService:
                 if not base:
                     base = f"{_slug(it.title) or str(it.id)}.md"
 
-                name = base
+                # Prefix the agent-folder path so the file nests where it sits in
+                # the UI; de-dup within that folder, not across the whole archive.
+                folder = ""
+                did = dir_for_instruction.get(str(it.id))
+                if did:
+                    folder = _dir_path(did)
+                prefix = f"instructions/{folder}/" if folder else "instructions/"
+
+                name = f"{prefix}{base}"
                 n = 1
                 while name in used_names:
                     stem = base[:-3] if base.endswith(".md") else base
-                    name = f"{stem}-{n}.md"
+                    name = f"{prefix}{stem}-{n}.md"
                     n += 1
                 used_names.add(name)
-                name = f"instructions/{name}"
 
                 # Frontmatter: only meaningful keys, in a stable order.
                 fm: dict = {}
@@ -4694,6 +4998,66 @@ class InstructionService:
                     zf.writestr(f"evals/{sname}", suite_yaml)
             except Exception as e:
                 logger.warning(f"Skipping evals in export for {data_source_id}: {e}")
+
+            # queries/*.yaml — one file per saved query (Entity) scoped to this
+            # agent. Export-only (no round-trip import, like the rest of the
+            # bundle). Visibility matches the agent's "Queries" panel: EntityService
+            # .list_entities applies the same bow/accessibility/workshop scoping,
+            # so a viewer gets live queries plus their own drafts/suggestions —
+            # the "like instructions" rule. Best-effort: skip on any failure.
+            try:
+                from app.services.entity_service import EntityService
+                entity_service = EntityService()
+                entities = []
+                e_skip = 0
+                e_page = 500
+                while True:
+                    batch = await entity_service.list_entities(
+                        db, organization, current_user,
+                        data_source_ids=[data_source_id],
+                        skip=e_skip, limit=e_page,
+                    )
+                    entities.extend(batch)
+                    # list_entities filters entirely in SQL before LIMIT, so a
+                    # short page is a reliable end-of-list signal.
+                    if len(batch) < e_page:
+                        break
+                    e_skip += e_page
+                used_query_names: set[str] = set()
+                for ent in entities:
+                    q_doc: dict = {
+                        "title": getattr(ent, "title", None) or "",
+                        "slug": getattr(ent, "slug", None) or str(ent.id),
+                        "type": getattr(ent, "type", None) or "model",
+                        "status": getattr(ent, "status", None) or "draft",
+                    }
+                    if getattr(ent, "description", None):
+                        q_doc["description"] = ent.description
+                    if getattr(ent, "tags", None):
+                        q_doc["tags"] = list(ent.tags)
+                    if getattr(ent, "parameters", None):
+                        q_doc["parameters"] = ent.parameters
+                    q_doc["code"] = getattr(ent, "code", None) or ""
+                    query_yaml = yaml.safe_dump(
+                        q_doc, sort_keys=False, allow_unicode=True
+                    )
+                    # Name the file after the readable title (like instructions).
+                    # The slug is often an auto-generated step-<hash> for queries
+                    # promoted from a conversation, so it makes a cryptic filename;
+                    # fall back to slug, then id, only when there is no title.
+                    base = (
+                        f"{_slug(q_doc['title']) or _slug(q_doc['slug']) or str(ent.id)}"
+                        ".yaml"
+                    )
+                    qname = base
+                    k = 1
+                    while qname in used_query_names:
+                        qname = f"{base[:-5]}-{k}.yaml"
+                        k += 1
+                    used_query_names.add(qname)
+                    zf.writestr(f"queries/{qname}", query_yaml)
+            except Exception as e:
+                logger.warning(f"Skipping queries in export for {data_source_id}: {e}")
 
         return buf.getvalue(), agent_name
 
@@ -5070,8 +5434,14 @@ class InstructionService:
         db: AsyncSession,
         organization: Organization,
         data_source_ids: List[str],
+        current_user: Optional[User] = None,
     ) -> str:
-        """Build a lightweight context string for selected data sources."""
+        """Build a lightweight context string for selected data sources.
+
+        The ids are caller-supplied, so with a ``current_user`` only the agents
+        they can see are used. Others are dropped silently: an error naming
+        them would itself confirm which ids exist.
+        """
         if not data_source_ids:
             return ""
 
@@ -5086,6 +5456,11 @@ class InstructionService:
         )
         result = await db.execute(stmt)
         data_sources = result.scalars().all()
+        if current_user is not None:
+            from app.services.data_source_service import DataSourceService
+            data_sources = await DataSourceService().filter_user_visible_data_sources(
+                db, list(data_sources), current_user, organization
+            )
 
         parts: list[str] = []
         for ds in data_sources:
@@ -5225,7 +5600,14 @@ class InstructionService:
             )
             primary_ds = primary_result.scalars().all()
             instruction_dict["primary_for"] = [
-                DataSourceMinimalSchema(id=str(ds.id), name=ds.name, icon=getattr(ds, "icon", None)).model_dump()
+                DataSourceMinimalSchema(
+                    id=str(ds.id),
+                    name=ds.name,
+                    icon=getattr(ds, "icon", None),
+                    # Input-only; lets the schema resolve icon_token (excluded
+                    # from the dump, see DataSourceMinimalSchema).
+                    connections=getattr(ds, "connections", None),
+                ).model_dump()
                 for ds in primary_ds
             ]
         except Exception as e:
@@ -5248,20 +5630,9 @@ class InstructionService:
                         ref_data["object"] = MetadataResourceSchema.from_orm(referenced_obj).model_dump()
                         
                         # Add data source info for metadata resources
-                        from app.models.connection import Connection
-                        from app.models.domain_connection import domain_connection
-                        ds_result = await db.execute(
-                            select(DataSource.name, Connection.type, DataSource.icon)
-                            .select_from(DataSource)
-                            .outerjoin(domain_connection, domain_connection.c.data_source_id == DataSource.id)
-                            .outerjoin(Connection, domain_connection.c.connection_id == Connection.id)
-                            .where(DataSource.id == referenced_obj.data_source_id)
-                        )
-                        ds_info = ds_result.first()
+                        ds_info = await _resolve_reference_data_source(db, referenced_obj.data_source_id)
                         if ds_info:
-                            ref_data["data_source_name"] = ds_info.name
-                            ref_data["data_source_type"] = ds_info.type
-                            ref_data["data_source_icon"] = ds_info.icon
+                            ref_data.update(ds_info)
                             ref_data["data_source_id"] = referenced_obj.data_source_id
                             
                     elif ref.object_type == "datasource_table":
@@ -5269,20 +5640,9 @@ class InstructionService:
                         ref_data["object"] = DataSourceTableSchema.from_orm(referenced_obj).model_dump()
                         
                         # Add data source info for datasource tables
-                        from app.models.connection import Connection
-                        from app.models.domain_connection import domain_connection
-                        ds_result = await db.execute(
-                            select(DataSource.name, Connection.type, DataSource.icon)
-                            .select_from(DataSource)
-                            .outerjoin(domain_connection, domain_connection.c.data_source_id == DataSource.id)
-                            .outerjoin(Connection, domain_connection.c.connection_id == Connection.id)
-                            .where(DataSource.id == referenced_obj.datasource_id)
-                        )
-                        ds_info = ds_result.first()
+                        ds_info = await _resolve_reference_data_source(db, referenced_obj.datasource_id)
                         if ds_info:
-                            ref_data["data_source_name"] = ds_info.name
-                            ref_data["data_source_type"] = ds_info.type
-                            ref_data["data_source_icon"] = ds_info.icon
+                            ref_data.update(ds_info)
                             ref_data["data_source_id"] = referenced_obj.datasource_id
                 else:
                     logger.warning(f"Referenced object not found: type={ref.object_type}, id={ref.object_id}")

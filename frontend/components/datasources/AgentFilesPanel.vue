@@ -13,10 +13,10 @@
           {{ uploading ? 'Uploading…' : '+ Upload files' }}
         </button>
       </div>
-      <div v-if="files.length === 0" class="text-xs text-gray-400 dark:text-gray-500 py-2">No uploaded files yet.</div>
+      <div v-if="files.length === 0" class="text-xs text-ink-muted py-2">No uploaded files yet.</div>
       <ul v-else class="divide-y divide-gray-100 dark:divide-gray-800">
         <li v-for="f in files" :key="f.id" class="flex items-center justify-between py-1.5 text-sm group">
-          <span class="flex items-center gap-2 min-w-0"><UIcon name="i-heroicons-document" class="w-4 h-4 text-gray-400 shrink-0" /><span class="truncate text-gray-700 dark:text-gray-300">{{ f.filename }}</span></span>
+          <span class="flex items-center gap-2 min-w-0"><UIcon name="i-heroicons-document" class="w-4 h-4 text-ink-muted shrink-0" /><span class="truncate text-gray-700 dark:text-gray-300">{{ f.filename }}</span></span>
           <button v-if="canUpdate" @click="removeFile(f)" class="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-500"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
         </li>
       </ul>
@@ -28,40 +28,25 @@
         <div class="flex items-center gap-2">
           <DataSourceIcon :type="conn.type" class="w-4 h-4" />
           <span class="text-sm font-semibold text-gray-900 dark:text-gray-100">{{ conn.name }}</span>
-          <span class="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500">{{ conn.type }}</span>
+          <span class="text-2xs uppercase tracking-wide text-ink-muted">{{ conn.type }}</span>
         </div>
         <div class="flex items-center gap-2">
-          <span :class="badgeClass(indexModeOf(conn))" class="text-[10px] px-2 py-0.5 rounded-full font-medium">{{ badgeLabel(indexModeOf(conn)) }}</span>
+          <span :class="badgeClass(indexModeOf(conn))" class="text-2xs px-2 py-0.5 rounded-full font-medium">{{ badgeLabel(indexModeOf(conn)) }}</span>
           <button class="text-xs px-2 py-1 rounded-md border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800" @click="editScope(conn)">Edit scope</button>
         </div>
       </div>
       <div class="mt-3 grid grid-cols-[64px_1fr] gap-x-3 gap-y-1.5 text-xs">
-        <span class="text-gray-400 dark:text-gray-500">Base</span>
+        <span class="text-ink-muted">Base</span>
         <span class="font-mono text-gray-700 dark:text-gray-300 break-all">{{ baseOf(conn) }}</span>
-        <span class="text-gray-400 dark:text-gray-500">Scope</span>
+        <span class="text-ink-muted">Scope</span>
         <div>
-          <template v-if="globsOf(conn).length"><code v-for="g in globsOf(conn)" :key="g" class="inline-block mr-1.5 mb-1 px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-800">{{ g }}</code></template>
+          <span v-if="conn.type === 'kms_lighthouse'" class="text-gray-500 italic">{{ $t('kmsFileScope.browsingOnly') }}</span>
+          <template v-else-if="globsOf(conn).length"><code v-for="g in globsOf(conn)" :key="g" class="inline-block mr-1.5 mb-1 px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 border border-blue-100 dark:border-blue-800">{{ g }}</code></template>
           <span v-else class="text-gray-500 italic">whole path</span>
         </div>
       </div>
-      <div class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-2">
-        <div v-if="browse[conn.id]?.connectRequired" class="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 rounded px-2 py-1.5">
-          Connect your account to browse — this connection reads files with each user's own credentials.
-        </div>
-        <template v-else>
-        <!-- Browsing a delegated source is a live call to the provider and can
-             take a while; say so instead of rendering "… files match", which
-             reads like a value rather than a pending fetch. -->
-        <div v-if="browse[conn.id] === undefined" class="text-xs text-gray-400 dark:text-gray-500 mb-1 flex items-center gap-1.5">
-          <UIcon name="i-heroicons-arrow-path" class="w-3 h-3 animate-spin" />{{ $t('agentsPage.loadingFiles') }}
-        </div>
-        <div v-else class="text-xs text-gray-500 dark:text-gray-400 mb-1">{{ browse[conn.id]?.total ?? 0 }} files match · agent reads ONLY these · denials audited</div>
-        <ul class="text-xs font-mono text-gray-600 dark:text-gray-400 space-y-0.5 max-h-48 overflow-auto">
-          <li v-for="n in (browse[conn.id]?.names || [])" :key="n" class="truncate">{{ n }}</li>
-          <li v-if="(browse[conn.id]?.total || 0) > (browse[conn.id]?.names?.length || 0)" class="text-gray-400 italic">… {{ browse[conn.id].total - browse[conn.id].names.length }} more</li>
-          <li v-if="browse[conn.id] && browse[conn.id].total === 0" class="text-gray-400 italic">{{ indexModeOf(conn) === 'none' ? 'Live source — read on demand, not cached.' : 'No files match.' }}</li>
-        </ul>
-        </template>
+      <div class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-3">
+        <ConnectionFileBrowser :ds-id="dsId" :connection-id="conn.id" :connection-type="conn.type" />
       </div>
     </section>
 
@@ -71,14 +56,16 @@
 
 <script setup lang="ts">
 import DataSourceIcon from '~/components/DataSourceIcon.vue'
+import ConnectionFileBrowser from '~/components/datasources/ConnectionFileBrowser.vue'
 const props = defineProps<{ dsId: string; canUpdate?: boolean }>()
-const emit = defineEmits(['edit-connection'])
+// `changed` tells the host tree to re-read the uploaded-file list: the two
+// views keep separate copies and neither can see the other's mutations.
+const emit = defineEmits(['edit-connection', 'changed'])
 const toast = useToast()
 
 const connections = ref<any[]>([])
 const registryByType = ref<Record<string, any>>({})
 const files = ref<any[]>([])
-const browse = ref<Record<string, { names: string[]; total: number; connectRequired?: boolean }>>({})
 const uploading = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 
@@ -87,6 +74,7 @@ const cfg = (c: any) => c?.config || {}
 const baseOf = (c: any) => {
   const g = cfg(c)
   if (c.type === 'sharepoint_onprem') return [g.site_url, g.drive_name, g.folder_path].filter(Boolean).join(' / ')
+  if (c.type === 'documentum') return [g.rest_url, g.repository, g.root_path].filter(Boolean).join(' / ')
   return g.bucket ? `s3://${g.bucket}/${g.prefix || ''}` : (g.root_path || '—')
 }
 const globsOf = (c: any) => String(cfg(c).include_globs || '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean)
@@ -104,37 +92,30 @@ async function loadAll() {
   for (const e of (reg.data.value as any[]) || []) registryByType.value[e.type] = e
   connections.value = (conns.data.value as any[]) || []
   files.value = (ups.data.value as any[]) || []
-  for (const c of fileConnections.value) {
-    try {
-      // Live list — same path the agent's list_files uses (source of truth),
-      // so browse never diverges and none-mode connections show their files.
-      const res = await useMyFetch(`/data_sources/${props.dsId}/connections/${c.id}/files?limit=30`, { method: 'GET' })
-      const d: any = res.data.value || {}
-      // Show the human-readable name. Connectors whose ids ARE paths
-      // (network_dir, S3) read fine either way, but Graph sources return opaque
-      // item ids — preferring `id` listed a OneDrive/SharePoint library as
-      // "01TP3T7WAPS6ZPWYNEKFDLOFCUKPKFKA54" instead of "Book 1.xlsx".
-      browse.value[c.id] = { names: (d.files || []).map((f: any) => f.name || f.path || f.id), total: d.total ?? (d.files || []).length, connectRequired: !!d.connect_required }
-    } catch { browse.value[c.id] = { names: [], total: 0 } }
-  }
 }
 function triggerUpload() { fileInput.value?.click() }
 async function onFileInput(e: Event) {
   const input = e.target as HTMLInputElement
   if (!input.files?.length) return
   uploading.value = true
+  let ok = 0
   try {
     for (const file of Array.from(input.files)) {
       const fd = new FormData(); fd.append('file', file)
       const { data, error } = await useMyFetch(`/data_sources/${props.dsId}/files`, { method: 'POST', body: fd })
       if (error.value || !data.value) { toast.add({ title: 'Upload failed', description: file.name, color: 'red' }); continue }
       files.value.push(data.value as any)
+      ok++
     }
   } finally { uploading.value = false; if (input) input.value = '' }
+  if (ok) emit('changed')
 }
 async function removeFile(f: any) {
-  try { await useMyFetch(`/data_sources/${props.dsId}/files/${f.id}`, { method: 'DELETE' }); files.value = files.value.filter((x) => x.id !== f.id) }
-  catch { toast.add({ title: 'Failed to remove file', color: 'red' }) }
+  try {
+    await useMyFetch(`/data_sources/${props.dsId}/files/${f.id}`, { method: 'DELETE' })
+    files.value = files.value.filter((x) => x.id !== f.id)
+    emit('changed')
+  } catch { toast.add({ title: 'Failed to remove file', color: 'red' }) }
 }
 // Scope lives on the connection — let the host open the ConnectionDetailModal.
 function editScope(conn: any) { emit('edit-connection', conn) }

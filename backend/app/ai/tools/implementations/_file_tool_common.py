@@ -14,6 +14,8 @@ import uuid
 from typing import Any, Dict, Optional, Tuple
 
 import aiofiles
+
+from app.services import storage
 import pandas as pd
 from sqlalchemy import select
 
@@ -23,6 +25,7 @@ from app.data_sources.clients._office_convert import (
     CONVERTIBLE_EXTS,
     office_to_pdf_bytes,
 )
+from .agent_focus_common import run_scope_agents
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +37,13 @@ logger = logging.getLogger(__name__)
 # "no file source is attached to this agent".
 FILE_SOURCE_TYPES = {
     "sharepoint_onprem",
+    "documentum",
     "sharepoint", "onedrive", "google_drive", "outlook_mail", "gmail_mail",
     "network_dir", "s3", "onenote",
+    # KMS Lighthouse: live only (no catalog), read with the caller's identity.
+    "kms_lighthouse",
+    # Code connections: a cached clone served by a NetworkDirClient subclass.
+    "github_repo", "gitlab_repo", "bitbucket_repo",
     # Hybrid connectors (QUERY + file capabilities). ServiceNow serves record
     # attachments (KB files by default) live via its Attachment API; its
     # tabular catalog is untouched, so it must NOT be added to the type sets
@@ -89,6 +97,30 @@ def friendly_tool_error(operation: str, connection_name: str, exc: Exception) ->
     Connect this source") instead of a raw OAuth boilerplate dump rendered
     red in the chat; everything else keeps the raw detail for debugging."""
     from app.data_sources.clients.sharepoint_onprem_client import SharePointHTTPError
+    from app.data_sources.clients.documentum_client import DocumentumHTTPError
+    from app.data_sources.clients._graph_throttle import GraphThrottledError
+    if isinstance(exc, GraphThrottledError):
+        name = connection_name or "this source"
+        wait = max(1, int(round(exc.retry_after)))
+        return (
+            f"Microsoft is rate-limiting '{name}' right now (HTTP {exc.status}); it will "
+            f"accept requests again in about {wait}s. Do NOT retry this call immediately or "
+            "in a loop — every request sent while throttled extends the block. Tell the "
+            "user the source is temporarily throttled by Microsoft and continue with the "
+            "remaining sources."
+        )
+    if isinstance(exc, DocumentumHTTPError) and exc.status in (401, 403):
+        name = connection_name or "Documentum"
+        if exc.status == 401:
+            return (
+                f"Documentum rejected the credentials for '{name}'. Check the connection's repository "
+                "user or OTDS client. For a user-required connection, the user must connect with their own "
+                "Documentum login (OTDS impersonation or sign-in)."
+            )
+        return (
+            f"Documentum denied access to that object for the current identity on '{name}' — the "
+            "repository ACL does not grant Browse/Read. Do not retry; tell the user which document was denied."
+        )
     if isinstance(exc, SharePointHTTPError) and exc.status == 401:
         return (
             f"Windows authentication failed for '{connection_name or 'SharePoint Server'}'. "
@@ -123,7 +155,9 @@ def mark_agent_used(runtime_ctx: Dict[str, Any], ds: Any) -> None:
         pass
 
 
-def note_enumeration(runtime_ctx: Dict[str, Any], connection_key: str, count: int) -> Optional[str]:
+def note_enumeration(
+    runtime_ctx: Dict[str, Any], connection_key: str, count: int, *, scoped: bool = False,
+) -> Optional[str]:
     """Per-run repeat-enumeration guard for list/search file tools.
 
     Returns a hint string when this connection was ALREADY enumerated this
@@ -131,7 +165,14 @@ def note_enumeration(runtime_ctx: Dict[str, Any], connection_key: str, count: in
     exact-query dedupe), else records the enumeration and returns None.
     Result-time feedback lands exactly when the model is about to repeat
     itself, unlike description-time advice.
+
+    ``scoped`` (a listing narrowed to one folder, or the next cursor page) is
+    neither noted nor recorded: walking a library folder by folder lists each
+    folder once, and telling the model "already enumerated, stop re-listing"
+    on the second folder steers it away from the work it was asked to do.
     """
+    if scoped:
+        return None
     try:
         seen = runtime_ctx.setdefault("_file_enum_seen", {})
         key = str(connection_key or "")
@@ -167,7 +208,7 @@ async def resolve_file_data_source(
     # frequently addresses a source by the label it sees (e.g. the connection
     # name "Employees SharePoint") rather than the internal UUID.
     file_choices = []  # (name, id) for the error message
-    for ds in (report.data_sources or []):
+    for ds in run_scope_agents(runtime_ctx):
         for conn in (ds.connections or []):
             if conn.type in FILE_SOURCE_TYPES:
                 file_choices.append(((getattr(conn, "name", "") or "").strip(), conn.id))
@@ -199,14 +240,12 @@ def attached_file_connections(runtime_ctx: Dict[str, Any]) -> list:
     connection on the current report's ACTIVE data sources.
 
     This is the allow-list every file tool resolves against: a disabled agent
-    or connection is never a valid target, and nothing outside the report the
-    caller is running in can appear here. Empty when there's no report scope.
+    or connection is never a valid target, and nothing outside the run's scope
+    (its working set — Auto's accessible agents — plus the report's own
+    attachments) can appear here. Empty when there's no report scope.
     """
-    report = runtime_ctx.get("report")
-    if not report:
-        return []
     out: list = []
-    for ds in (report.data_sources or []):
+    for ds in run_scope_agents(runtime_ctx):
         if not getattr(ds, "is_active", True):
             continue
         for conn in (ds.connections or []):
@@ -374,7 +413,8 @@ async def resolve_file_client(
 
 def resolve_session_file(runtime_ctx: Dict[str, Any], file_id: str):
     """Resolve a file id against the report's OWN file space (uploads,
-    attach_file results). The report.files list is the allow-list — a session
+    attach_file results, project files, the run agents' library files). That
+    list is the allow-list — a session
     id from another report resolves to None here, exactly like an unattached
     connection in resolve_file_client. Org membership is double-checked so a
     stale association can't cross tenants."""
@@ -383,10 +423,12 @@ def resolve_session_file(runtime_ctx: Dict[str, Any], file_id: str):
     sid = str(file_id or "").strip()
     if not (report and sid):
         return None
-    # Report uploads + files inherited live from the report's project (the
-    # agent loop stages the latter in runtime_ctx as "project_files").
+    # Report uploads + files inherited live from the report's project and
+    # from the run agents' libraries (the agent loop stages those in
+    # runtime_ctx as "project_files" / "agent_files").
     candidates = list(getattr(report, "files", None) or [])
     candidates += list(runtime_ctx.get("project_files") or [])
+    candidates += list(runtime_ctx.get("agent_files") or [])
     for f in candidates:
         if str(getattr(f, "id", "")) != sid:
             continue
@@ -403,7 +445,7 @@ class SessionFileClient:
 
     Delegates parsing/windowed/page_range reads to NetworkDirClient rooted at
     the file's directory, so session files get the exact same read semantics
-    (newline-snapped windows, PDF page extraction, tabular parsing) as
+    (exact byte windows, PDF page extraction, tabular parsing) as
     connector files — one pipeline, two resolution sources. The stored disk
     name keeps the original extension (uuid_name.ext), so type dispatch works.
     """
@@ -416,18 +458,125 @@ class SessionFileClient:
 
     def _inner(self):
         from app.data_sources.clients.network_dir_client import NetworkDirClient
-        return NetworkDirClient(root_path=self._dir)
+        # Uploads live in the app's own uploads/files; the connection-root
+        # policy refuses that directory by design (a user must not point a
+        # network_dir connection at the app). This shim serves one report-owned
+        # upload row, not user-configured input, so it takes the internal
+        # app-owned constructor. Root confinement (`_resolve`) still applies.
+        return NetworkDirClient.for_app_owned_dir(root_path=self._dir)
 
     async def aread_file(self, _file_id: str, **kwargs) -> Any:
         import asyncio as _asyncio
+        from app.services import storage
+        await storage.aensure_local(self._file.path)
         return await _asyncio.to_thread(self._inner().read_file, self._name, **kwargs)
 
     def read_raw_bytes(self, _file_id: str):
+        from app.services import storage
+        storage.ensure_local(self._file.path)
         return self._inner().read_raw_bytes(self._name)
 
     @property
     def display_name(self) -> str:
         return getattr(self._file, "filename", None) or self._name
+
+
+class EmailAttachmentClient:
+    """File-client shim over ONE attachment of an email file.
+
+    Backs the ``<parent>#att:<i>:<name>`` ids that an email's rendered text
+    lists. The attachment is reached ONLY through the parent: every read
+    first fetches the email's bytes via the parent client's own raw-bytes
+    path (connector scope / glob / permission checks included), then walks
+    the ``#att:`` chain inside the parsed message. An attachment is therefore
+    never reachable unless the email itself is.
+
+    The extracted bytes are then read exactly like any file of that
+    extension — document extraction, CSV/XLSX → DataFrame, text, binary —
+    by handing them to NetworkDirClient in a scratch directory, the same
+    delegation SessionFileClient uses. One typed-read pipeline, three
+    resolution sources.
+    """
+
+    # read_source_bytes must not split the id again: this client already IS
+    # the resolved attachment (its raw reader ignores the id it is given).
+    resolves_attachment_ids = True
+
+    def __init__(self, parent_client, parent_id: str, chain):
+        self._parent = parent_client
+        self._parent_id = parent_id
+        self._chain = list(chain)
+        self._name = self._chain[-1][1] if self._chain else ""
+
+    def _attachment(self) -> tuple[bytes, str, str | None]:
+        from app.data_sources.clients._email_text import extract_email_attachment
+
+        content, name, _mime = _raw_bytes_sync(self._parent, self._parent_id)
+        data, leaf, mime = extract_email_attachment(content, name, self._chain)
+        return data, leaf, (mime or None)
+
+    def _read_sync(self, **kwargs) -> Any:
+        import tempfile
+
+        from app.data_sources.clients._file_source_common import DocumentText, NamedBytes
+        from app.data_sources.clients.network_dir_client import NetworkDirClient
+
+        data, leaf, mime = self._attachment()
+        with tempfile.TemporaryDirectory(prefix="bow-att-") as tmp:
+            target = os.path.join(tmp, leaf)
+            with open(target, "wb") as fh:
+                fh.write(data)
+            payload = NetworkDirClient.for_app_owned_dir(root_path=tmp).read_file(leaf, **kwargs)
+        # Carry the attachment's own name on text/binary results so the tool
+        # layer dispatches and labels by it (the id's leaf would also work,
+        # but a DocumentText keeps the bytes for the viewer without a refetch).
+        if isinstance(payload, str) and not isinstance(payload, DocumentText):
+            return DocumentText(payload, raw=data, name=leaf, mime=mime)
+        if isinstance(payload, (bytes, bytearray)) and not isinstance(payload, NamedBytes):
+            return NamedBytes(bytes(payload), name=leaf, mime=mime)
+        return payload
+
+    async def aread_file(self, _file_id: str, **kwargs) -> Any:
+        import asyncio as _asyncio
+        return await _asyncio.to_thread(self._read_sync, **kwargs)
+
+    def read_raw_bytes(self, _file_id: str, *, max_bytes: int | None = None):
+        data, leaf, mime = self._attachment()
+        if max_bytes and len(data) > max_bytes:
+            from app.data_sources.clients._file_source_common import FileTooLargeError
+            raise FileTooLargeError(
+                f"Attachment '{leaf}' is {len(data) / 1024 / 1024:.1f} MB, over the "
+                f"{max_bytes / 1024 / 1024:.0f} MB limit."
+            )
+        return data, leaf, mime
+
+    @property
+    def display_name(self) -> str:
+        return self._name
+
+    @property
+    def _bow_connection(self):
+        # The tool layer inspects the resolved connection (auth policy, name)
+        # through this attribute; the attachment belongs to the parent's.
+        return getattr(self._parent, "_bow_connection", None)
+
+
+def _raw_bytes_sync(client, file_id: str) -> tuple[bytes, str, str | None]:
+    """Synchronous twin of read_source_bytes for the attachment shim, which
+    runs on a worker thread. Same preference order: the client's raw reader,
+    else a serialized whole-file read."""
+    leaf = str(file_id or "").rsplit("/", 1)[-1] or "file"
+    if hasattr(client, "read_raw_bytes"):
+        raw = client.read_raw_bytes(file_id)
+        if isinstance(raw, tuple):
+            return raw[0], (raw[1] if len(raw) > 1 and raw[1] else leaf), (raw[2] if len(raw) > 2 else None)
+        return raw, leaf, None
+    payload = client.read_file(file_id)
+    if isinstance(payload, (bytes, bytearray)):
+        return bytes(payload), leaf, None
+    if isinstance(payload, str):
+        return payload.encode("utf-8"), leaf, None
+    raise ValueError(f"'{file_id}' cannot be read as raw bytes from this connection.")
 
 
 def render_pdf_pages_images(pdf_bytes: bytes, first: int, last: int, *, max_pages: int = 8, dpi: int = 150):
@@ -490,6 +639,14 @@ def render_file_payload(name: str, payload: Any, max_rows: int, max_chars: int) 
             "col_count": int(len(df.columns)),
             "truncated": truncated,
         })
+        # Excel workbooks: which sheet this is, and every sheet in the file.
+        # Without the list the model only ever sees the first sheet and has
+        # no way to ask for the others (connectors tag it — see
+        # read_excel_sheet in _file_source_common).
+        sheet_names = payload.attrs.get("sheet_names")
+        if sheet_names:
+            out["sheet"] = payload.attrs.get("sheet")
+            out["sheets"] = [str(n) for n in sheet_names]
         return out
 
     if isinstance(payload, str):
@@ -544,6 +701,10 @@ _ATTACHABLE_BY_EXT = {
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "doc": "application/msword",
     "ppt": "application/vnd.ms-powerpoint",
+    # Email files: attachable as the original message (attach_file on a
+    # connector .eml/.msg) — their text render is what the model reads.
+    "eml": "message/rfc822",
+    "msg": "application/vnd.ms-outlook",
     # Rendered page images / picture files — materialized so they get a file id
     # (referenceable in later turns and visible in the UI).
     "png": "image/png",
@@ -659,23 +820,13 @@ def render_file_images(file_id: str, payload, *, max_pages: int = 8, dpi: int = 
 
 
 def allow_llm_see_data(runtime_ctx: Dict[str, Any]) -> bool:
-    """Whether the org lets raw data/content reach the model. Defaults to True
-    when settings are unavailable, matching the other tool call sites."""
-    try:
-        org = runtime_ctx.get("organization")
-        settings = getattr(org, "settings", None)
-        if settings is None:
-            return True
-        try:
-            return bool(settings.get_config("allow_llm_see_data").value)
-        except Exception:
-            pass
-        cfg = getattr(settings, "config", None)
-        if isinstance(cfg, dict):
-            return bool(cfg.get("allow_llm_see_data", {}).get("value", True))
-    except Exception:
-        pass
-    return True
+    """Whether the org lets raw data/content reach the model (the shared
+    reader: on without settings, off when they cannot be read)."""
+    from app.ai.data_visibility import allow_llm_see_data as _allowed
+
+    org = (runtime_ctx or {}).get("organization")
+    return _allowed(getattr(org, "settings", None))
+
 
 # Hard cap on auto-attach size. Larger files still return content inline but
 # don't get persisted — the agent should reach for a more specific reader.
@@ -688,23 +839,56 @@ _ATTACH_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
 _PREVIEW_MAX_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
-async def read_source_bytes(client, file_id: str) -> Tuple[bytes, str, Optional[str]]:
+async def read_source_bytes(
+    client, file_id: str, *, max_bytes: Optional[int] = None,
+) -> Tuple[bytes, str, Optional[str]]:
     """The file's ORIGINAL bytes + name + mime, unparsed.
 
     Prefers the client's raw-bytes reader so callers persist a real .pdf/.xlsx
     instead of a reparsed copy, and falls back to serializing whatever
     ``read_file`` returns for clients that expose no such reader.
 
+    ``max_bytes`` is forwarded to raw readers that accept it, which reject an
+    oversize file from its reported size (FileTooLargeError) BEFORE
+    downloading it. Readers without the parameter, and the fallback path,
+    don't enforce it — callers that must bound memory check the result too.
+
     Clients disagree on the return shape — network_dir/s3/graph_drive/
     google_drive hand back ``(bytes, name, mime)`` while OneNote returns bare
     bytes — so normalize it here. Unpacking the bare-bytes form into three
     names is a TypeError, which is exactly why this belongs in one place.
     """
+    # An email attachment id (`<parent>#att:<i>:<name>`) is served from the
+    # PARENT's bytes: fetch the email through this same function (so the
+    # connector's scope check runs on it), then cut the attachment out. This
+    # is what lets attach_file and the document-preview path take attachment
+    # ids without knowing anything about email.
+    from app.data_sources.clients._email_text import (
+        extract_email_attachment,
+        split_attachment_id,
+    )
+
+    parent_id, chain = split_attachment_id(file_id)
+    if chain and not getattr(client, "resolves_attachment_ids", False):
+        import asyncio
+
+        content, name, _mime = await read_source_bytes(client, parent_id, max_bytes=max_bytes)
+        data, leaf, mime = await asyncio.to_thread(extract_email_attachment, content, name, chain)
+        return data, leaf, (mime or None)
+
     leaf = str(file_id or "").rsplit("/", 1)[-1] or "file"
     if hasattr(client, "read_raw_bytes"):
         import asyncio
+        import inspect
 
-        raw = await asyncio.to_thread(client.read_raw_bytes, file_id)
+        kwargs = {}
+        if max_bytes:
+            try:
+                if "max_bytes" in inspect.signature(client.read_raw_bytes).parameters:
+                    kwargs["max_bytes"] = max_bytes
+            except (TypeError, ValueError):
+                pass
+        raw = await asyncio.to_thread(client.read_raw_bytes, file_id, **kwargs)
         if isinstance(raw, tuple):
             content = raw[0]
             name = raw[1] if len(raw) > 1 else ""
@@ -822,7 +1006,7 @@ async def attach_drive_file_to_session(
         return None
     if len(content_bytes) > _ATTACH_MAX_BYTES:
         logger.info(
-            "attach_drive_file_to_session: %s skipped (%.1f MB > cap)",
+            "attach_drive_file_to_session: %r skipped (%.1f MB > cap)",
             filename, len(content_bytes) / (1024 * 1024),
         )
         return None
@@ -873,6 +1057,7 @@ async def attach_drive_file_to_session(
             # for content that is byte-identical. Size first (free), full
             # compare only on a size match.
             unchanged = False
+            await storage.aensure_local(path)
             try:
                 if (
                     cached.content_type == resolved_mime
@@ -885,7 +1070,7 @@ async def attach_drive_file_to_session(
                 unchanged = False
             if unchanged:
                 logger.info(
-                    "attach_drive_file_to_session: %s unchanged, reusing session file %s",
+                    "attach_drive_file_to_session: %r unchanged, reusing session file %s",
                     filename, cached.id,
                 )
                 if analysis:
@@ -893,6 +1078,7 @@ async def attach_drive_file_to_session(
                 return str(cached.id)
             async with aiofiles.open(path, "wb") as fh:
                 await fh.write(content_bytes)
+            await storage.apersist(path, resolved_mime)
             cached.content_type = resolved_mime
             cached.filename = filename
             db_file = cached
@@ -900,7 +1086,7 @@ async def attach_drive_file_to_session(
             await db.commit()
             await db.refresh(db_file)
             logger.info(
-                "attach_drive_file_to_session: refreshed %s in place (session file %s)",
+                "attach_drive_file_to_session: refreshed %r in place (session file %s)",
                 filename, db_file.id,
             )
         else:
@@ -913,6 +1099,7 @@ async def attach_drive_file_to_session(
             path = f"uploads/files/{unique_filename}"
             async with aiofiles.open(path, "wb") as fh:
                 await fh.write(content_bytes)
+            await storage.apersist(path, resolved_mime)
 
             db_file = File(
                 filename=filename,
@@ -956,12 +1143,14 @@ async def attach_drive_file_to_session(
             db.add(db_file)
             await db.commit()
         except Exception as e:
-            logger.warning("attach_drive_file_to_session: preview failed for %s: %s", filename, e)
+            logger.warning("attach_drive_file_to_session: preview failed for %r: %r", filename, e)
 
-        logger.info("attach_drive_file_to_session: attached %s as session file %s", filename, db_file.id)
+        logger.info("attach_drive_file_to_session: attached %r as session file %s", filename, db_file.id)
         return str(db_file.id)
     except Exception as e:
-        logger.warning("attach_drive_file_to_session: persistence failed for %s: %s", filename, e)
+        # %r: the name (and the driver's error quoting it) can carry
+        # surrogateescape'd bytes, which no UTF-8 log sink can write.
+        logger.warning("attach_drive_file_to_session: persistence failed for %r: %r", filename, e)
         # A failure during flush (bad encoding, constraint violation) leaves the
         # session in a state where EVERY later statement raises "This Session's
         # transaction has been rolled back" — the attach is best-effort, but
@@ -1058,3 +1247,22 @@ async def persist_source_document(
     except Exception as e:
         logger.warning("persist_source_document: failed for %s: %s", file_id, e)
         return None
+
+
+def email_inventory_row(e: dict) -> str:
+    """One line of a mailbox listing for the model-facing observation.
+
+    `list_emails` / `search_email` advertise that they return "messages with
+    their id, subject, sender and received time". The data is there (the mail
+    clients emit `from` / `modified_at`), but the generic file row renders only
+    name/path/size, so the model saw `Subject [id=...]` and had to call
+    read_email once per message just to learn the sender and date. This renders
+    the fields the tool description promises.
+    """
+    subject = str(e.get("name") or "(no subject)")
+    bits = [subject]
+    if e.get("sender"):
+        bits.append(f"from {e['sender']}")
+    if e.get("modified_at"):
+        bits.append(str(e["modified_at"]))
+    return " — ".join(bits) + f" [id={e.get('id')}]"

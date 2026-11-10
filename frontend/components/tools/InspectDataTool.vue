@@ -3,17 +3,17 @@
     <!-- Status header -->
     <Transition name="fade" appear>
       <div
-        class="flex items-center text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
+        class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
         @click="toggleExpanded"
       >
         <span v-if="status === 'running'" class="tool-shimmer flex items-center flex-wrap gap-1">
-          <Icon name="heroicons-command-line" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />
-          <span>{{ $t('tools.inspectData.inspecting') }}</span>
+          <Icon name="heroicons-command-line" class="w-3 h-3 me-1 text-ink-muted" />
+          <span>{{ t('tools.inspectData.inspecting') }}</span>
           <Transition name="fade-in" appear>
             <span v-if="groupedTables.length" class="inline-flex items-center flex-wrap gap-1">
               <template v-for="(group, gidx) in groupedTables" :key="gidx">
                 <span v-if="gidx > 0" class="text-gray-300 dark:text-gray-600">|</span>
-                <DataSourceIcon :type="group.type" class="h-2" />
+                <DataSourceIcon :icon-token="group.iconToken" class="h-2" />
                 <span class="inline-flex items-center flex-wrap" :title="group.title">
                   <span v-for="(nm, nidx) in group.visible" :key="nidx" class="inline-flex items-center">
                     <UIcon
@@ -22,23 +22,23 @@
                       class="w-2.5 h-2.5 me-0.5 text-amber-500 flex-shrink-0"
                       title="Cached locally — this read did not query the source"
                     />
-                    <span>{{ nm }}</span><span v-if="nidx < group.visible.length - 1">,&nbsp;</span>
+                    <bdi>{{ nm }}</bdi><span v-if="nidx < group.visible.length - 1">,&nbsp;</span>
                   </span>
-                  <UTooltip v-if="group.more" :text="group.moreTitle"><span class="text-gray-400 dark:text-gray-500">&nbsp;+{{ group.more }}</span></UTooltip>
+                  <UTooltip v-if="group.more" :text="group.moreTitle"><span class="text-ink-muted">&nbsp;+{{ group.more }}</span></UTooltip>
                 </span>
               </template>
             </span>
-            <span v-else>{{ $t('tools.inspectData.dataRunning') }}</span>
+            <span v-else>{{ t('tools.inspectData.dataRunning') }}</span>
           </Transition>
         </span>
         <span v-else class="text-gray-600 dark:text-gray-400 flex items-center flex-wrap gap-1">
-          <Icon name="heroicons-command-line" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />
-          <span>{{ $t('tools.inspectData.inspected') }}</span>
+          <Icon name="heroicons-command-line" class="w-3 h-3 me-1 text-ink-muted" />
+          <span>{{ t('tools.inspectData.inspected') }}</span>
           <Transition name="fade-in" appear>
             <span v-if="groupedTables.length" class="inline-flex items-center flex-wrap gap-1">
               <template v-for="(group, gidx) in groupedTables" :key="gidx">
                 <span v-if="gidx > 0" class="text-gray-300 dark:text-gray-600">|</span>
-                <DataSourceIcon :type="group.type" class="h-2.5" />
+                <DataSourceIcon :icon-token="group.iconToken" class="h-2.5" />
                 <span class="inline-flex items-center flex-wrap" :title="group.title">
                   <span v-for="(nm, nidx) in group.visible" :key="nidx" class="inline-flex items-center">
                     <UIcon
@@ -47,18 +47,18 @@
                       class="w-2.5 h-2.5 me-0.5 text-amber-500 flex-shrink-0"
                       title="Cached locally — this read did not query the source"
                     />
-                    <span>{{ nm }}</span><span v-if="nidx < group.visible.length - 1">,&nbsp;</span>
+                    <bdi>{{ nm }}</bdi><span v-if="nidx < group.visible.length - 1">,&nbsp;</span>
                   </span>
-                  <UTooltip v-if="group.more" :text="group.moreTitle"><span class="text-gray-400 dark:text-gray-500">&nbsp;+{{ group.more }}</span></UTooltip>
+                  <UTooltip v-if="group.more" :text="group.moreTitle"><span class="text-ink-muted">&nbsp;+{{ group.more }}</span></UTooltip>
                 </span>
               </template>
             </span>
-            <span v-else>{{ $t('tools.inspectData.data') }}</span>
+            <span v-else>{{ t('tools.inspectData.data') }}</span>
           </Transition>
-          <span v-if="duration" class="text-gray-400 dark:text-gray-500 ms-1">{{ duration }}</span>
+          <span v-if="duration" class="text-ink-muted ms-1">{{ duration }}</span>
           <Icon
             :name="isExpanded ? 'heroicons-chevron-down' : 'heroicons-chevron-right'"
-            class="w-3 h-3 ms-1 text-gray-400 dark:text-gray-500 rtl-flip"
+            class="w-3 h-3 ms-1 text-ink-muted rtl-flip"
           />
         </span>
       </div>
@@ -67,20 +67,20 @@
     <!-- Live progress while running -->
     <Transition name="slide">
       <div v-if="status === 'running' && progressStage" class="mt-1.5 ms-5 space-y-1">
-        <div class="flex items-center text-[11px] text-gray-500 dark:text-gray-400">
-          <Spinner v-if="isCodeGenerating" class="w-2.5 h-2.5 me-1 text-gray-400 dark:text-gray-500" />
+        <div class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400">
+          <Spinner v-if="isCodeGenerating" class="w-2.5 h-2.5 me-1 text-ink-muted" />
           <Icon v-else-if="codeGenDone" name="heroicons-check" class="w-2.5 h-2.5 me-1 text-green-500" />
-          <span v-if="isCodeGenerating" class="tool-shimmer">{{ $t('tools.inspectData.generatingCode') }}</span>
-          <span v-else-if="codeGenDone" class="text-gray-500 dark:text-gray-400">{{ $t('tools.inspectData.generatedCode') }}</span>
+          <span v-if="isCodeGenerating" class="tool-shimmer">{{ t('tools.inspectData.generatingCode') }}</span>
+          <span v-else-if="codeGenDone" class="text-gray-500 dark:text-gray-400">{{ t('tools.inspectData.generatedCode') }}</span>
         </div>
-        <div v-if="showExecutingStep" class="flex items-center text-[11px] text-gray-500 dark:text-gray-400">
-          <Spinner v-if="isExecuting" class="w-2.5 h-2.5 me-1 text-gray-400 dark:text-gray-500" />
+        <div v-if="showExecutingStep" class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400">
+          <Spinner v-if="isExecuting" class="w-2.5 h-2.5 me-1 text-ink-muted" />
           <Icon v-else-if="executionDone" name="heroicons-check" class="w-2.5 h-2.5 me-1 text-green-500" />
-          <span v-if="isExecuting" class="tool-shimmer">{{ $t('tools.inspectData.executing') }}</span>
-          <span v-else-if="executionDone" class="text-gray-500 dark:text-gray-400">{{ $t('tools.inspectData.executed') }}</span>
+          <span v-if="isExecuting" class="tool-shimmer">{{ t('tools.inspectData.executing') }}</span>
+          <span v-else-if="executionDone" class="text-gray-500 dark:text-gray-400">{{ t('tools.inspectData.executed') }}</span>
         </div>
         <!-- Execution error from stdout -->
-        <div v-if="latestStdoutError" class="text-[10px] text-amber-600 bg-amber-50/50 dark:bg-amber-950 rounded px-2 py-1 max-h-12 overflow-y-auto">
+        <div v-if="latestStdoutError" class="text-chat-2 text-amber-600 bg-amber-50/50 dark:bg-amber-950 rounded px-2 py-1 max-h-12 overflow-y-auto">
           <pre class="whitespace-pre-wrap break-words m-0">{{ latestStdoutError }}</pre>
         </div>
       </div>
@@ -92,39 +92,39 @@
         <!-- Code section -->
         <div v-if="code" class="group">
           <div
-            class="flex items-center text-[11px] text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-600 dark:hover:text-gray-300 mb-0.5"
+            class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-600 dark:hover:text-gray-300 mb-0.5"
             @click="toggleCode"
           >
             <Icon
               :name="showCode ? 'heroicons-chevron-down' : 'heroicons-chevron-right'"
-              class="w-2.5 h-2.5 me-1 text-gray-400 dark:text-gray-500 rtl-flip"
+              class="w-2.5 h-2.5 me-1 text-ink-muted rtl-flip"
             />
-            <span>{{ $t('tools.common.code') }}</span>
+            <span>{{ t('tools.common.code') }}</span>
           </div>
           <div v-if="showCode" class="max-h-24 overflow-auto rounded bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800">
-            <pre class="text-[10px] leading-tight text-gray-600 dark:text-gray-400 p-2 m-0 whitespace-pre-wrap break-words">{{ code }}</pre>
+            <pre class="text-chat-2 leading-tight text-gray-600 dark:text-gray-400 p-2 m-0 whitespace-pre-wrap break-words">{{ code }}</pre>
           </div>
         </div>
 
         <!-- Output section -->
         <div v-if="output" class="group">
           <div
-            class="flex items-center text-[11px] text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-600 dark:hover:text-gray-300 mb-0.5"
+            class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-600 dark:hover:text-gray-300 mb-0.5"
             @click="toggleOutput"
           >
             <Icon
               :name="showOutput ? 'heroicons-chevron-down' : 'heroicons-chevron-right'"
-              class="w-2.5 h-2.5 me-1 text-gray-400 dark:text-gray-500 rtl-flip"
+              class="w-2.5 h-2.5 me-1 text-ink-muted rtl-flip"
             />
-            <span>{{ $t('tools.common.output') }}</span>
+            <span>{{ t('tools.common.output') }}</span>
           </div>
           <div v-if="showOutput" class="max-h-28 overflow-auto rounded bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800">
-            <pre class="text-[10px] leading-tight text-gray-600 dark:text-gray-400 p-2 m-0 whitespace-pre-wrap break-words font-mono">{{ output }}</pre>
+            <pre class="text-chat-2 leading-tight text-gray-600 dark:text-gray-400 p-2 m-0 whitespace-pre-wrap break-words font-mono">{{ output }}</pre>
           </div>
         </div>
 
         <!-- Error message -->
-        <div v-if="errorMessage" class="text-[10px] text-red-500 bg-red-50/50 dark:bg-red-950 rounded px-2 py-1">
+        <div v-if="errorMessage" class="text-chat-2 text-red-500 bg-red-50/50 dark:bg-red-950 rounded px-2 py-1">
           {{ errorMessage }}
         </div>
       </div>
@@ -133,6 +133,8 @@
 </template>
 
 <script setup lang="ts">
+const { t } = useResponseI18n()
+
 import { useCachedTableNames } from '~/composables/useFastTable'
 import { groupToolTables, type ToolTableGroup } from '~/composables/useToolTables'
 import { computed, ref } from 'vue'
@@ -150,11 +152,11 @@ interface ToolExecution {
   duration_ms?: number
 }
 
+// See CreateDataTool: id to match tables_by_source, plus the backend's
+// pre-resolved icon. Nothing icon-shaped is derived on the client.
 interface DataSource {
   id: string
-  type?: string
-  data_source_type?: string
-  connections?: Array<{ id: string; type: string }>
+  icon_token?: string | null
 }
 
 interface Props {
@@ -179,8 +181,12 @@ const duration = computed<string>(() => {
   return `${(ms / 1000).toFixed(1)}s`
 })
 
-// Code: prefer final result, fall back to streamed progress code
+// Code: prefer final result, fall back to streamed progress code.
+// Gated on `view_code`; the section is `v-if="code"` so an empty string already
+// removes the whole disclosure row, header included.
+const canViewCode = useCanViewCode()
 const code = computed<string>(() => {
+  if (!canViewCode.value) return ''
   const rj = props.toolExecution?.result_json || {}
   return rj.code || (props.toolExecution as any).progress_code || ''
 })
@@ -215,7 +221,7 @@ const latestStdoutError = computed(() => {
 })
 
 // Group tables by connection type for display
-// Cached (BOW custom query) relations — a tool call that read one never
+// Cached (BOW custom table) relations — a tool call that read one never
 // touched the source database. Names come from the agent list (fetched once
 // per page); the report payload doesn't carry them.
 const { ensureLoaded: ensureCachedNames, isCachedTable } = useCachedTableNames()
@@ -234,8 +240,15 @@ const executedOnCache = computed(() => {
 })
 const isCached = (n: string) => isCachedTable(n) || executedOnCache.value
 
+// The agents the backend attached to this tool execution — present in every
+// view, unlike the `dataSources` prop (report page only), which stays as a
+// fallback.
+const iconAgents = computed<DataSource[]>(
+  () => (props.toolExecution as any)?.data_sources || props.dataSources || [],
+)
+
 const groupedTables = computed<ToolTableGroup[]>(() =>
-  groupToolTables(props.toolExecution?.arguments_json, props.dataSources)
+  groupToolTables(props.toolExecution?.arguments_json, iconAgents.value)
 )
 
 function toggleExpanded() {

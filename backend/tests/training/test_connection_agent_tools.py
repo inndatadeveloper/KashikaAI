@@ -141,6 +141,28 @@ def test_registry_gates_tools_to_training_mode():
             assert not (new_tools & names), (mode, new_tools & names)
 
 
+def test_registry_offers_artifact_tools_in_training_mode():
+    from app.ai.registry import ToolRegistry
+    r = ToolRegistry()
+    artifact_tools = {
+        "create_doc", "edit_doc",
+        "create_artifact", "edit_artifact", "read_artifact",
+        "read_query", "add_parameter",
+    }
+
+    def _names(mode):
+        names = set()
+        for pt in ("action", "research"):
+            names |= {t["name"] for t in r.get_catalog_for_plan_type(pt, mode=mode)}
+        return names
+
+    for mode in ("chat", "training"):
+        names = _names(mode)
+        assert artifact_tools <= names, (mode, artifact_tools - names)
+    names = _names("knowledge")
+    assert not (artifact_tools & names), artifact_tools & names
+
+
 @pytest.mark.asyncio
 async def test_list_connections_scoped_to_create_tier():
     ids = await _seed()
@@ -224,10 +246,14 @@ async def test_get_connection_tables_glob_schema_pagination():
         out = ev.payload["output"]
         assert len(out["tables"]) == 1 and out["has_more"] is False
 
-        # No grant on conn_other → permission_denied, not a leak.
+        # No grant on conn_other → rejected exactly like an unknown id: no
+        # name, no existence oracle (pentest 829415184).
         ev = await _final(GetConnectionTool(), {"connection_id": ids["conn_other"]}, ctx)
         out = ev.payload["output"]
-        assert out["success"] is False and out["rejected_reason"] == "permission_denied"
+        unknown = (await _final(GetConnectionTool(), {"connection_id": str(uuid.uuid4())}, ctx)).payload["output"]
+        assert out["success"] is False and unknown["success"] is False
+        assert out["rejected_reason"] == unknown["rejected_reason"]
+        assert out["message"] == unknown["message"] and not out.get("name")
 
 
 @pytest.mark.asyncio

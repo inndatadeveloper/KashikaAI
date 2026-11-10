@@ -37,6 +37,7 @@ Auth is Splunk-native:
                  (Settings → Tokens; works on Splunk Cloud and 8.x+).
   - `userpass` → HTTP basic against the management port (older on-prem installs).
 """
+from app.data_sources.clients.progress import discovery_progress
 import json
 import logging
 import re
@@ -45,7 +46,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from app.core.egress import pinned_request
 
+from app.data_sources.clients.progress import IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 from app.ai.prompt_formatters import Table, TableColumn, ServiceFormatter
 
@@ -166,7 +169,8 @@ class SplunkClient(DataSourceClient):
         params = dict(params or {})
         params.setdefault("output_mode", "json")
         try:
-            resp = requests.get(
+            resp = pinned_request(
+                "GET",
                 f"{self.base_url}{path}", params=params,
                 headers=self._headers(), auth=self._auth(),
                 verify=self.verify_ssl, timeout=HTTP_TIMEOUT,
@@ -220,7 +224,8 @@ class SplunkClient(DataSourceClient):
         if latest is not None:
             params["latest_time"] = latest
         try:
-            resp = requests.post(
+            resp = pinned_request(
+                "POST",
                 f"{self.base_url}/services/search/jobs",
                 data=params, headers=self._headers(), auth=self._auth(),
                 verify=self.verify_ssl, timeout=HTTP_TIMEOUT,
@@ -281,7 +286,10 @@ class SplunkClient(DataSourceClient):
                 name = entry.get("name")
                 if name and not name.startswith("_"):
                     names.append(name)
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("splunk catalog")
             logger.warning(f"Splunk index enumeration failed: {e}")
         self._indexes_cache = names
         return names
@@ -329,7 +337,10 @@ class SplunkClient(DataSourceClient):
                     rows.extend(self._run_search(
                         self._scoped_catalog_search(chunk),
                         earliest=self._window(), latest="now", count=MAX_ROWS))
+                except IndexingCancelled:
+                    raise
                 except Exception as e:
+                    self.mark_discovery_incomplete("splunk catalog")
                     logger.warning(f"Splunk scoped tstats catalog failed for {chunk}: {e}")
             if rows:
                 return rows
@@ -339,7 +350,10 @@ class SplunkClient(DataSourceClient):
                                     earliest=self._window(), latest="now", count=MAX_ROWS)
             return [{"index": None, "sourcetype": r.get("sourcetype"),
                      "count": r.get("totalCount")} for r in rows if r.get("sourcetype")]
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("splunk catalog")
             logger.warning(f"Splunk metadata catalog failed: {e}")
             return []
 
@@ -354,7 +368,10 @@ class SplunkClient(DataSourceClient):
                    f'by index | sort - count')
             try:
                 rows = self._run_search(spl, earliest=self._window(), latest="now", count=10)
+            except IndexingCancelled:
+                raise
             except Exception as e:
+                self.mark_discovery_incomplete("splunk catalog")
                 logger.warning(f"Splunk index resolution failed for {sourcetype}: {e}")
                 continue
             for r in rows:
@@ -599,7 +616,10 @@ class SplunkClient(DataSourceClient):
                 continue
             try:
                 tables.append(self._dashboard_table(entry, parsed))
+            except IndexingCancelled:
+                raise
             except Exception as e:
+                self.mark_discovery_incomplete("splunk catalog")
                 logger.warning(f"Splunk dashboard catalog skipped {app}/{entry.get('name')}: {e}")
         return tables
 
@@ -648,14 +668,21 @@ class SplunkClient(DataSourceClient):
         tables: List[Table] = []
         try:
             tables.extend(self._dashboard_tables())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("splunk catalog")
             logger.warning(f"Splunk dashboard catalog failed: {e}")
         try:
             tables.extend(self._saved_search_tables())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("splunk catalog")
             logger.warning(f"Splunk saved-search catalog failed: {e}")
         return tables
 
+    @discovery_progress
     def get_schemas(self, progress_callback=None) -> List[Table]:
         """Discover `index::sourcetype` tables (cheap) and sample fields for
         the top-K sourcetypes by volume (capped)."""

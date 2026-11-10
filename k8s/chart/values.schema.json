@@ -15,8 +15,68 @@
     "host": { "type": "string" },
     "postgresql": {
       "type": "object",
-      "additionalProperties": true,
-      "description": "Bitnami PostgreSQL subchart values — all keys permitted"
+      "additionalProperties": false,
+      "description": "Bundled PostgreSQL (official postgres image). Bitnami subchart keys from chart <= 2.x are rejected rather than silently ignored.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "migrateFromBitnami": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "registry": { "type": "string" },
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "imagePullSecrets": { "type": "array" },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "username": { "type": "string" },
+            "password": { "type": "string" },
+            "database": { "type": "string" },
+            "postgresPassword": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKeys": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "userPasswordKey": { "type": "string", "minLength": 1 },
+                "adminPasswordKey": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "primary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "persistence": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "size": { "type": "string" },
+                "storageClass": { "type": "string" },
+                "accessModes": { "type": "array", "items": { "type": "string" } },
+                "existingClaim": { "type": "string" }
+              }
+            },
+            "resources": { "type": "object", "additionalProperties": true },
+            "nodeSelector": { "type": "object", "additionalProperties": true },
+            "tolerations": { "type": "array" },
+            "affinity": { "type": "object", "additionalProperties": true },
+            "podAnnotations": { "type": "object", "additionalProperties": true },
+            "podSecurityContext": { "type": "object", "additionalProperties": true },
+            "containerSecurityContext": { "type": "object", "additionalProperties": true },
+            "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+            "extendedConfiguration": { "type": "string" }
+          }
+        }
+      }
     },
     "database": {
       "type": "object",
@@ -83,11 +143,21 @@
         "intercomEnabled": { "type": "boolean" },
         "telemetryEnabled": { "type": "boolean" },
         "baseUrl": { "type": "string" },
+        "forwardedAllowIps": { "type": "string" },
         "authMode": { "type": "string", "enum": ["hybrid", "local_only", "sso_only"] },
         "allowUninvitedSignups": { "type": "boolean" },
         "allowMultipleOrganizations": { "type": "boolean" },
         "verifyEmails": { "type": "boolean" },
         "uvicornWorkers": { "type": ["string", "integer"] },
+        "database": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "poolSize": { "type": ["string", "integer"] },
+            "maxOverflow": { "type": ["string", "integer"] },
+            "idleSessionTimeoutMs": { "type": ["string", "integer"] }
+          }
+        },
         "otel": {
           "type": "object",
           "additionalProperties": false,
@@ -184,6 +254,63 @@
     "affinity": { "type": "object", "additionalProperties": true },
     "topologySpreadConstraints": { "type": "array" },
     "podAnnotations": { "type": "object", "additionalProperties": true },
+    "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "type": "string", "enum": ["local", "s3", "azure"] },
+        "prefix": { "type": "string" },
+        "s3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bucket": { "type": "string" },
+            "region": { "type": "string" },
+            "endpointUrl": { "type": "string" },
+            "addressingStyle": { "type": "string", "enum": ["auto", "path", "virtual"] },
+            "auth": { "type": "string", "enum": ["default", "static", "assume_role"] },
+            "roleArn": { "type": "string" },
+            "externalId": { "type": "string" },
+            "sse": { "type": "string", "enum": ["", "AES256", "aws:kms"] },
+            "kmsKeyId": { "type": "string" }
+          }
+        },
+        "azure": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "accountUrl": { "type": "string" },
+            "container": { "type": "string" },
+            "auth": { "type": "string", "enum": ["default", "service_principal", "connection_string", "sas"] },
+            "tenantId": { "type": "string" },
+            "clientId": { "type": "string" }
+          }
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "sizeLimit": { "type": "string" } }
+        },
+        "local": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "persistence": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "existingClaim": { "type": "string" },
+                "size": { "type": "string" },
+                "storageClass": { "type": "string" },
+                "accessModes": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    },
     "podSecurityContext": { "type": "object", "additionalProperties": true },
     "containerSecurityContext": { "type": "object", "additionalProperties": true },
     "lifecycle": { "type": "object", "additionalProperties": true },

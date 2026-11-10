@@ -1,7 +1,9 @@
+from app.data_sources.clients.progress import discovery_progress
 from app.data_sources.clients.base import DataSourceClient
 from app.ai.prompt_formatters import Table, TableColumn, TableFormatter
 from typing import List, Optional
 import requests
+from app.core.egress import pinned_session
 import pandas as pd
 import logging
 
@@ -61,7 +63,7 @@ class TimbrA2aClient(DataSourceClient):
 
     def _get_session(self) -> requests.Session:
         if self._session is None:
-            self._session = requests.Session()
+            self._session = pinned_session()
             self._session.headers.update({
                 "x-api-key": self.api_key,
                 "Content-Type": "application/json",
@@ -174,7 +176,8 @@ class TimbrA2aClient(DataSourceClient):
     # Schema discovery
     # ------------------------------------------------------------------
 
-    def get_schemas(self) -> List[Table]:
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
         return self.get_tables()
 
     def get_tables(self) -> List[Table]:

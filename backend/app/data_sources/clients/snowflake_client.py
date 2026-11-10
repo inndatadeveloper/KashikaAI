@@ -1,11 +1,17 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 from app.data_sources.fk_reflection import attach_foreign_keys
 from app.data_sources.query_cancellation import track
+from app.data_sources.query_tag import (
+    SOURCE_QUERY_ID_ATTR,
+    current_query_tag,
+    render_query_tag,
+)
 
 import pandas as pd
 import sqlalchemy
 from sqlalchemy import text
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Dict, Generator, List, Optional
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
@@ -13,8 +19,27 @@ from functools import cached_property
 from snowflake.sqlalchemy import URL
 import base64
 import json
+import logging
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
+
+logger = logging.getLogger(__name__)
+
+# Per pooled DBAPI connection (`Connection.info` survives check-in/out):
+# the QUERY_TAG this session currently has, and the id of the last statement.
+_TAG_INFO_KEY = "bow_query_tag"
+_LAST_QUERY_ID_KEY = "bow_last_query_id"
+
+
+def _remember_query_id(conn, cursor, statement, parameters, context, executemany):
+    """SQLAlchemy `after_cursor_execute` hook: keep Snowflake's query id.
+
+    The id is on the driver cursor (`sfqid`), which pandas owns and discards,
+    so it is captured here, without an extra round trip.
+    """
+    qid = getattr(cursor, "sfqid", None)
+    if qid:
+        conn.info[_LAST_QUERY_ID_KEY] = str(qid)
 
 
 class SnowflakeClient(DataSourceClient):
@@ -40,8 +65,15 @@ class SnowflakeClient(DataSourceClient):
         private_key_passphrase: Optional[str] = None,
         role: Optional[str] = None,
         access_token: Optional[str] = None,
+        query_tag_enabled: bool = True,
+        query_tag_label: Optional[str] = None,
     ):
         self.account = account
+        # Tag every session with a JSON QUERY_TAG naming the BOW report, run
+        # and user behind its queries (see app/data_sources/query_tag.py).
+        # Off for customers whose own QUERY_TAG scheme must not be replaced.
+        self.query_tag_enabled = query_tag_enabled is not False
+        self.query_tag_label = query_tag_label
         self.user = user
         self.password = password
         self.private_key_pem = private_key_pem
@@ -96,10 +128,10 @@ class SnowflakeClient(DataSourceClient):
             connect_args["authenticator"] = "oauth"
             # The token goes through connect_args rather than the URL: JWTs are
             # long and URL() would embed the secret in the engine's repr/logs.
-            return sqlalchemy.create_engine(
+            return self._instrument(sqlalchemy.create_engine(
                 URL(**connect_args),
                 connect_args={"token": self.access_token},
-            )
+            ))
 
         connect_args["user"] = self.user
 
@@ -129,8 +161,70 @@ class SnowflakeClient(DataSourceClient):
             # Fallback to password-based auth
             connect_args["password"] = self.password
 
-        engine = sqlalchemy.create_engine(URL(**connect_args))
+        return self._instrument(sqlalchemy.create_engine(URL(**connect_args)))
+
+    def _instrument(self, engine):
+        # Best effort: losing these hooks costs the query id and the tag on a
+        # new session's first statements (checkout still tags it), never the
+        # connection itself.
+        try:
+            sqlalchemy.event.listen(engine, "after_cursor_execute", _remember_query_id)
+            sqlalchemy.event.listen(engine, "do_connect", self._tag_new_session)
+        except Exception as e:
+            logger.warning("Snowflake query tagging hooks not installed: %s", e)
         return engine
+
+    def _tag_new_session(self, dialect, conn_rec, cargs, cparams) -> None:
+        """SQLAlchemy `do_connect` hook: open new sessions already tagged.
+
+        A fresh session runs the dialect's own setup statements before any
+        checkout code sees it, so an ALTER issued at checkout would leave
+        those untagged. Passing QUERY_TAG as a connect-time session parameter
+        (snowflake.connector's `session_parameters`) tags them too.
+        """
+        if not self.query_tag_enabled:
+            return
+        tag = self._query_tag()
+        params = dict(cparams.get("session_parameters") or {})
+        params["QUERY_TAG"] = tag
+        cparams["session_parameters"] = params
+        # Same dict as Connection.info on every later checkout.
+        conn_rec.info[_TAG_INFO_KEY] = tag
+
+    def _query_tag(self) -> str:
+        """The QUERY_TAG for a statement issued now, from this thread's scope."""
+        return render_query_tag(current_query_tag(
+            connection_id=getattr(self, "_bow_connection_id", None),
+            data_source_id=getattr(self, "_bow_data_source_id", None),
+            label=self.query_tag_label,
+        ))
+
+    def _apply_query_tag(self, conn) -> None:
+        """Give this checkout's session the current tag.
+
+        Runs on every checkout, not once per connection: the pool hands the
+        same session to the next caller, and a tag left over from the previous
+        one would attribute its queries to the wrong report. The ALTER is only
+        sent when the tag changed, so a run's queries pay for it once per
+        pooled session. Best effort: a failed ALTER never blocks the query.
+        """
+        if not self.query_tag_enabled:
+            return
+        tag = self._query_tag()
+        if conn.info.get(_TAG_INFO_KEY) == tag:
+            return
+        try:
+            # Tag values are restricted to [A-Za-z0-9 _.:/@-] (query_tag._clean),
+            # so the JSON holds no quote or backslash; escape anyway.
+            literal = tag.replace("\\", "\\\\").replace("'", "''")
+            conn.exec_driver_sql(f"ALTER SESSION SET QUERY_TAG = '{literal}'")
+            conn.info[_TAG_INFO_KEY] = tag
+        except Exception as e:
+            conn.info.pop(_TAG_INFO_KEY, None)
+            logger.warning("Could not set Snowflake QUERY_TAG: %s", e)
+            # Leave the connection clean for the query that follows.
+            with suppress(Exception):
+                conn.rollback()
 
     @contextmanager
     def connect(self) -> Generator[sqlalchemy.engine.base.Connection, None, None]:
@@ -139,6 +233,8 @@ class SnowflakeClient(DataSourceClient):
         try:
             engine = self.snowflake_engine
             conn = engine.connect()
+        except IndexingCancelled:
+            raise
         except Exception as e:
             if conn is not None:
                 conn.close()
@@ -150,6 +246,7 @@ class SnowflakeClient(DataSourceClient):
         # indistinguishable from a connection failure. The except clause is
         # meant to wrap connect-time errors, and now only does.
         try:
+            self._apply_query_tag(conn)
             with track(self, conn):
                 yield conn
         finally:
@@ -162,8 +259,21 @@ class SnowflakeClient(DataSourceClient):
         """Run SQL statement."""
         try:
             with self.connect() as conn:
-                # Wrap SQL query with text() to handle complex SQL
-                df = pd.read_sql(text(sql), conn)
+                conn.info.pop(_LAST_QUERY_ID_KEY, None)
+                try:
+                    # Wrap SQL query with text() to handle complex SQL
+                    df = pd.read_sql(text(sql), conn)
+                except Exception as e:
+                    # A failed statement has a Snowflake query id too, and it
+                    # is the one an admin needs to look the failure up.
+                    qid = getattr(getattr(e, "orig", None), "sfqid", None) or conn.info.get(_LAST_QUERY_ID_KEY)
+                    if qid:
+                        with suppress(Exception):
+                            setattr(e, SOURCE_QUERY_ID_ATTR, str(qid))
+                    raise
+                qid = conn.info.pop(_LAST_QUERY_ID_KEY, None)
+            if qid:
+                df.attrs[SOURCE_QUERY_ID_ATTR] = qid
             return df
         except Exception as e:
             print(f"Error executing SQL: {e}")
@@ -173,6 +283,8 @@ class SnowflakeClient(DataSourceClient):
         """Get tables with graceful fallback if enriched query fails, plus semantic views."""
         try:
             tables = self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             # Fallback to basic query without comments
             tables = self._get_tables_basic()
@@ -180,7 +292,10 @@ class SnowflakeClient(DataSourceClient):
         # Append semantic views (failures here should not affect regular tables)
         try:
             tables.extend(self._get_semantic_views())
+        except IndexingCancelled:
+            raise
         except Exception:
+            self.mark_discovery_incomplete("snowflake catalog")
             pass
 
         return tables
@@ -244,6 +359,7 @@ class SnowflakeClient(DataSourceClient):
 
     def _get_semantic_views(self) -> List[Table]:
         """Discover Snowflake semantic views and their columns/measures/dimensions."""
+        discovery_phase('reading_semantic_views')
         tables = []
         schemas = self._schemas if self._schemas else ([self._primary_schema] if self._primary_schema else [])
 
@@ -256,7 +372,10 @@ class SnowflakeClient(DataSourceClient):
                     sv_results = conn.execute(
                         text(f"SHOW SEMANTIC VIEWS IN DATABASE {self.database}")
                     ).fetchall()
+                except IndexingCancelled:
+                    raise
                 except Exception:
+                    self.mark_discovery_incomplete("snowflake catalog")
                     return tables
             else:
                 for schema in schemas:
@@ -265,10 +384,13 @@ class SnowflakeClient(DataSourceClient):
                             text(f"SHOW SEMANTIC VIEWS IN SCHEMA {self.database}.{schema}")
                         ).fetchall()
                         sv_results.extend(rows)
+                    except IndexingCancelled:
+                        raise
                     except Exception:
+                        self.mark_discovery_incomplete("snowflake catalog")
                         continue
 
-            for sv_row in sv_results:
+            for sv_row in discovery_items(sv_results, 'semantic_views', label=lambda row: str(row[0])):
                 view_name = sv_row[1]  # name
                 sv_schema = sv_row[3]  # schema_name
                 fqn = f"{sv_schema}.{view_name}"
@@ -351,6 +473,8 @@ class SnowflakeClient(DataSourceClient):
                             description=props.get("COMMENT"),
                             metadata=col_metadata,
                         ))
+                except IndexingCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -375,6 +499,7 @@ class SnowflakeClient(DataSourceClient):
 
     def _get_tables_enriched(self) -> List[Table]:
         """Get tables with column/table comments. May fail on older Snowflake versions."""
+        discovery_phase('reading_columns')
         tables = {}
         with self.connect() as conn:
             params = {}
@@ -408,7 +533,7 @@ class SnowflakeClient(DataSourceClient):
 
             results = conn.execute(sql, params).fetchall()
 
-            for row in results:
+            for row in discovery_items(results, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                 table_schema, table_name, column_name, data_type, col_comment, tbl_comment = row
                 key = (table_schema, table_name)
                 fqn = f"{table_schema}.{table_name}"
@@ -433,6 +558,7 @@ class SnowflakeClient(DataSourceClient):
 
     def _get_tables_basic(self) -> List[Table]:
         """Get tables without comments (original query - always works)."""
+        discovery_phase('metadata_fallback')
         tables = {}
         with self.connect() as conn:
             params = {}
@@ -458,7 +584,7 @@ class SnowflakeClient(DataSourceClient):
 
             results = conn.execute(sql, params).fetchall()
 
-            for row in results:
+            for row in discovery_items(results, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                 table_schema, table_name, column_name, data_type = row
                 key = (table_schema, table_name)
                 fqn = f"{table_schema}.{table_name}"
@@ -502,7 +628,8 @@ class SnowflakeClient(DataSourceClient):
 
             return Table(name=f"{schema}.{table}", columns=columns, pks=None, fks=None, metadata_json={"schema": schema})
 
-    def get_schemas(self):
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
         tables = self.get_tables()
         return tables
 

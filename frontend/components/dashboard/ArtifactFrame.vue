@@ -1,8 +1,10 @@
 <template>
   <div class="h-full w-full flex flex-col bg-white dark:bg-gray-900">
     <!-- Header / Toolbar -->
-    <div class="flex-shrink-0 flex items-center justify-between px-4 py-2 bg-gradient-to-b from-cyan-50/50 dark:from-cyan-900/10 to-white dark:to-gray-900 border-b border-gray-200 dark:border-gray-700/60">
-      <div class="flex items-center gap-3">
+    <!-- Wraps rather than clips: with presence, Publish and Share the
+         right-hand group can outgrow a narrow pane. -->
+    <div v-if="!verificationPreview" class="flex-shrink-0 flex flex-wrap items-center justify-between gap-x-2 gap-y-2 px-4 py-2 bg-gradient-to-b from-cyan-50/50 dark:from-cyan-900/10 to-white dark:to-gray-900 border-b border-gray-200 dark:border-gray-700/60">
+      <div class="flex items-center gap-3 min-w-0 grow basis-52">
         <UTooltip :text="$t('artifactFrame.backToChat')">
           <button @click="$emit('close')" class="hover:bg-gray-100 dark:hover:bg-gray-700 p-1 rounded">
             <Icon name="heroicons:x-mark" class="w-4 h-4 text-gray-500 dark:text-gray-400" />
@@ -10,7 +12,7 @@
         </UTooltip>
 
         <!-- Artifact Selector Dropdown -->
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 min-w-0 flex-1">
           <!-- Rename (owner only): the selector becomes an input in place so
                the toolbar keeps its width. Enter saves, Escape cancels. -->
           <form
@@ -18,14 +20,14 @@
             class="flex items-center gap-1"
             @submit.prevent="saveRename"
           >
-            <UInput
+            <UInput v-text-dir
               ref="renameInputRef"
               v-model="renameDraft"
               size="xs"
               class="min-w-[280px]"
               :maxlength="255"
               :disabled="isSavingRename"
-              :placeholder="$t('artifactFrame.renamePlaceholder')"
+              :placeholder="tm('artifactFrame.renamePlaceholder', selectedArtifact?.mode)"
               @keydown.escape.prevent="cancelRename"
             />
             <UTooltip :text="$t('common.save')">
@@ -49,47 +51,59 @@
               </button>
             </UTooltip>
           </form>
+          <!-- One control: "<dashboard> · v3". Its menu lists the versions,
+               grouped under each dashboard when this conversation holds more
+               than one; Live marks what viewers see. Whether the open version
+               is live is said once, by the Publish button. -->
           <USelectMenu
             v-else-if="artifactsList.length > 0"
-            v-model="selectedArtifactId"
-            :options="artifactOptions"
+            :model-value="pickerValue"
+            :options="pickerOptions"
             value-attribute="value"
             option-attribute="label"
             size="xs"
-            class="min-w-[280px]"
-            :placeholder="$t('artifactFrame.selectArtifact')"
-            :ui="{ option: { base: 'py-2' } }"
+            class="max-w-[320px] min-w-0"
+            data-testid="frame-version-picker"
+            @update:model-value="onPick"
+            :popper="{ placement: 'bottom-start' }"
+            :ui-menu="{ width: 'w-80', container: 'z-50 group' }"
+            :ui="{ option: { base: 'py-1.5' } }"
           >
             <template #label>
-              <span class="truncate text-xs">{{ selectedArtifactLabel }}</span>
+              <span class="flex items-center gap-1.5 min-w-0 text-xs">
+                <Icon :name="modeIcon(selectedArtifactItem?.mode)" class="w-3.5 h-3.5 flex-shrink-0 text-ink-muted" />
+                <span v-text-dir class="truncate">{{ selectedDashboardTitle }}</span>
+                <span class="text-ink-muted shrink-0">·</span>
+                <Icon v-if="viewing" name="heroicons:eye" class="w-3.5 h-3.5 shrink-0 text-blue-500" />
+                <span class="font-medium tabular-nums shrink-0">v{{ viewing ? viewing.version : selectedArtifactItem?.version }}</span>
+              </span>
             </template>
             <template #option="{ option }">
-              <div class="flex flex-col gap-0.5 w-full">
-                <div class="flex items-center justify-between">
-                  <span class="flex items-center gap-1 min-w-0 text-xs font-medium text-gray-900 dark:text-white truncate">
-                    <Icon
-                      :name="option.artifact.mode === 'doc' ? 'heroicons:document-text' : (option.artifact.mode === 'slides' ? 'heroicons:presentation-chart-bar' : 'heroicons:squares-2x2')"
-                      class="w-3 h-3 flex-shrink-0 text-gray-400"
-                    />
-                    <span class="truncate">{{ option.artifact.title || 'Untitled' }}</span>
-                  </span>
-                  <span class="text-[10px] text-gray-400 ms-2">v{{ option.artifact.version }}</span>
+              <!-- A dashboard's heading (only with several dashboards) -->
+              <div v-if="option.header" class="w-full min-w-0 pt-1" data-testid="frame-dashboard-heading">
+                <div class="flex items-center gap-1.5 text-xs font-medium text-gray-900 dark:text-white min-w-0">
+                  <Icon :name="modeIcon(option.mode)" class="w-3.5 h-3.5 flex-shrink-0 text-ink-muted" />
+                  <span v-text-dir class="truncate">{{ option.title }}</span>
                 </div>
-                <div class="flex items-center justify-between text-[10px] text-gray-400">
-                  <span>{{ formatRelativeTime(option.artifact.created_at) }}</span>
-                  <button
-                    @click.stop="copyArtifactId(option.artifact.id)"
-                    class="hover:text-gray-600 flex items-center gap-0.5 font-mono"
-                    title="Click to copy ID"
-                  >
-                    <Icon name="heroicons:clipboard-document" class="w-3 h-3" />
-                    {{ option.artifact.id.slice(0, 8) }}
-                  </button>
-                </div>
+                <div class="text-2xs text-ink-muted ps-5">{{ $t('dashboardCollab.versions.createdOn', { when: formatRelativeTime(option.created_at) }) }}</div>
+              </div>
+              <div v-else-if="option.allVersions" class="flex items-center gap-1.5 w-full text-xs text-blue-600 dark:text-blue-400" data-testid="frame-version-all">
+                <Icon name="heroicons:clock" class="w-3.5 h-3.5" />{{ $t('dashboardCollab.versions.allVersions') }}
+              </div>
+              <div v-else class="flex flex-col w-full min-w-0" :class="option.grouped ? 'ps-5' : ''"
+                :data-testid="option.elsewhere ? 'frame-version-elsewhere' : 'frame-version-row'">
+                <span class="flex items-center gap-1.5 text-xs min-w-0">
+                  <span class="font-medium tabular-nums">v{{ option.version }}</span>
+                  <span v-text-dir v-if="option.name" class="truncate text-gray-700 dark:text-gray-300">“{{ option.name }}”</span>
+                  <span v-if="option.live" class="px-1.5 rounded bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300 text-2xs font-medium">{{ $t('dashboardCollab.versions.live') }}</span>
+                </span>
+                <span class="text-2xs text-ink-muted">
+                  <template v-if="option.elsewhere">{{ $t('dashboardCollab.versions.elsewhereBy', { name: option.author || $t('dashboardCollab.history.someone') }) }} · </template>{{ formatRelativeTime(option.created_at) }}
+                </span>
               </div>
             </template>
           </USelectMenu>
-          <span v-else class="text-xs text-gray-400 italic">No artifacts yet</span>
+          <span v-else class="text-xs text-ink-muted italic">No artifacts yet</span>
 
           <!-- A run elsewhere created a new artifact: offer it, never hijack -->
           <button
@@ -101,22 +115,11 @@
             New artifact — view
           </button>
 
-          <!-- Use this version button (shown when non-latest is selected) -->
-          <button
-            v-if="!isLatestSelected && artifactsList.length > 1"
-            @click="useThisVersion"
-            :disabled="isDuplicating"
-            class="text-xs px-2 py-1 bg-blue-50 dark:bg-blue-950 text-blue-600 hover:bg-blue-100 rounded border border-blue-200 transition-colors disabled:opacity-50 flex items-center gap-1"
-          >
-            <Spinner v-if="isDuplicating" class="w-3 h-3" />
-            <Icon v-else name="heroicons:arrow-uturn-up" class="w-3 h-3" />
-            {{ $t('artifactFrame.useThisVersion') }}
-          </button>
         </div>
       </div>
 
-      <div class="flex items-center gap-2">
-        <span v-if="isLoading" class="text-xs text-gray-400">{{ t('artifactFrame.loading') }}</span>
+      <div class="flex flex-wrap items-center justify-end gap-2 ms-auto shrink-0 max-w-full">
+        <span v-if="isLoading" class="text-xs text-ink-muted">{{ t('artifactFrame.loading') }}</span>
 
         <!-- Refresh Dashboard (rerun + refresh). Everyday action, so it stays
              a visible button.
@@ -124,7 +127,7 @@
              endpoint takes run_as_user_id, so the rerun would resolve
              identity params as YOU and replace what is on screen while the
              banner still says "Viewing as X". -->
-        <UTooltip :text="isViewAsActive ? $t('artifactFrame.refreshDisabledViewAs') : $t('artifactFrame.refreshData')">
+        <UTooltip v-if="!viewing" :text="isViewAsActive ? $t('artifactFrame.refreshDisabledViewAs') : $t('artifactFrame.refreshData')">
           <button
             @click="refreshDashboard"
             :disabled="isRefreshing || isViewAsActive"
@@ -135,17 +138,20 @@
           </button>
         </UTooltip>
 
-        <!-- Data (query manager) and Schedule stay visible next to Refresh:
-             the three things a dashboard owner touches routinely. Each
-             component renders its own trigger and keeps its modal mounted. -->
-        <DataModal
-          v-if="report"
-          :report-id="reportId"
-          :artifact-id="selectedArtifact?.id"
-          :artifact-viz-ids="selectedArtifact?.content?.visualization_ids || []"
-          :artifact-mode="selectedArtifact?.mode"
-        />
-        <CronModal v-if="report" :report="report" compact />
+        <!-- Settings stay visible next to Refresh: one window with a tab
+             each for the schedule, what viewers get, the link, the queries
+             behind it (Data), its resources and its analytics. Who has
+             access is Share's. -->
+        <DashboardSettingsModal v-if="report && selectedArtifact?.artifact_id" ref="settingsModalRef" :report-id="reportId"
+          :dashboard-id="selectedArtifact.artifact_id"
+          :artifact-id="selectedArtifact.id"
+          :artifact-viz-ids="selectedArtifact.content?.visualization_ids || []"
+          :artifact-mode="selectedArtifact.mode"
+          :title="currentArtifactTitle()"
+          :rename="canRename ? renameTo : undefined"
+          :resources-available="resourcesAvailable && !verificationPreview"
+          :show-analytics="(isReportOwner || dashboardCaps.includes('analytics')) && !verificationPreview"
+          @history-changed="onHistoryChanged" />
 
         <!-- Everything used less than daily lives behind one ⋯ with labelled
              rows: rename, every export (download), full screen, new tab.
@@ -154,7 +160,7 @@
           v-if="moreMenuItems.length"
           :items="moreMenuItems"
           :popper="{ placement: 'bottom-end' }"
-          :ui="{ width: 'w-auto min-w-[11rem]', item: { padding: 'px-2 py-1.5' } }"
+          :ui="{ width: 'w-auto min-w-[11rem]', item: { padding: 'px-2 py-1.5' }, container: 'z-50 group' }"
         >
           <UTooltip :text="$t('artifactFrame.more')">
             <button
@@ -167,8 +173,8 @@
             </button>
           </UTooltip>
           <template #item="{ item }">
-            <div class="flex items-center gap-2 text-start w-full">
-              <UIcon :name="item.icon" class="w-4 h-4 shrink-0 text-gray-400 dark:text-gray-500" />
+            <div class="flex items-center gap-2 text-start w-full" :data-testid="item.testid">
+              <UIcon :name="item.icon" class="w-4 h-4 shrink-0 text-ink-muted" />
               <span class="text-xs font-medium text-gray-900 dark:text-white">{{ item.label }}</span>
             </div>
           </template>
@@ -178,7 +184,7 @@
              viewer — anonymous or any org member, searchable by name/email.
              Identity-only — data is unaffected. -->
         <USelectMenu
-          v-if="canViewAs"
+          v-if="canViewAs && !viewing"
           v-model="viewAsMode"
           :options="viewAsOptions"
           value-attribute="value"
@@ -188,6 +194,7 @@
           :searchable-placeholder="$t('artifactFrame.searchMembers')"
           size="xs"
           class="min-w-[130px]"
+          :ui-menu="{ container: 'z-50 group' }"
         >
           <template #label>
             <span class="flex items-center gap-1 text-xs" :class="viewAsMode !== 'you' ? 'text-indigo-600 font-medium' : ''">
@@ -198,26 +205,88 @@
           <template #option="{ option }">
             <div class="flex flex-col">
               <span class="text-xs">{{ option.label }}</span>
-              <span v-if="option.email" class="text-[10px] text-gray-400">{{ option.email }}</span>
+              <span v-if="option.email" class="text-2xs text-ink-muted">{{ option.email }}</span>
             </div>
           </template>
         </USelectMenu>
         <!-- Delegated-source caveat, visible before a target is even picked -->
         <UTooltip
-          v-if="canViewAs && credentialScoped"
+          v-if="canViewAs && credentialScoped && !viewing"
           :text="$t('artifactFrame.viewAsTooltip')"
           :popper="{ placement: 'bottom' }"
         >
           <Icon name="heroicons:information-circle" class="w-3.5 h-3.5 text-amber-500" />
         </UTooltip>
 
+        <!-- Who else is editing this dashboard right now (collab01) -->
+        <div v-if="presenceOthers.length" data-testid="frame-presence">
+          <PresenceAvatars :others="presenceOthers" />
+        </div>
+
         <!-- Share Dashboard -->
-        <ShareModal v-if="report" :report="report" share-type="artifact" title="Share Dashboard" />
+        <ShareModal v-if="report && selectedArtifact?.artifact_id" :report="report" share-type="artifact" :title="tm('share.shareDashboard', selectedArtifact?.mode)"
+          :artifact-mode="selectedArtifact.mode"
+          :item-name="selectedArtifact.title" :dashboard-id="selectedArtifact.artifact_id" />
+
+        <!-- Publish (the version open here), last: the toolbar's main action.
+             "Review changes" (someone published since) opens the draft page's
+             changes view. -->
+        <PublishButton v-if="report && selectedArtifact && !viewing" :key="publishKey" :artifact="selectedArtifact" @review="reviewChanges"
+          @status="publishStatus = $event" @open-version="openVersionById" />
       </div>
     </div>
 
+    <!-- Live moved on past this conversation's own unpublished work: offer
+         to look at it (nothing is copied until "Edit here"). -->
+    <div v-if="liveAhead && !verificationPreview" class="flex-shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-2 text-xs bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-900 text-amber-900 dark:text-amber-200"
+      data-testid="frame-live-ahead">
+      <UIcon name="i-heroicons-arrow-path-rounded-square" class="w-4 h-4 shrink-0" />
+      <span class="flex-1 min-w-0">{{ $t('dashboardCollab.versions.liveAhead', { name: liveAhead.live.by?.name || $t('dashboardCollab.history.someone'), live: liveAhead.live.version, here: liveAhead.newest_here?.version }) }}</span>
+      <button type="button" class="font-medium underline underline-offset-2" data-testid="frame-live-ahead-view" @click="viewLiveAhead">
+        {{ $t('dashboardCollab.versions.viewLive', { n: liveAhead.live.version }) }}
+      </button>
+      <button type="button" class="text-amber-700 dark:text-amber-300 hover:underline" data-testid="frame-live-ahead-keep" @click="keepWorkingHere">
+        {{ $t('dashboardCollab.versions.keepWorking', { n: liveAhead.newest_here?.version }) }}
+      </button>
+    </div>
+
+    <!-- Viewing a version made in another conversation (or live, when it
+         moved on): shown read-only, nothing copied. "Edit here" copies it in
+         (its charts run again as you) and the next edit builds on it. -->
+    <div v-if="viewing && !verificationPreview" class="flex-shrink-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-2 text-xs bg-blue-50 dark:bg-blue-950/40 border-b border-blue-200 dark:border-blue-900 text-blue-900 dark:text-blue-200"
+      data-testid="frame-viewing-bar">
+      <UIcon name="i-heroicons-eye" class="w-4 h-4 shrink-0" />
+      <span class="flex-1 min-w-0">
+        {{ viewing.live
+          ? $t('dashboardCollab.versions.viewingLiveBar', { n: viewing.version, here: selectedArtifactItem?.version })
+          : $t('dashboardCollab.versions.viewingBar', { n: viewing.version, name: viewing.author || $t('dashboardCollab.history.someone'), here: selectedArtifactItem?.version }) }}
+      </span>
+      <button type="button" class="inline-flex items-center gap-1 font-medium underline underline-offset-2 disabled:opacity-50" :disabled="bringing" data-testid="frame-viewing-edit" @click="editViewing">
+        <Spinner v-if="bringing" class="w-3 h-3" />
+        {{ $t('dashboardCollab.versions.editHere', { n: viewing.version }) }}
+      </button>
+      <button v-if="selectedArtifactItem" type="button" class="text-blue-700 dark:text-blue-300 hover:underline" data-testid="frame-viewing-back" @click="viewing = null">
+        {{ $t('dashboardCollab.versions.backTo', { n: selectedArtifactItem.version }) }}
+      </button>
+    </div>
+
     <!-- Iframe Container -->
-    <div class="flex-1 min-h-0 relative bg-white dark:bg-gray-900">
+    <div ref="polishContainerRef" class="flex-1 min-h-0 relative bg-white dark:bg-gray-900">
+      <!-- The version being viewed, as its preview page draws it. -->
+      <iframe v-if="viewingSrc" :key="viewingSrc" :src="viewingSrc" :title="$t('dashboardCollab.history.preview')"
+        class="absolute inset-0 z-[35] w-full h-full border-0 bg-white dark:bg-gray-900" data-testid="frame-viewing" />
+      <!-- This conversation's agent is changing a dashboard others edit too
+           (collab01): outline it, as Figma does, with whose agent it is. -->
+      <div
+        v-if="showAgentOutline"
+        class="absolute inset-0 z-[25] pointer-events-none rounded-sm ring-2 ring-inset ring-violet-500/80 dark:ring-violet-400/80"
+        data-testid="agent-editing-outline"
+      >
+        <span class="absolute top-0 end-0 flex items-center gap-1 rounded-es-md bg-violet-600 text-white ps-2 pe-2.5 py-0.5 text-2xs font-medium shadow-sm">
+          <Icon name="heroicons:sparkles" class="w-3 h-3" />
+          {{ $t('dashboardCollab.presence.agentEditing', { name: agentOwnerFirstName }) }}
+        </span>
+      </div>
       <!-- View-as switch in flight: cover the pane with a spinner until the
            new identity (and any identity-scoped re-runs) fully settle, so the
            transient anonymous fallback never flashes as the final render. -->
@@ -256,48 +325,102 @@
              (e.g. Power BI) still run as YOU — their rows may differ. -->
         <div
           v-if="credentialScoped"
-          class="flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-200 shadow text-[11px]"
+          class="flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-50 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-200 shadow text-2xs"
         >
           <Icon name="heroicons:exclamation-triangle" class="w-3.5 h-3.5 shrink-0" />
           <span>Identity parameters only — sources that authenticate per user still run with your credentials, so this user's actual rows may differ.</span>
         </div>
       </div>
+      <!-- Some charts withheld from this viewer: the dashboard still renders
+           the ones they can read; say which are missing and why. -->
+      <div
+        v-if="partiallyWithheld && !isLoading"
+        class="absolute top-2 left-1/2 -translate-x-1/2 z-20 max-w-[90%] flex items-start gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-200 shadow text-2xs"
+      >
+        <Icon name="heroicons:lock-closed" class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+        <div>
+          <div v-if="withheldCharts.some(c => c.noAccess)">
+            {{ $t('artifactFrame.partialNoAccess', { charts: withheldCharts.filter(c => c.noAccess).map(c => c.title).join(', ') }) }}
+          </div>
+          <div v-if="withheldCharts.some(c => !c.noAccess)">
+            {{ $t('artifactFrame.partialFailed', { charts: withheldCharts.filter(c => !c.noAccess).map(c => c.title).join(', ') }) }}
+          </div>
+        </div>
+      </div>
+
+      <!-- Brought in from elsewhere (bring / Edit here / fork): the copied
+           queries are running again as this user and have no rows yet. Cover
+           the dashboard until they finish instead of letting it render empty. -->
+      <div
+        v-if="hydration && !isLoading && hasArtifact && !isPendingArtifact && !showViewerGate"
+        data-testid="artifact-hydration"
+        class="absolute inset-0 z-30 flex items-center justify-center overflow-y-auto py-8 px-4 bg-white/95 dark:bg-gray-900/95"
+      >
+        <div v-if="hydration.phase === 'running'" class="flex flex-col items-center gap-3 text-center max-w-sm">
+          <Spinner class="w-6 h-6 text-gray-400" />
+          <div class="text-sm text-gray-700 dark:text-gray-200">{{ t('artifactFrame.hydrating.title') }}</div>
+          <div class="text-xs text-gray-500 dark:text-gray-400">
+            {{ t('artifactFrame.hydrating.progress', { done: hydration.done, total: hydration.total }) }}
+          </div>
+          <div class="w-48 h-1.5 rounded-full bg-gray-100 dark:bg-gray-800 overflow-hidden">
+            <div class="h-full bg-blue-500 transition-all" :style="{ width: `${hydration.total ? Math.round(100 * hydration.done / hydration.total) : 0}%` }" />
+          </div>
+        </div>
+        <div v-else-if="hydration.phase === 'timeout'" class="flex flex-col items-center gap-3 text-center max-w-sm">
+          <Icon name="heroicons:clock" class="w-6 h-6 text-amber-500" />
+          <div class="text-sm text-gray-700 dark:text-gray-200">{{ t('artifactFrame.hydrating.timeout') }}</div>
+          <div class="flex gap-2">
+            <UButton size="xs" color="gray" variant="soft" @click="reloadAfterHydration">{{ t('artifactFrame.hydrating.reload') }}</UButton>
+            <UButton size="xs" color="gray" variant="ghost" @click="dismissHydration">{{ t('artifactFrame.hydrating.showAnyway') }}</UButton>
+          </div>
+        </div>
+        <div v-else class="flex flex-col gap-3 w-full max-w-md">
+          <div class="flex items-start gap-2">
+            <Icon name="heroicons:exclamation-triangle" class="w-5 h-5 shrink-0 text-amber-500 mt-0.5" />
+            <div class="text-sm text-gray-800 dark:text-gray-100">
+              {{ t('artifactFrame.hydrating.failedTitle', { failed: hydration.failed.length, total: hydration.total }) }}
+            </div>
+          </div>
+          <ul class="flex flex-col gap-2">
+            <li v-for="f in hydration.failed" :key="f.queryId"
+              class="rounded-md border border-gray-200 dark:border-gray-700 px-3 py-2">
+              <div class="text-xs font-medium text-gray-800 dark:text-gray-100">{{ f.title || t('artifactFrame.dataUntitledQuery') }}</div>
+              <div class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 break-words whitespace-pre-line">
+                {{ f.noAccess ? t('artifactFrame.hydrating.noAccess') : (f.reason || t('artifactFrame.hydrating.noReason')) }}
+              </div>
+            </li>
+          </ul>
+          <div v-if="hydration.rerunError" class="text-[11px] text-red-600 dark:text-red-400 break-words">{{ hydration.rerunError }}</div>
+          <div class="flex gap-2">
+            <UButton size="xs" color="blue" :loading="hydration.rerunning" data-testid="hydration-run-again" @click="runFailedAgain">
+              {{ t('artifactFrame.hydrating.runAgain') }}
+            </UButton>
+            <UButton size="xs" color="gray" variant="ghost" @click="dismissHydration">{{ t('artifactFrame.hydrating.showAnyway') }}</UButton>
+          </div>
+        </div>
+      </div>
+
       <!-- Loading State -->
       <div v-if="isLoading" class="absolute inset-0 flex items-center justify-center bg-white dark:bg-gray-900">
         <div class="flex flex-col items-center gap-3">
-          <Spinner class="w-6 h-6 text-gray-400" />
-          <span class="text-sm text-gray-400">{{ t('artifactFrame.loading') }}</span>
+          <Spinner class="w-6 h-6 text-ink-muted" />
+          <span class="text-sm text-ink-muted">{{ t('artifactFrame.loading') }}</span>
         </div>
       </div>
 
       <!-- Empty State: Has visualizations but no artifact - show Generate Dashboard button -->
-      <div v-else-if="!hasArtifact && hasSuccessfulVisualizations" class="absolute inset-0 flex flex-col items-center justify-center bg-white dark:bg-gray-900">
-        <Icon name="heroicons:sparkles" class="w-8 h-8 text-gray-400 mb-3" />
-        <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Ready to create a dashboard</h3>
-        <p class="text-xs text-gray-400 mb-4 max-w-xs text-center">
-          You have {{ visualizationsData.length }} visualization{{ visualizationsData.length !== 1 ? 's' : '' }} ready
-        </p>
-        <UButton
-          @click="generateDashboardPrompt"
-          size="xs"
-          color="blue"
-        >
-          <Icon name="heroicons:bolt" class="w-4 h-4" />
-          Generate Dashboard
-        </UButton>
-      </div>
-
-      <!-- Empty State: No visualizations and no artifact -->
-      <div v-else-if="!hasArtifact && !hasVisualizations" class="absolute inset-0 flex flex-col items-center justify-center bg-white dark:bg-gray-900">
-        <Icon name="heroicons:chart-bar" class="w-6 h-6 text-gray-400 mb-2" />
-        <span class="text-sm text-gray-400">No dashboard items yet</span>
+      <!-- No dashboard here yet: make one (from this conversation's charts,
+           or by asking), or open one you may edit. -->
+      <div v-else-if="!hasArtifact" class="absolute inset-0 flex items-center justify-center overflow-y-auto py-8 bg-white dark:bg-gray-900">
+        <DashboardStart :chart-count="hasSuccessfulVisualizations ? visualizationsData.length : 0" :report-id="reportId"
+          @generate="generateDashboardPrompt" @brought="onBroughtFromStart" />
       </div>
 
       <!-- Pending Artifact State (generating) -->
       <div v-else-if="isPendingArtifact" class="absolute inset-0 flex items-center justify-center bg-white dark:bg-gray-900">
         <div class="flex flex-col items-center gap-3">
-          <Spinner class="w-6 h-6 text-gray-400" />
-          <span class="text-sm text-gray-400">
+          <Spinner class="w-6 h-6 text-ink-muted" />
+          <span class="text-sm text-ink-muted">
             {{ selectedArtifact?.mode === 'slides' ? 'Generating slides...' : 'Generating dashboard...' }}
           </span>
         </div>
@@ -311,7 +434,7 @@
            mode — withheld empty data must never reach the artifact code, nor
            surface as a code error with a Fix Error button. The backend never
            withholds from the report owner, so owners never see this. -->
-      <div v-else-if="snapshotWithheld" class="absolute inset-0 flex items-center justify-center bg-white dark:bg-gray-900">
+      <div v-else-if="showViewerGate" class="absolute inset-0 flex items-center justify-center bg-white dark:bg-gray-900">
         <ViewerRunGate :state="gateState" :report-id="reportId"
           :is-running="isViewerRunning" :source-errors="dataSourceErrors"
           :error-message="gateErrorMessage" :source-type="gateSourceType" @run="runAsViewer" />
@@ -327,16 +450,16 @@
       <!-- Slides without previews: content.code is python-pptx source, which
            the browser cannot render — never inject it into the iframe. -->
       <div v-else-if="slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center bg-white dark:bg-gray-900">
-        <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 text-gray-400 mb-3" />
+        <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 text-ink-muted mb-3" />
         <template v-if="selectedArtifact?.status === 'failed'">
           <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Slides generation failed</h3>
-          <p class="text-xs text-gray-400 mb-4 max-w-sm text-center">
+          <p class="text-xs text-ink-muted mb-4 max-w-sm text-center">
             The presentation could not be built. Ask the agent to regenerate the slides.
           </p>
         </template>
         <template v-else>
           <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Slide previews unavailable</h3>
-          <p class="text-xs text-gray-400 mb-4 max-w-sm text-center">
+          <p class="text-xs text-ink-muted mb-4 max-w-sm text-center">
             The deck was built, but preview images could not be generated on the server. You can still download the PowerPoint file.
           </p>
           <UButton @click="exportPptx" :disabled="isExporting" size="xs" color="purple" variant="soft">
@@ -372,10 +495,17 @@
       <div v-else-if="iframeError" class="absolute inset-0 flex flex-col items-center justify-center bg-white dark:bg-gray-900">
         <Icon name="heroicons:exclamation-triangle" class="w-8 h-8 text-red-400 mb-3" />
         <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Dashboard failed to render</h3>
-        <p class="text-xs text-gray-400 mb-3 max-w-md text-center font-mono bg-gray-50 dark:bg-gray-900 rounded p-2 border">
+        <!-- A viewer missing some charts' data: the likely cause is artifact
+             code that assumed those rows exist. They cannot fix it (it is not
+             their dashboard), so explain instead of offering Fix Error. -->
+        <p v-if="partiallyWithheld" class="text-xs text-gray-500 dark:text-gray-400 max-w-md text-center">
+          {{ tm('artifactFrame.partialRenderFailed', selectedArtifact?.mode) }}
+        </p>
+        <p v-else class="text-xs text-ink-muted mb-3 max-w-md text-center font-mono bg-gray-50 dark:bg-gray-900 rounded p-2 border">
           {{ iframeError.length > 200 ? iframeError.slice(0, 200) + '...' : iframeError }}
         </p>
         <UButton
+          v-if="!partiallyWithheld"
           @click="fixRenderError"
           size="xs"
           color="red"
@@ -388,10 +518,11 @@
 
       <!-- Iframe (shown when artifact exists and data is ready) -->
       <iframe
-        v-show="hasArtifact && !isLoading && !isPendingArtifact && !hasSlidesWithPreviews && !isDocMode && !snapshotWithheld && !iframeError && iframeSrcdoc"
+        v-show="hasArtifact && !isLoading && !isPendingArtifact && !hasSlidesWithPreviews && !isDocMode && !showViewerGate && !iframeError && iframeSrcdoc"
         ref="iframeRef"
+        data-artifact-frame
         :srcdoc="iframeSrcdoc"
-        sandbox="allow-scripts allow-same-origin allow-downloads"
+        sandbox="allow-scripts allow-downloads allow-forms"
         class="absolute inset-0 w-full h-full border-0 bg-white dark:bg-gray-900 z-0"
         @load="onIframeLoad"
       />
@@ -400,7 +531,7 @@
            slides render as page images through SlideViewer, so there is no
            iframe for the element picker to talk to) -->
       <div
-        v-if="hasArtifact && !isLoading && !isPendingArtifact && !snapshotWithheld && !iframeError && !isDocMode && !hasSlidesWithPreviews && !slidesPreviewsMissing"
+        v-if="!verificationPreview && hasArtifact && !isLoading && !isPendingArtifact && !snapshotWithheld && !iframeError && !isDocMode && !hasSlidesWithPreviews && !slidesPreviewsMissing"
         class="absolute bottom-4 left-4 z-20"
       >
         <button
@@ -420,38 +551,50 @@
       <!-- Polish Prompt Box -->
       <div
         v-if="polishPromptVisible"
+        ref="polishBoxRef"
         class="absolute z-30 w-80 bg-white dark:bg-gray-900 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-3"
         :style="polishPromptPosition"
       >
         <div class="flex items-center gap-2 mb-2">
           <Icon name="heroicons:paint-brush" class="w-3.5 h-3.5 text-indigo-500" />
           <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Polish this element</span>
-          <button @click="cancelPolishPrompt" class="ms-auto text-gray-400 hover:text-gray-600">
+          <button @click="cancelPolishPrompt" class="ms-auto text-ink-muted hover:text-gray-600">
             <Icon name="heroicons:x-mark" class="w-3.5 h-3.5" />
           </button>
         </div>
-        <div class="text-[10px] text-gray-400 mb-2 font-mono bg-gray-50 dark:bg-gray-900 rounded px-2 py-1 truncate">
+        <div class="text-2xs text-ink-muted mb-2 font-mono bg-gray-50 dark:bg-gray-900 rounded px-2 py-1 truncate">
           &lt;{{ polishSelectedElement?.tag?.toLowerCase() }}&gt; {{ polishSelectedElement?.text?.slice(0, 60) }}
         </div>
-        <form @submit.prevent="submitPolishPrompt" class="flex gap-2">
-          <input
+        <!-- Grows with the instruction up to ~6 lines, then scrolls, so a long
+             prompt stays readable. Enter applies; Shift+Enter breaks the line. -->
+        <form @submit.prevent="submitPolishPrompt" class="flex flex-col gap-2">
+          <textarea
             ref="polishInputRef"
             v-model="polishInstruction"
-            type="text"
+            rows="2"
+            dir="auto"
             placeholder="e.g. make this bigger, change colors..."
-            class="flex-1 text-sm border border-gray-200 dark:border-gray-700 rounded-md px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400"
+            class="block w-full resize-none max-h-36 overflow-y-auto text-sm border border-gray-200 dark:border-gray-700 rounded-md px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400"
+            @keydown.enter.exact="onPolishEnter"
             @keydown.escape="cancelPolishPrompt"
           />
           <button
             type="submit"
             :disabled="!polishInstruction.trim()"
-            class="px-3 py-1.5 bg-indigo-500 text-white text-sm rounded-md hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            class="self-end px-3 py-1.5 bg-indigo-600 text-white text-sm rounded-md hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             {{ $t('artifactFrame.apply') }}
           </button>
         </form>
       </div>
     </div>
+
+    <!-- Inspect: the app's activity (requests, streams, filters, clicks,
+         errors) docked under it, DevTools-style; opened from the ⋯ menu.
+         Editors only: it reads the log the agent reads. -->
+    <ArtifactActivityLog v-if="inspectOpen && report && selectedArtifact?.artifact_id && !verificationPreview" ref="activityLogRef"
+      :artifact-id="selectedArtifact.artifact_id" :report-id="reportId" :version="selectedArtifact?.version ?? null"
+      @close="inspectOpen = false" />
 
     <!-- Fullscreen Modal -->
     <Teleport to="body">
@@ -460,8 +603,8 @@
           <!-- Modal Header -->
           <div class="p-3 flex justify-between items-center border-b bg-white dark:bg-gray-900">
             <div class="flex items-center gap-3">
-              <span class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ selectedArtifact?.title || reportData?.title || 'Artifact' }}</span>
-              <span v-if="selectedArtifact" class="text-xs text-gray-400">v{{ selectedArtifact.version }}</span>
+              <span v-text-dir class="text-sm font-medium text-gray-700 dark:text-gray-300">{{ selectedArtifact?.title || reportData?.title || 'Artifact' }}</span>
+              <span v-if="selectedArtifact" class="text-xs text-ink-muted">v{{ selectedArtifact.version }}</span>
             </div>
             <UButton color="gray" variant="ghost" icon="i-heroicons-x-mark-20-solid" @click="closeFullscreen" />
           </div>
@@ -482,15 +625,16 @@
               class="absolute inset-0"
             />
             <!-- Slides without previews have no renderable content -->
-            <div v-else-if="isFullscreenOpen && slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center text-gray-400">
+            <div v-else-if="isFullscreenOpen && slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center text-ink-muted">
               <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 mb-2" />
               <span class="text-sm">Slide previews unavailable</span>
             </div>
             <!-- Other artifacts use iframe -->
             <iframe
+              ref="fullscreenRuntimeFrame"
               v-else-if="isFullscreenOpen && iframeSrcdoc"
               :srcdoc="iframeSrcdoc"
-              sandbox="allow-scripts allow-same-origin allow-downloads"
+              sandbox="allow-scripts allow-downloads allow-forms"
               class="absolute inset-0 w-full h-full border-0"
             />
           </div>
@@ -502,19 +646,35 @@
 
 <script setup lang="ts">
 import type { ExportFormat } from '~/composables/useArtifactExports'
-import { ref, computed, onMounted, onUnmounted, watch, toRaw, nextTick } from 'vue';
-import { useMyFetch } from '~/composables/useMyFetch';
-import CronModal from '../CronModal.vue';
-import DataModal from './DataModal.vue';
+import type { ActivityEvent } from '~/composables/useArtifactRuntime'
+import { ref, computed, onMounted, onUnmounted, onBeforeUnmount, watch, toRaw, nextTick, provide } from 'vue';
+import { CHAT_VIZ_TEXT_PX } from '~/utils/chatVizText'
+import { useMyFetch as useApplicationFetch } from '~/composables/useMyFetch';
+import DashboardSettingsModal from './DashboardSettingsModal.vue';
+import ArtifactActivityLog from './ArtifactActivityLog.vue';
+import DashboardStart from './DashboardStart.vue';
 import ShareModal from '../ShareModal.vue';
+import PublishButton from './PublishButton.vue';
+import PresenceAvatars from './collab/PresenceAvatars.vue';
 import Spinner from '../Spinner.vue';
 import SlideViewer from './SlideViewer.vue';
 import DocViewer from './DocViewer.vue';
 import DocEditor from './DocEditor.vue';
 import ViewerRunGate from './ViewerRunGate.vue';
-import { buildArtifactIframeHtml, isHtmlSlidesCode } from '~/utils/artifactIframe';
+import { buildArtifactIframeHtml, isHtmlSlidesCode, inlineableArtifactLibs, artifactPageLibs } from '~/utils/artifactIframe';
+import { artifactLibSources, ensureArtifactLibs, whenArtifactLibsSettled } from '~/utils/artifactLibs';
+
+import { polishPromptPosition as computePolishPromptPosition, buildPolishPrompt } from '~/utils/polishPrompt';
+import { newestVersionOf } from '~/utils/artifactVersionLatest';
+import { artifactRowCounts } from '~/utils/artifactRowCounts';
+import { viewingPath } from '~/utils/dashboardViewing';
+
+// A dashboard keeps its own dense chart and grid sizes even when it sits
+// beside a conversation that scales them (utils/chatVizText.ts).
+provide(CHAT_VIZ_TEXT_PX, ref(0))
 
 const { t } = useI18n();
+const { tm } = useArtifactWording();
 const toast = useToast();
 const config = useRuntimeConfig();
 const { token } = useAuth();
@@ -533,12 +693,26 @@ async function copyArtifactId(id: string) {
 }
 
 interface ArtifactItem {
-  id: string;
+  id: string;                 // version id
+  artifact_id?: string;       // parent identity — shared by all versions of one artifact
   title: string;
   version: number;
   created_at: string;
   mode: string;
   status?: string;
+  name?: string | null;       // a name someone gave the version (collab01)
+}
+
+// Download the iframe libraries now, in parallel with the artifact/data
+// requests (utils/artifactLibs.ts).
+ensureArtifactLibs(artifactPageLibs({ reactBuild: 'development', babel: false, pdf: false }));
+
+interface ArtifactFramePrefetch {
+  artifactId: string;
+  queries?: Promise<any> | null;
+  viewerContext?: Promise<any> | null;
+  queriesUsed?: boolean;
+  viewerContextUsed?: boolean;
 }
 
 const props = defineProps<{
@@ -556,7 +730,53 @@ const props = defineProps<{
    *  summary unmounts it and every click from there arrives too early. A prop
    *  is already reactive state on the page, so it survives the remount. */
   requestedArtifactId?: string | null;
+  /** A dashboard to open on its newest version (Edit from its draft page,
+   *  `?dashboard=`), instead of the conversation's newest version. */
+  requestedDashboardId?: string | null;
+  /** Server-brokered preview: no user credential/session enters this page. */
+  verificationPreview?: boolean;
+  /** This conversation's own agent is running (collab01): outline the
+   *  dashboard when others edit it too. */
+  agentRunning?: boolean;
+  /** First-load requests the report page started before this frame mounted
+   *  (same URLs this frame would request). Each is used at most once, only
+   *  for the artifact it was started for; anything else fetches normally. */
+  prefetch?: ArtifactFramePrefetch | null;
 }>();
+
+// The preview's server-side request broker supplies normal authorized API
+// responses. Rendering and parameter execution stay on this shared host.
+const useMyFetch: typeof useApplicationFetch = (async (request: any, options: any = {}) => {
+  if (!props.verificationPreview) return useApplicationFetch(request, options);
+  const path = String(request).startsWith('/api/') ? String(request) : `/api${request}`;
+  try {
+    const value = await $fetch(path, options);
+    return { data: ref(value), error: ref(null), pending: ref(false), status: ref('success'), refresh: () => {} };
+  } catch (error) {
+    return { data: ref(null), error: ref(error), pending: ref(false), status: ref('error'), refresh: () => {} };
+  }
+}) as typeof useApplicationFetch;
+
+let verificationRevision = 0;
+// BOW's preview: the editor's real conversation policy, for the simulated
+// bow.conversations (artifact-sdk.js fixtureRefusal).
+let previewConversationPolicy: any = null;
+// A full payload carries only the latest accepted result for each query.
+const verificationRequests = new Map<string, string>();
+// Set once the runtime broker exists (below): the editor's activity log.
+let logActivity: ((event: ActivityEvent) => void) | null = null;
+function verificationEvent(kind: string, fields: Record<string, any> = {}) {
+  if (!props.verificationPreview) {
+    // Outside the preview the same moments go to the editor's activity log.
+    if (kind === 'params_commit') logActivity?.({ kind: 'filter', status: 'ok', detail: { params: fields.changes || {}, queries: (fields.targets || []).length || undefined } });
+    else if (kind === 'error' && fields.source === 'runtime') logActivity?.({ kind: 'error', detail: { message: String(fields.message || 'Render error').slice(0, 300), where: 'render' } });
+    else if (kind === 'error') logActivity?.({ kind: 'filter', status: 'error', detail: { message: String(fields.message || '').slice(0, 300) } });
+    return;
+  }
+  window.dispatchEvent(new CustomEvent('bow:artifact-evidence', {
+    detail: { kind, artifact_id: props.requestedArtifactId, ...fields },
+  }));
+}
 
 defineEmits<{
   (e: 'close'): void;
@@ -578,16 +798,39 @@ const iframeError = ref<string | null>(null);
 const isPolishMode = ref(false);
 const polishPromptVisible = ref(false);
 const polishInstruction = ref('');
-const polishInputRef = ref<HTMLInputElement | null>(null);
+const polishInputRef = ref<HTMLTextAreaElement | null>(null);
+const polishContainerRef = ref<HTMLElement | null>(null);
+const polishBoxRef = ref<HTMLElement | null>(null);
+const polishBoxHeight = ref(0);
 const polishSelectedElement = ref<{ tag: string; classes: string; text: string; htmlSnippet: string; rect: { top: number; left: number; width: number; height: number } } | null>(null);
 
 const polishPromptPosition = computed(() => {
   if (!polishSelectedElement.value?.rect) return { top: '50%', left: '50%' };
-  const r = polishSelectedElement.value.rect;
-  // Position below the element, clamped within the container
-  const top = Math.min(Math.max(r.top + r.height + 8, 8), 500);
-  const left = Math.min(Math.max(r.left, 8), 400);
+  // polishContainerRef is the inline pane the iframe fills, so the rect the
+  // iframe reports maps 1:1 onto it.
+  const { top, left } = computePolishPromptPosition(
+    polishSelectedElement.value.rect,
+    { width: polishBoxRef.value?.offsetWidth ?? 320, height: polishBoxHeight.value },
+    { width: polishContainerRef.value?.clientWidth ?? Infinity, height: polishContainerRef.value?.clientHeight ?? Infinity },
+  );
   return { top: top + 'px', left: left + 'px' };
+});
+
+watch(polishBoxRef, (el, _prev, onCleanup) => {
+  if (!el) return;
+  polishBoxHeight.value = el.offsetHeight;
+  const observer = new ResizeObserver(() => { polishBoxHeight.value = el.offsetHeight; });
+  observer.observe(el);
+  onCleanup(() => observer.disconnect());
+});
+
+// Fit the instruction box to its text; max-h caps it and scrolling takes over.
+watch(polishInstruction, async () => {
+  await nextTick();
+  const el = polishInputRef.value;
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
 });
 
 function togglePolishMode() {
@@ -604,7 +847,7 @@ function enterPolishMode() {
   polishSelectedElement.value = null;
   polishInstruction.value = '';
   // Tell iframe to enable pick mode (srcdoc iframe inherits parent origin)
-  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, window.location.origin);
+  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, '*');
 }
 
 function exitPolishMode() {
@@ -612,14 +855,24 @@ function exitPolishMode() {
   polishPromptVisible.value = false;
   polishSelectedElement.value = null;
   polishInstruction.value = '';
-  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_EXIT' }, window.location.origin);
+  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_EXIT' }, '*');
 }
 
 function cancelPolishPrompt() {
   polishPromptVisible.value = false;
   polishSelectedElement.value = null;
   polishInstruction.value = '';
-  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, window.location.origin);
+  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, '*');
+}
+
+// Enter applies — except the Enter that commits an IME candidate (CJK input),
+// which would submit a half-written instruction. Chrome/Firefox flag it with
+// isComposing; Safari fires it after compositionend, where only keyCode 229
+// gives it away.
+function onPolishEnter(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  submitPolishPrompt();
 }
 
 function submitPolishPrompt() {
@@ -628,7 +881,12 @@ function submitPolishPrompt() {
   const artifactTitle = selectedArtifact.value?.title || 'the dashboard';
   const artifactId = selectedArtifact.value?.id || selectedArtifactId.value || '';
   const el = polishSelectedElement.value;
-  const prompt = `Polish the dashboard "${artifactTitle}" (artifact_id: ${artifactId}).\nTarget element:\n\`\`\`html\n${el.htmlSnippet}\n\`\`\`\nInstruction: ${polishInstruction.value.trim()}`;
+  const prompt = buildPolishPrompt({
+    title: artifactTitle,
+    artifactId: String(artifactId),
+    htmlSnippet: el.htmlSnippet,
+    instruction: polishInstruction.value.trim(),
+  });
 
   window.dispatchEvent(new CustomEvent('prompt:prefill', {
     detail: { text: prompt, autoSubmit: true }
@@ -672,16 +930,16 @@ async function refreshDashboard() {
       toast.add({ title: t('artifactFrame.refreshNothing'), color: 'orange' });
     } else if (run.steps_failed > 0) {
       toast.add({
-        title: run.steps_succeeded > 0 ? t('artifactFrame.refreshPartial') : t('artifactFrame.refreshFailed'),
+        title: run.steps_succeeded > 0 ? tm('artifactFrame.refreshPartial', selectedArtifact.value?.mode) : tm('artifactFrame.refreshFailed', selectedArtifact.value?.mode),
         description: summary,
         color: run.steps_succeeded > 0 ? 'orange' : 'red',
       });
     } else {
-      toast.add({ title: t('artifactFrame.refreshed'), description: summary, color: 'green' });
+      toast.add({ title: tm('artifactFrame.refreshed', selectedArtifact.value?.mode), description: summary, color: 'green' });
     }
   } catch (error: any) {
     console.error('Failed to refresh dashboard:', error);
-    toast.add({ title: t('artifactFrame.error'), description: t('artifactFrame.refreshDashboardFailed', { error: error.message || '' }), color: 'red' });
+    toast.add({ title: t('artifactFrame.error'), description: tm('artifactFrame.refreshDashboardFailed', selectedArtifact.value?.mode, { error: error.message || '' }), color: 'red' });
     // fetchData never ran, so clear the loading overlay it would have reset —
     // otherwise the dashboard stays hidden behind the spinner forever.
     isLoading.value = false;
@@ -906,7 +1164,7 @@ async function exportHtml() {
     console.error('Failed to export HTML:', error);
     toast.add({
       title: t('artifactFrame.exportFailed'),
-      description: error.message || t('artifactFrame.exportHtmlFailed'),
+      description: error.message || tm('artifactFrame.exportHtmlFailed', selectedArtifact.value?.mode),
       color: 'red',
     });
   } finally {
@@ -920,6 +1178,15 @@ async function exportHtml() {
 const viewerContext = ref<any>(null);
 async function fetchViewerContext() {
   try {
+    const pf = props.prefetch;
+    if (pf?.viewerContext && !pf.viewerContextUsed && !props.verificationPreview) {
+      pf.viewerContextUsed = true;
+      const res: any = await pf.viewerContext;
+      if (!res?.error?.value) {
+        viewerContext.value = res?.data?.value || null;
+        return;
+      }
+    }
     const { data } = await useMyFetch('/api/users/me/viewer_context');
     viewerContext.value = data.value || null;
   } catch {
@@ -928,6 +1195,28 @@ async function fetchViewerContext() {
 }
 
 const iframeRef = ref<HTMLIFrameElement | null>(null);
+const fullscreenRuntimeFrame = ref<HTMLIFrameElement | null>(null);
+// Fullscreen runs a second copy of the artifact: it seeds from the same
+// srcdoc, then needs every live update (data, theme, param status) too.
+const fullscreenReady = ref(false);
+watch(isFullscreenOpen, (open) => { if (!open) fullscreenReady.value = false; });
+function postToRuntimeFrames(message: any) {
+  for (const frame of [iframeRef.value, fullscreenRuntimeFrame.value]) {
+    try { frame?.contentWindow?.postMessage(message, '*'); } catch { /* frame not ready */ }
+  }
+}
+const resourcesAvailable = ref(false);
+
+
+// The editor's own session logs what happens in the app for the agent
+// (services/artifact_activity.py); BOW's preview turns the same events into
+// its evidence. View-as and readers are never logged.
+const runtime = useArtifactRuntime(() => ({ frames: [iframeRef.value, fullscreenRuntimeFrame.value], artifactId: selectedArtifact.value?.artifact_id, readOnly: !!props.verificationPreview || viewAsMode.value !== "you",
+  activity: !props.verificationPreview && viewAsMode.value === "you" ? { reportId: props.reportId, version: selectedArtifact.value?.version ?? null } : null,
+  onActivity: props.verificationPreview
+    ? (e) => verificationEvent('sdk_call', { event_kind: e.kind, op: e.op, status: e.status, error_code: e.error_code, duration_ms: e.duration_ms, detail: e.detail })
+    : (e) => { if (viewAsMode.value === "you") activityLogRef.value?.push(e); } }));
+logActivity = runtime.log;
 const isLoading = ref(true);
 
 // App color mode, forwarded into the artifact iframe (initial srcdoc + live
@@ -939,10 +1228,7 @@ const colorMode = useColorMode();
 let artifactColorMode: 'light' | 'dark' = colorMode.value === 'dark' ? 'dark' : 'light';
 watch(() => colorMode.value, (v) => {
   artifactColorMode = v === 'dark' ? 'dark' : 'light';
-  iframeRef.value?.contentWindow?.postMessage(
-    { type: 'ARTIFACT_SET_COLOR_MODE', mode: artifactColorMode },
-    window.location.origin
-  );
+  postToRuntimeFrames({ type: 'ARTIFACT_SET_COLOR_MODE', mode: artifactColorMode });
 });
 const dataReady = ref(false);  // Guards iframeSrcdoc to prevent rendering before data loads
 
@@ -969,6 +1255,13 @@ const latestParamRunForQid: Record<string, number> = {};
 // Snapshot embedded in the iframe's srcdoc; frozen per data load so live
 // param/view-as updates (postMessage) never trigger an iframe reload.
 const srcdocSeed = ref<any>(null);
+
+// Which sandbox runtime generation the selected artifact was authored for.
+// Read from content.runtime_version so a legacy row keeps its legacy look.
+function artifactRuntime() {
+  const v = Number((selectedArtifact.value as any)?.content?.runtime_version || 0);
+  return { version: Number.isFinite(v) ? v : 0 };
+}
 
 function paramsPayload() {
   // Aggregate declarations by name: same-named params across queries render
@@ -1121,12 +1414,8 @@ function queriesWithIdentityParams(): string[] {
 
 function postParamsStatus(loading: boolean, error: string | null = null) {
   paramRunLoading.value = loading;
-  try {
-    iframeRef.value?.contentWindow?.postMessage(
-      { type: 'ARTIFACT_PARAMS_STATUS', payload: { loading, error } },
-      window.location.origin,
-    );
-  } catch { /* iframe not ready */ }
+  verificationEvent(error ? 'error' : 'params_status', { loading, message: error });
+  postToRuntimeFrames({ type: 'ARTIFACT_PARAMS_STATUS', payload: { loading, error } });
 }
 
 // Execute the parameterized queries server-side (viewer mode: per-viewer
@@ -1137,6 +1426,7 @@ async function runParamQueries(
   opts: { force?: boolean; identityOnly?: boolean } = {},
 ) {
   const changedNames = Object.keys(changes || {});
+  verificationEvent('params_commit', { changes, targets, commit_seq: paramAckSeq });
 
   // A name no query declares would silently no-op (nothing to run) — the
   // classic generated-code bug of setParam('genre') vs a declared genre_id.
@@ -1175,6 +1465,13 @@ async function runParamQueries(
   const runAs = (viewAsMode.value !== 'you' && viewAsMode.value !== 'anonymous')
     ? viewAsMode.value : undefined;
   await Promise.all(affected.map(async (qid) => {
+    // Each parameterized run is a request in the app's activity log (Inspect,
+    // the agent's <app_activity>): which query, how long, how many rows.
+    const t0 = Date.now();
+    const title = visualizationsData.value.find((v: any) => v.queryId === qid)?.title || qid.slice(0, 8);
+    const logRun = (status: 'ok' | 'error', extra: Record<string, any> = {}) =>
+      logActivity?.({ kind: 'request', op: 'queries.run', status, duration_ms: Date.now() - t0,
+                      detail: { resource: String(title).slice(0, 120), action: 'run', ...extra } });
     try {
       const { data: runRes, error } = await useMyFetch(`/api/queries/${qid}/run`, {
         method: 'POST',
@@ -1189,18 +1486,23 @@ async function runParamQueries(
       if (error.value || !res || res.status !== 'success') {
         const msg = (error.value as any)?.data?.detail || res?.error || 'Query run failed';
         if (!firstError) firstError = String(msg);
+        logRun('error', { message: String(msg).slice(0, 300), http_status: (error.value as any)?.status });
         return;
       }
+      logRun('ok', { rows: Array.isArray(res.data?.rows) ? res.data.rows.length : undefined });
       if (latestParamRunForQid[qid] !== myRun) return; // superseded mid-flight
+      if (props.verificationPreview && res.verification_request_id) verificationRequests.set(qid, res.verification_request_id);
       for (const viz of visualizationsData.value) {
         if (viz.queryId === qid) {
           viz.rows = res.data?.rows || [];
+          Object.assign(viz, artifactRowCounts(res.data));
           viz.columns = res.data?.columns || [];
           viz.stepStatus = 'success';
         }
       }
     } catch (e: any) {
       if (!firstError) firstError = e?.message || 'Query run failed';
+      logRun('error', { message: String(e?.message || 'Query run failed').slice(0, 300) });
     }
   }));
   // New array identity so watchers fire and the fresh rows reach the iframe.
@@ -1269,33 +1571,232 @@ async function fetchArtifactFiles(): Promise<any[]> {
 const artifactsList = ref<ArtifactItem[]>([]);
 const selectedArtifactId = ref<string | undefined>(undefined);
 const selectedArtifact = ref<any>(null);
+watch(() => selectedArtifact.value?.artifact_id, async (id) => {
+  resourcesAvailable.value = false;
+  if (!id || props.verificationPreview) return;
+  try {
+    await $fetch(`/api/artifacts/${encodeURIComponent(id)}/runtime/context`, {headers:{Authorization:token.value || ''}});
+    if (selectedArtifact.value?.artifact_id === id) resourcesAvailable.value = true;
+  } catch { /* Disabled on existing installations until explicitly enabled. */ }
+}, {immediate:true});
 
 // Availability of PDF / PPTX / HTML for whatever is on screen; the public
 // share page derives its list from the same composable.
 const { availableExports } = useArtifactExports(selectedArtifact)
 
-// Computed options for dropdown
-const artifactOptions = computed(() => {
-  return artifactsList.value.map(a => ({
-    value: a.id,
-    label: `${a.title || 'Untitled'} (v${a.version})`,
-    artifact: a
-  }));
-});
-
-const selectedArtifactLabel = computed(() => {
-  const selected = artifactsList.value.find(a => a.id === selectedArtifactId.value);
-  if (selected) {
-    return `${selected.title || 'Untitled'} (v${selected.version})`;
+// The pickers: which dashboard (a conversation can hold several), then
+// which of its versions. One line of versions per dashboard; Live is the
+// one viewers see (from the Publish button's status).
+const modeIcon = (mode?: string) =>
+  mode === 'doc' ? 'heroicons:document-text' : (mode === 'slides' ? 'heroicons:presentation-chart-bar' : 'heroicons:squares-2x2');
+const dashboardKeyOf = (a: ArtifactItem) => a.artifact_id || a.id;
+const selectedArtifactItem = computed(() => artifactsList.value.find(a => a.id === selectedArtifactId.value) || null);
+// Every dashboard in this conversation, newest first: its versions and when
+// it was first made (what tells same-named dashboards apart).
+const dashboardGroups = computed(() => {
+  const groups = new Map<string, ArtifactItem[]>();
+  for (const a of artifactsList.value) {
+    const k = dashboardKeyOf(a);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k)!.push(a);
   }
-  return t('artifactFrame.selectArtifact');
+  return [...groups.entries()].map(([key, rows]) => {
+    const versions = [...rows].sort((x, y) => y.version - x.version);
+    const first = [...rows].sort((x, y) => new Date(x.created_at).getTime() - new Date(y.created_at).getTime())[0];
+    return { key, title: versions[0]?.title || 'Untitled', mode: versions[0]?.mode, created_at: first?.created_at, versions };
+  }).sort((x, y) => new Date(y.versions[0]?.created_at || 0).getTime() - new Date(x.versions[0]?.created_at || 0).getTime());
+});
+const selectedDashboardKey = computed(() => (selectedArtifactItem.value ? dashboardKeyOf(selectedArtifactItem.value) : undefined));
+const selectedDashboardTitle = computed(() => selectedArtifactItem.value?.title || t('artifactFrame.selectArtifact'));
+
+const publishStatus = ref<any>(null);
+const liveVersionId = computed<string | null>(() => publishStatus.value?.published?.source_version_id || null);
+const liveNumber = computed<number | null>(() => publishStatus.value?.published?.source_version_number || null);
+// Every version of the open dashboard, from any conversation (History):
+// ours are picked directly; one made elsewhere offers Preview or Bring here.
+const ELSEWHERE = 'elsewhere:';
+const ALL_VERSIONS = 'all-versions';
+const allVersions = ref<any[]>([]);
+async function loadAllVersions() {
+  const dashboardId = selectedArtifactItem.value?.artifact_id;
+  if (!dashboardId || props.verificationPreview) { allVersions.value = []; return; }
+  const { data, error } = await useMyFetch(`/artifacts/${encodeURIComponent(dashboardId)}/history`);
+  if (dashboardId !== selectedArtifactItem.value?.artifact_id) return;
+  allVersions.value = error.value ? [] : (((data.value as any)?.versions) || []);
+}
+watch(() => [selectedArtifactItem.value?.artifact_id, artifactsList.value.length, liveVersionId.value], loadAllVersions);
+const pickerOptions = computed(() => {
+  const several = dashboardGroups.value.length > 1;
+  const out: any[] = [];
+  for (const g of dashboardGroups.value) {
+    if (several) {
+      out.push({ value: `heading:${g.key}`, label: g.title, header: true, disabled: true,
+                 title: g.title, mode: g.mode, created_at: g.created_at });
+    }
+    const isSelected = g.key === selectedDashboardKey.value;
+    const rows: any[] = g.versions.map(a => ({
+      value: a.id, label: `${g.title} v${a.version}`, version: a.version, name: a.name || null,
+      created_at: a.created_at, grouped: several, live: isSelected && a.id === liveVersionId.value,
+    }));
+    if (isSelected) {
+      // From other conversations only live and the newest one there; the
+      // rest stay in Settings > Versions ("All versions…").
+      const here = new Set(g.versions.map(a => a.id));
+      const others = allVersions.value.filter(v => !here.has(v.id) && String(v.report_id) !== String(props.reportId));
+      const newestOther = others.reduce((m: any, v: any) => (!m || v.number > m.number ? v : m), null);
+      for (const v of others) {
+        if (!v.live && v !== newestOther && v.id !== viewing.value?.versionId) continue;
+        rows.push({ value: `${ELSEWHERE}${v.id}`, label: `${g.title} v${v.number}`, version: v.number, name: v.name || null,
+                    created_at: v.created_at, grouped: several, live: !!v.live, elsewhere: true, author: v.author?.name || null,
+                    versionId: v.id });
+      }
+      rows.sort((x, y) => y.version - x.version);
+    }
+    out.push(...rows);
+    if (isSelected && allVersions.value.length && dashboardCaps.value.includes('edit')) {
+      out.push({ value: ALL_VERSIONS, label: t('dashboardCollab.versions.allVersions'), allVersions: true });
+    }
+  }
+  return out;
 });
 
-// Check if selected artifact is the latest (first in list, sorted by created_at desc)
-const isLatestSelected = computed(() => {
-  if (!selectedArtifactId.value || artifactsList.value.length === 0) return true;
-  return artifactsList.value[0].id === selectedArtifactId.value;
+// A version made in another conversation is viewed in place, read-only:
+// nothing is copied until "Edit here" brings it in (a copy whose charts run
+// again as you; the next edit builds on it). Live is the published page, as
+// readers see it (viewingPath).
+const viewing = ref<{ versionId: string; version: number; author?: string | null; live?: boolean } | null>(null);
+const viewingSrc = computed(() => {
+  const dashboardId = selectedArtifactItem.value?.artifact_id;
+  return viewing.value && dashboardId ? viewingPath(dashboardId, viewing.value) : null;
 });
+const pickerValue = computed(() => (viewing.value ? `${ELSEWHERE}${viewing.value.versionId}` : selectedArtifactId.value));
+function onPick(value: string) {
+  if (value === ALL_VERSIONS) { settingsModalRef.value?.open('versions'); return; }
+  if (value && String(value).startsWith(ELSEWHERE)) {
+    const option = pickerOptions.value.find(o => o.value === value);
+    if (option) viewing.value = { versionId: option.versionId, version: option.version, author: option.author, live: option.live };
+    return;
+  }
+  viewing.value = null;
+  selectedArtifactId.value = value;
+}
+// Picking a version of our own, or the agent saving one, ends the viewing.
+watch(selectedArtifactId, () => { viewing.value = null; });
+const bringing = ref(false);
+async function bringHere(versionId: string | null) {
+  const dashboardId = selectedArtifactItem.value?.artifact_id;
+  if (!dashboardId || bringing.value) return null;
+  bringing.value = true;
+  try {
+    const { data, error } = await useMyFetch(`/artifacts/${encodeURIComponent(dashboardId)}/bring`, {
+      method: 'POST', body: { report_id: props.reportId, version_id: versionId },
+    });
+    if (error.value) throw error.value;
+    const res = data.value as any;
+    await fetchArtifactsList(true);
+    if (res?.version_id && artifactsList.value.some(a => a.id === res.version_id)) {
+      await switchToArtifact(res.version_id);
+    }
+    return res;
+  } catch (e: any) {
+    toast.add({ title: t('dashboardCollab.versions.bringFailed'), description: e?.data?.detail?.message || undefined, color: 'red' });
+    return null;
+  } finally {
+    bringing.value = false;
+  }
+}
+async function editViewing() {
+  const v = viewing.value;
+  if (!v) return;
+  const res = await bringHere(v.versionId);
+  if (res) viewing.value = null;
+}
+// The chat's note above the prompt offers "Edit here" too.
+function onEditHere(e: Event) {
+  if ((e as CustomEvent).detail?.report_id === props.reportId) editViewing();
+}
+onMounted(() => window.addEventListener('artifact:edit-here', onEditHere));
+onBeforeUnmount(() => window.removeEventListener('artifact:edit-here', onEditHere));
+// "Open v4" (the publish question): ours is selected; one from elsewhere viewed.
+async function openVersionById(versionId: string) {
+  if (artifactsList.value.some(a => a.id === versionId)) {
+    await switchToArtifact(versionId);
+    return;
+  }
+  if (!allVersions.value.some(v => v.id === versionId)) await loadAllVersions();
+  const v = allVersions.value.find(x => x.id === versionId);
+  if (v) viewing.value = { versionId: v.id, version: v.number, author: v.author?.name || null, live: !!v.live };
+}
+
+async function viewAskedVersion(n: number) {
+  await loadAllVersions();
+  const v = allVersions.value.find(x => x.number === n);
+  if (!v || artifactsList.value.some(a => a.id === v.id)) return;
+  liveAhead.value = null;
+  viewing.value = { versionId: v.id, version: v.number, author: v.author?.name || null, live: !!v.live };
+}
+
+// On opening (and when another dashboard is picked): live moved on past this
+// conversation's work -> show it, read-only, without copying anything; with
+// work of its own here nobody published, ask first instead.
+const liveAhead = ref<any | null>(null);
+const liveAheadDismissed = ref<Set<string>>(new Set());
+async function onBroughtFromStart(versionId: string | null) {
+  await fetchArtifactsList(true);
+  if (versionId && artifactsList.value.some(a => a.id === versionId)) await switchToArtifact(versionId);
+}
+async function checkLiveAhead() {
+  liveAhead.value = null;
+  viewing.value = null;
+  const dashboardId = selectedArtifactItem.value?.artifact_id;
+  if (!dashboardId || props.verificationPreview) return;
+  const { data, error } = await useMyFetch(`/artifacts/${encodeURIComponent(dashboardId)}/open-state`, {
+    query: { report_id: props.reportId },
+  });
+  if (error.value || dashboardId !== selectedArtifactItem.value?.artifact_id) return;
+  const st = data.value as any;
+  if (viewing.value || !st?.behind_live || !st.live) return;
+  if (st.unpublished_here) {
+    if (!liveAheadDismissed.value.has(st.live.version_id)) liveAhead.value = st;
+    return;
+  }
+  viewing.value = { versionId: st.live.version_id, version: st.live.version, author: st.live.by?.name || null, live: true };
+}
+// The version open here is what this conversation's next edit builds on
+// (collab01): the prompt sends it, and says so when a newer one exists.
+function announceOpenVersion() {
+  const item = selectedArtifactItem.value;
+  const group = item ? dashboardGroups.value.find(g => g.key === dashboardKeyOf(item)) : null;
+  const newest = group?.versions[0] || null;
+  window.dispatchEvent(new CustomEvent('artifact:open-version', {
+    detail: item && !props.verificationPreview ? {
+      report_id: props.reportId, version_id: item.id, version: item.version,
+      newest_id: newest?.id || item.id, newest_version: newest?.version || item.version,
+      viewing_version: viewing.value?.version ?? null,
+    } : { report_id: props.reportId, version_id: null },
+  }));
+}
+watch([selectedArtifactId, () => artifactsList.value.length, viewing], announceOpenVersion);
+onBeforeUnmount(() => window.dispatchEvent(new CustomEvent('artifact:open-version', {
+  detail: { report_id: props.reportId, version_id: null },
+})));
+function viewLiveAhead() {
+  const st = liveAhead.value;
+  if (!st) return;
+  viewing.value = { versionId: st.live.version_id, version: st.live.version, author: st.live.by?.name || null, live: true };
+  liveAhead.value = null;
+}
+function keepWorkingHere() {
+  if (liveAhead.value?.live?.version_id) liveAheadDismissed.value.add(liveAhead.value.live.version_id);
+  liveAhead.value = null;
+}
+watch(() => selectedArtifactItem.value?.artifact_id, (id, previous) => {
+  if (id && id !== previous && !props.verificationPreview) checkLiveAhead();
+});
+
+// "Use this version" appears when the selection is not the newest version of
+// its dashboard (utils/artifactVersionLatest.ts; old versions with no tie to
+// their dashboard keep the rule by mode).
 
 // Check if selected artifact is pending (still generating)
 const isPendingArtifact = computed(() => {
@@ -1349,6 +1850,75 @@ const isReportOwner = computed(() => {
 const isEditingDoc = ref(false);
 const docEditorRef = ref<any>(null);
 
+// --- Collaboration (collab01) ------------------------------------------
+// What this user may do with the dashboard open here: its draft page's
+// capabilities, asked once per dashboard. Empty while unknown, and for
+// anyone the dashboard does not let edit -- every collaboration control
+// then stays hidden, so a dashboard nobody else edits looks as before.
+const dashboardMeta = ref<{ capabilities: string[]; isOwner: boolean } | null>(null);
+const dashboardCaps = computed<string[]>(() => dashboardMeta.value?.capabilities || []);
+const currentDashboardId = computed<string | null>(() => selectedArtifact.value?.artifact_id || null);
+let dashboardMetaFor: string | null = null;
+async function loadDashboardMeta(force = false) {
+  const id = currentDashboardId.value;
+  if (!force && id === dashboardMetaFor) return;
+  dashboardMetaFor = id;
+  if (!force) dashboardMeta.value = null;
+  if (!id || props.verificationPreview) return;
+  try {
+    const { data, error } = await useMyFetch(`/api/d/${encodeURIComponent(id)}/draft`);
+    if (dashboardMetaFor !== id) return; // switched dashboards meanwhile
+    const meta: any = error.value ? null : data.value;
+    dashboardMeta.value = meta ? { capabilities: meta.capabilities || [], isOwner: !!meta.is_owner } : null;
+  } catch {
+    if (dashboardMetaFor === id) dashboardMeta.value = null;
+  }
+}
+watch(currentDashboardId, () => { loadDashboardMeta(); }, { immediate: true });
+
+// Presence: beat while an editor has a page or slides dashboard open here,
+// with this conversation; get back who else is editing it.
+const presenceEnabled = computed(() =>
+  !props.verificationPreview && !!currentDashboardId.value
+  && ['page', 'slides'].includes(selectedArtifact.value?.mode)
+  && dashboardCaps.value.includes('edit'));
+const { others: presenceOthers } = useDashboardPresence(
+  currentDashboardId, computed(() => props.reportId), presenceEnabled);
+
+// This conversation's agent at work on a dashboard someone else edits too
+// (they have it open now, or it is not this user's own dashboard): outline
+// it with whose agent it is. A dashboard only its owner edits shows nothing.
+const showAgentOutline = computed(() =>
+  !!props.agentRunning && presenceEnabled.value
+  && (presenceOthers.value.length > 0 || dashboardMeta.value?.isOwner === false));
+const agentOwnerFirstName = computed(() => {
+  const me = sessionUser.value as any;
+  const name = String(props.report?.user?.name || me?.user?.name || me?.name || '');
+  return name.split(/[\s@]/)[0] || name;
+});
+
+// "Review changes" from the publish warning: the draft page's changes view.
+// "Review changes" (someone published since): the version open here against
+// what readers see now -- not the newest version, which may be theirs.
+function reviewChanges() {
+  const id = currentDashboardId.value;
+  if (!id) return;
+  const n = selectedArtifact.value?.version;
+  navigateTo(`/d/${encodeURIComponent(id)}/draft?${n ? `version=${n}&` : ''}changes=1`);
+}
+
+// The settings window: its History tabs open from the ⋯ menu too.
+const settingsModalRef = ref<any>(null);
+const activityLogRef = ref<InstanceType<typeof ArtifactActivityLog> | null>(null);
+const inspectOpen = ref(false);
+// Remounting the Publish button re-reads what readers see now.
+const publishKey = ref(0);
+// A roll back changes what is live; a transfer changes who may do what.
+function onHistoryChanged() {
+  publishKey.value += 1;
+  loadDashboardMeta(true);
+}
+
 // --- Rename the dashboard ------------------------------------------------
 // "The dashboard" is two records to the user: the report (its card on
 // /dashboards, the sidebar entry, the browser tab) and the selected artifact
@@ -1388,11 +1958,19 @@ function cancelRename() {
 }
 
 async function saveRename() {
-  const id = selectedArtifactId.value;
   const title = renameDraft.value.trim();
-  if (!id || !title || isSavingRename.value) return;
+  if (!title || isSavingRename.value) return;
   if (title === currentArtifactTitle()) { cancelRename(); return; }
+  if (await renameTo(title)) {
+    isRenaming.value = false;
+    renameDraft.value = '';
+  }
+}
 
+// The rename itself, for the inline field and the settings' General tab.
+async function renameTo(title: string): Promise<boolean> {
+  const id = selectedArtifactId.value;
+  if (!id || !title || isSavingRename.value) return false;
   isSavingRename.value = true;
   try {
     const { data, error } = await useMyFetch(`/api/artifacts/${id}`, {
@@ -1403,19 +1981,9 @@ async function saveRename() {
 
     const saved = (data.value as any)?.title || title;
 
-    // The report title is what every list renders (see /dashboards). Keep it
-    // in step, then tell the page and the sidebar — the same event
-    // loadReport() fires when the server generates a title.
-    if (props.report?.id) {
-      const { error: reportError } = await useMyFetch(`/api/reports/${props.report.id}`, {
-        method: 'PUT',
-        body: { title: saved },
-      });
-      if (reportError.value) throw reportError.value;
-      window.dispatchEvent(new CustomEvent('report:updated', {
-        detail: { id: props.report.id, title: saved },
-      }));
-    }
+    // A dashboard is named by its own title; renaming it no longer renames the
+    // conversation it was born from (the /dashboards card reads the artifact's
+    // title now, falling back to the conversation's only when it has none).
     // Patch local state instead of refetching: the list endpoint is the same
     // one the report page seeds us from, and a refetch would race an
     // in-flight generation and could snap the selection.
@@ -1423,16 +1991,16 @@ async function saveRename() {
     if (selectedArtifact.value?.id === id) {
       selectedArtifact.value = { ...selectedArtifact.value, title: saved };
     }
-    isRenaming.value = false;
-    renameDraft.value = '';
-    toast.add({ title: t('artifactFrame.renamed'), color: 'green' });
+    toast.add({ title: tm('artifactFrame.renamed', selectedArtifact.value?.mode), color: 'green' });
+    return true;
   } catch (e: any) {
     console.error('[ArtifactFrame] Failed to rename artifact:', e);
     toast.add({
       title: t('artifactFrame.error'),
-      description: e?.data?.detail?.message || e?.data?.detail || t('artifactFrame.renameFailed'),
+      description: e?.data?.detail?.message || e?.data?.detail || tm('artifactFrame.renameFailed', selectedArtifact.value?.mode),
       color: 'red',
     });
+    return false;
   } finally {
     isSavingRename.value = false;
   }
@@ -1442,14 +2010,14 @@ async function saveRename() {
 watch(selectedArtifactId, () => { if (isRenaming.value) cancelRename(); });
 
 // --- Overflow (⋯) menu ---------------------------------------------------
-type MenuItem = { label: string; icon: string; click: () => void; disabled?: boolean };
+type MenuItem = { label: string; icon: string; click: () => void; disabled?: boolean; testid?: string };
 
 // Groups render with dividers between them (Nuxt UI takes an array of
 // arrays). Empty groups are dropped so no divider ever leads nowhere.
 const moreMenuItems = computed<MenuItem[][]>(() => {
   const edit: MenuItem[] = [];
   if (canRename.value) {
-    edit.push({ label: t('artifactFrame.rename'), icon: 'i-heroicons-pencil', click: startRename });
+    edit.push({ label: tm('artifactFrame.rename', selectedArtifact.value?.mode), icon: 'i-heroicons-pencil', click: startRename });
   }
 
   // The .md source download is doc-only; PDF/PPTX/HTML come from
@@ -1459,7 +2027,9 @@ const moreMenuItems = computed<MenuItem[][]>(() => {
   if (isDocMode.value && !isEditingDoc.value) {
     exports.push({ label: t('docViewer.exportMarkdown'), icon: 'i-heroicons-arrow-down-tray', click: exportDocMarkdown });
   }
-  for (const option of availableExports.value) {
+  // Viewing another version read-only: exports and full screen would act on
+  // our hidden one, so they go; a new tab opens the version being viewed.
+  for (const option of viewing.value ? [] : availableExports.value) {
     exports.push({
       label: t('artifactFrame.exportAs', { format: option.label }),
       icon: option.icon,
@@ -1468,15 +2038,30 @@ const moreMenuItems = computed<MenuItem[][]>(() => {
     });
   }
 
-  const view: MenuItem[] = [
+  const view: MenuItem[] = viewing.value ? [] : [
     { label: t('artifactFrame.fullScreen'), icon: 'i-heroicons-arrows-pointing-out', click: openFullscreen },
   ];
   if (props.report) {
-    // /r/{id} itself enforces access — an unshared report is still viewable
-    // there by its owner.
-    view.push({ label: t('artifactFrame.openInNewTab'), icon: 'i-heroicons-arrow-top-right-on-square', click: () => window.open(`/r/${props.report.id}`, '_blank', 'noopener') });
+    // What the editor works on, as /r showed until now: the dashboard's
+    // draft, its newest version (phase 8). Whoever may not edit it lands on
+    // its published page instead (SharedDashboardView). Without a dashboard
+    // id (older rows), the conversation's /r as before.
+    const dashboardId = selectedArtifact.value?.artifact_id;
+    const viewedId = selectedArtifactItem.value?.artifact_id;
+    const page = viewing.value && viewedId ? viewingPath(viewedId, viewing.value, { embed: false })
+      : dashboardId ? `/d/${dashboardId}/draft` : `/r/${props.report.id}`;
+    view.push({ label: t('artifactFrame.openInNewTab'), icon: 'i-heroicons-arrow-top-right-on-square', click: () => window.open(page, '_blank', 'noopener') });
   }
 
+  if (selectedArtifact.value?.artifact_id && !props.verificationPreview) {
+    // Resources and analytics are tabs of the dashboard's settings (the gear).
+    const inspectors = [];
+    // History: the conversations, versions and releases (Roll back) -- editors.
+    if (dashboardCaps.value.includes('edit')) inspectors.push({ label: t('dashboardCollab.conversation.history'), icon: 'i-heroicons-clock', testid: 'history-menu', click: () => { settingsModalRef.value?.open('versions'); } });
+    // Activity log: what the app did while it was used (requests, filters, clicks, errors) -- editors.
+    if (dashboardCaps.value.includes('edit')) inspectors.push({ label: t('artifactActivity.inspect'), icon: 'i-heroicons-code-bracket-square', testid: 'inspect-menu', click: () => { inspectOpen.value = !inspectOpen.value; } });
+    view.unshift(...inspectors);
+  }
   return [edit, exports, view].filter(g => g.length > 0);
 });
 
@@ -1486,6 +2071,159 @@ const moreMenuItems = computed<MenuItem[][]>(() => {
 // snapshot_withheld and empty data, and rendering the artifact against them
 // crashes generated code that assumes rows exist. Mirror of /r/[id].
 const snapshotWithheld = ref(false);
+// Per-chart view of the same policy. A viewer refused ONE dataset used to lose
+// the whole dashboard to the gate; now the charts they can read render and
+// only these are called out (see showViewerGate).
+const withheldCharts = ref<Array<{ title: string; noAccess: boolean }>>([]);
+// Set when the charts named above are the OWNER's own failed steps (a fork
+// whose hydration ran only part of the dashboard) rather than snapshots
+// withheld from a viewer. Banner-only: it must never reach showViewerGate.
+const ownerFailedCharts = ref(false);
+
+// ── Brought in: the copies run again as this user ──────────────────────────
+// A dashboard brought into this conversation (bring, "Edit vN here", "Edit in
+// my conversation", Fork) arrives with its code and queries but no rows: the
+// server reruns each copied step as the person who brought it, in the
+// background. Whenever a load finds steps still pending, poll their statuses
+// (no rows) until they settle, then load the data once. State-driven, so every
+// entry point is covered, including a page reload mid-run.
+type HydrationFailure = { queryId: string; title: string; reason: string | null; noAccess: boolean };
+const hydration = ref<null | {
+  phase: 'running' | 'failed' | 'timeout';
+  total: number; done: number; failed: HydrationFailure[];
+  rerunning: boolean; rerunError: string | null;
+}>(null);
+const HYDRATION_POLL_MS = 2000;
+const HYDRATION_MAX_MS = 10 * 60 * 1000;
+let hydrationTimer: ReturnType<typeof setTimeout> | null = null;
+let hydrationToken = 0;
+let hydrationStartedAt = 0;
+let hydrationArtifactId: string | null = null;
+const SETTLING = new Set(['pending', 'running']);
+
+function stopHydrationPolling() {
+  hydrationToken += 1;
+  if (hydrationTimer) clearTimeout(hydrationTimer);
+  hydrationTimer = null;
+}
+function dismissHydration() {
+  stopHydrationPolling();
+  hydration.value = null;
+}
+function failuresOf(statuses: any[]): HydrationFailure[] {
+  return statuses.filter(s => s.status === 'error').map(s => ({
+    queryId: s.query_id, title: s.title || '', reason: s.status_reason || null, noAccess: s.error_code === 'no_access',
+  }));
+}
+// Called by fetchData with the steps it just loaded.
+function watchHydration(artifactId: string | undefined | null, steps: any[]) {
+  const settling = steps.filter(s => s && SETTLING.has(s.status));
+  if (!settling.length || !artifactId || props.verificationPreview) {
+    if (hydration.value?.phase === 'running') hydration.value = null;
+    return;
+  }
+  if (hydration.value?.phase === 'running' && hydrationArtifactId === artifactId && hydrationTimer) return;
+  stopHydrationPolling();
+  hydrationArtifactId = artifactId;
+  hydrationStartedAt = Date.now();
+  hydration.value = {
+    phase: 'running', total: steps.length, done: steps.length - settling.length,
+    failed: [], rerunning: false, rerunError: null,
+  };
+  scheduleHydrationPoll(hydrationToken);
+}
+function scheduleHydrationPoll(token: number) {
+  if (token !== hydrationToken) return;
+  if (typeof document !== 'undefined' && document.hidden) return; // resumed on visibilitychange
+  hydrationTimer = setTimeout(() => pollHydration(token), HYDRATION_POLL_MS);
+}
+async function pollHydration(token: number) {
+  hydrationTimer = null;
+  const artifactId = hydrationArtifactId;
+  if (token !== hydrationToken || !artifactId || !hydration.value) return;
+  if (Date.now() - hydrationStartedAt > HYDRATION_MAX_MS) {
+    hydration.value = { ...hydration.value, phase: 'timeout' };
+    return;
+  }
+  let statuses: any[] | null = null;
+  try {
+    const { data, error } = await useMyFetch('/api/queries/statuses', {
+      query: { report_id: props.reportId, artifact_id: artifactId },
+    });
+    if (!error.value && Array.isArray(data.value)) statuses = data.value as any[];
+  } catch { /* a missed poll just waits for the next */ }
+  if (token !== hydrationToken || artifactId !== selectedArtifactId.value) return;
+  if (!statuses) { scheduleHydrationPoll(token); return; }
+  const settling = statuses.filter(s => SETTLING.has(s.status));
+  hydration.value = { ...hydration.value!, total: statuses.length, done: statuses.length - settling.length };
+  if (settling.length) { scheduleHydrationPoll(token); return; }
+  // Everything ran: load the rows once.
+  const failed = failuresOf(statuses);
+  await fetchData(artifactId, { inPlace: dataReady.value });
+  if (token !== hydrationToken) return;
+  hydration.value = failed.length
+    ? { phase: 'failed', total: statuses.length, done: statuses.length, failed, rerunning: false, rerunError: null }
+    : null;
+}
+async function reloadAfterHydration() {
+  const artifactId = hydrationArtifactId || selectedArtifactId.value;
+  dismissHydration();
+  await fetchData(artifactId || undefined, { inPlace: dataReady.value });
+}
+// "Run again": the conversation is this user's, so the report rerun runs the
+// dashboard's queries with their credentials and identity.
+async function runFailedAgain() {
+  const h = hydration.value;
+  const artifactId = hydrationArtifactId || selectedArtifactId.value;
+  if (!h || h.rerunning || !artifactId) return;
+  hydration.value = { ...h, rerunning: true, rerunError: null };
+  let rerunError: string | null = null;
+  try {
+    const { data, error } = await useMyFetch(`/api/reports/${props.reportId}/rerun?artifact_id=${encodeURIComponent(artifactId)}`, { method: 'POST' });
+    if (error.value) rerunError = (error.value as any)?.data?.detail?.message || (error.value as any)?.data?.detail || t('artifactFrame.refreshFailed');
+    else if ((data.value as any)?.skipped) rerunError = t('artifactFrame.hydrating.stillRunning');
+    else if ((data.value as any)?.steps_failed) rerunError = t('artifactFrame.hydrating.stillFailing', { failed: (data.value as any).steps_failed });
+  } catch (e: any) {
+    rerunError = e?.message || t('artifactFrame.refreshFailed');
+  }
+  let statuses: any[] = [];
+  try {
+    const { data } = await useMyFetch('/api/queries/statuses', { query: { report_id: props.reportId, artifact_id: artifactId } });
+    statuses = Array.isArray(data.value) ? data.value as any[] : [];
+  } catch { /* keep the previous list */ }
+  await fetchData(artifactId, { inPlace: dataReady.value });
+  if (hydration.value?.phase === 'running') return; // fetchData found steps still running and is polling
+  const failed = statuses.length ? failuresOf(statuses) : h.failed;
+  hydration.value = failed.length
+    ? { phase: 'failed', total: statuses.length || h.total, done: statuses.length || h.total, failed, rerunning: false,
+        rerunError: typeof rerunError === 'string' ? rerunError : null }
+    : null;
+}
+function onHydrationVisibility() {
+  if (document.hidden) {
+    if (hydrationTimer) { clearTimeout(hydrationTimer); hydrationTimer = null; }
+  } else if (hydration.value?.phase === 'running' && !hydrationTimer) {
+    pollHydration(hydrationToken);
+  }
+}
+onMounted(() => document.addEventListener('visibilitychange', onHydrationVisibility));
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onHydrationVisibility);
+  stopHydrationPolling();
+});
+watch(selectedArtifactId, () => dismissHydration());
+// Every query on the dashboard is withheld — nothing to render but the gate.
+const allWithheld = ref(false);
+// Some own run was refused by the provider (classified server-side as
+// error_code 'no_access'), as opposed to breaking for another reason.
+const viewerRunNoAccess = ref(false);
+// Some own run stopped because the viewer must sign in to a connection first
+// (error_code 'credentials_required') -- they HAVE access.
+const viewerRunNeedsConnect = ref(false);
+// The dashboard renders, but some of its charts are unavailable to this viewer.
+const partiallyWithheld = computed(() =>
+  (snapshotWithheld.value || ownerFailedCharts.value)
+  && !showViewerGate.value && withheldCharts.value.length > 0);
 // True when any of the dashboard's queries reads a delegated (per-user
 // credential) source: View-as swaps identity params only — source-level rows
 // still come back under the caller's own credentials, so the preview must
@@ -1507,7 +2245,7 @@ const autoRunTried = ref(false);
 const reportSources = ref<any[]>([]);
 
 const gateErrorMessage = computed(() =>
-  viewerRunFailedReason.value || dataSourceErrors.value[0]?.error || null);
+  dataSourceErrors.value[0]?.error || viewerRunFailedReason.value || null);
 
 const gateSourceType = computed<string | null>(() => {
   const conns = reportSources.value.flatMap((ds: any) => ds.connections || []);
@@ -1517,11 +2255,21 @@ const gateSourceType = computed<string | null>(() => {
 
 // In-app the user is always signed in, so the gate never shows 'signin';
 // the machine-readable data-source error codes pick the fallback action.
+// The gate covers the dashboard only when there is nothing of it to show:
+// before this viewer has any run of their own (it auto-runs and shows
+// "loading"), while that run is in flight, or when EVERY query is withheld.
+// Withheld is per query, so a viewer refused one dataset still gets every
+// chart they can read — the fork makes the same call (keep what ran).
+const showViewerGate = computed(() =>
+  snapshotWithheld.value && (allWithheld.value || isViewerRunning.value || !hasOwnResult.value));
+
 const gateState = computed<'loading' | 'signin' | 'connect' | 'no_access' | 'error' | 'ready'>(() => {
   if (isViewerRunning.value) return 'loading';
   const errs = dataSourceErrors.value;
-  if (errs.some((e) => e.code === 'credentials_required')) return 'connect';
-  if (errs.some((e) => e.code === 'no_access')) return 'no_access';
+  if (errs.some((e) => e.code === 'credentials_required') || viewerRunNeedsConnect.value) return 'connect';
+  // Refused at the data-source level (no client) OR at query time (one
+  // dataset) — both are "no access", never the provider's HTTP status.
+  if (errs.some((e) => e.code === 'no_access') || viewerRunNoAccess.value) return 'no_access';
   if (errs.length > 0 || viewerRunFailedReason.value) return 'error';
   return 'ready';
 });
@@ -1749,42 +2497,6 @@ function fixRenderError() {
   }));
 }
 
-// State for "Use this version" action
-const isDuplicating = ref(false);
-
-// Duplicate the selected artifact to make it the latest/default
-async function useThisVersion() {
-  if (!selectedArtifactId.value || isDuplicating.value) return;
-
-  isDuplicating.value = true;
-  try {
-    const { data, error } = await useMyFetch(`/api/artifacts/${selectedArtifactId.value}/duplicate`, {
-      method: 'POST'
-    });
-
-    if (error.value) throw error.value;
-
-    // Refresh the list and select the new artifact
-    await fetchArtifactsList(true);
-    if (data.value && (data.value as any).id) {
-      selectedArtifactId.value = (data.value as any).id;
-    }
-
-    toast.add({ title: t('artifactFrame.versionSetDefault'), color: 'green' });
-
-    // The revert emits a silent artifact_version_reverted session event
-    // server-side — reload the timeline so its strip appears (no websocket).
-    window.dispatchEvent(new CustomEvent('report:mutated', {
-      detail: { reportId: props.reportId, kind: 'artifact_version' }
-    }));
-  } catch (error: any) {
-    console.error('Failed to set version as default:', error);
-    toast.add({ title: t('artifactFrame.error'), description: t('artifactFrame.versionSetDefaultFailed'), color: 'red' });
-  } finally {
-    isDuplicating.value = false;
-  }
-}
-
 // Handle artifact:select event (select a specific artifact by ID)
 async function handleArtifactSelect(event: Event) {
   const artifactId = (event as CustomEvent).detail?.artifact_id;
@@ -1828,11 +2540,21 @@ async function switchToArtifact(artifactId: string) {
 // or updates the artifact already on screen)
 async function handleArtifactCreated(event: Event) {
   const detail = (event as CustomEvent).detail || {};
+  if (detail.report_id && detail.report_id !== props.reportId) return;
   const artifactId = detail.artifact_id;
   const takeover = detail.select !== false;
   if (!takeover && artifactId && selectedArtifactId.value &&
       artifactId !== selectedArtifactId.value) {
     await fetchArtifactsList(true);
+    // A new version of the dashboard on screen (this conversation's own run,
+    // re-attached after a reload, counts as "elsewhere"): follow it, so
+    // Publish and the next edit act on it and not on the one before.
+    const created = artifactsList.value.find(a => a.id === artifactId);
+    const onScreen = selectedArtifactItem.value;
+    if (created?.artifact_id && created.artifact_id === onScreen?.artifact_id) {
+      await switchToArtifact(artifactId);
+      return;
+    }
     offeredArtifactId.value = artifactId;
     return;
   }
@@ -1861,6 +2583,16 @@ onMounted(async () => {
   // First fetch artifact list to know which artifact is selected (viewer
   // identity in parallel — it gates nothing, a failure just renders anonymous)
   await Promise.all([fetchArtifactsList(), fetchViewerContext()]);
+  // ?version=N opens that version of the dashboard (a link to one version);
+  // without it, the newest -- what the next edit builds on.
+  const askedVersion = Number(paramRoute.query.version);
+  if (!props.requestedArtifactId && Number.isInteger(askedVersion) && askedVersion > 0) {
+    const key = selectedDashboardKey.value;
+    const hit = artifactsList.value.find(a => dashboardKeyOf(a) === key && a.version === askedVersion);
+    if (hit) selectedArtifactId.value = hit.id;
+    // One made in another conversation: view it here, read-only.
+    else if (key) viewAskedVersion(askedVersion);
+  }
 
   // Load the selected artifact exactly once after initial selection. The
   // report page already fetched the latest artifact; reuse that object when
@@ -1884,21 +2616,37 @@ onMounted(async () => {
   // mount and only for first-time viewers; a viewer whose earlier run failed
   // gets the explicit fallback state instead of a retry loop. (The backend
   // never withholds from the report owner, so this cannot fire for owners.)
-  if (snapshotWithheld.value && !isReportOwner.value && !hasOwnResult.value && !autoRunTried.value) {
-    autoRunTried.value = true;
-    await runAsViewer();
-  }
+  await autoRunForViewer();
 
   // Paint first, refresh second (refresh_on_view, default-on): the server
   // enforces the flag, a staleness gate, and a cross-worker single-flight
   // claim, so this is at most one owner-credential rerun per interval no
   // matter how many people open the page. Mirrors the /r host.
   try {
-    const { data } = await useMyFetch(`/api/r/${props.reportId}/rerun`, { method: 'POST' });
+    if (props.verificationPreview) return; // Verification only runs explicit viewer queries.
+    // The dashboard open here decides (its "refresh when opened", phase 9).
+    const open = selectedArtifact.value?.id;
+    const { data } = await useMyFetch(`/api/r/${props.reportId}/rerun${open ? `?artifact_id=${encodeURIComponent(open)}` : ''}`, { method: 'POST' });
     const run: any = data.value;
-    if (run && !run.skipped && run.steps_succeeded) await refreshAll();
+    if (run && !run.skipped && run.steps_succeeded) {
+      await refreshDataInPlace();
+      // A refresh drops every viewer's own results: run again for them (one
+      // more run, whatever ran before), as on a first open.
+      autoRunTried.value = false;
+      await autoRunForViewer();
+    }
   } catch { /* a failed background refresh must never break a rendered page */ }
 });
+
+// Also when their last run stopped on a missing sign-in: only a run names the
+// connection to connect, and they may have connected since.
+async function autoRunForViewer() {
+  if (!snapshotWithheld.value || isReportOwner.value || isViewerRunning.value || autoRunTried.value) return;
+  const needsRun = !hasOwnResult.value || (viewerRunNeedsConnect.value && dataSourceErrors.value.length === 0);
+  if (!needsRun) return;
+  autoRunTried.value = true;
+  await runAsViewer();
+}
 
 // Fetch list of all artifacts for the report
 async function fetchArtifactsList(force = false) {
@@ -1924,7 +2672,10 @@ async function fetchArtifactsList(force = false) {
       if (artifactsList.value.length > 0) {
         const stillExists = !!selectedArtifactId.value &&
           artifactsList.value.some(a => a.id === selectedArtifactId.value);
-        if (!stillExists) selectedArtifactId.value = artifactsList.value[0].id;
+        if (!stillExists) {
+          selectedArtifactId.value = newestVersionOf(artifactsList.value, props.requestedDashboardId)
+            || artifactsList.value[0].id;
+        }
       }
     }
   } catch (e) {
@@ -1982,12 +2733,21 @@ onUnmounted(() => {
 
 // Handle messages from iframe
 function handleIframeMessage(event: MessageEvent) {
-  if (event.data?.type === 'ARTIFACT_READY') {
+  if (event.source !== iframeRef.value?.contentWindow && event.source !== fullscreenRuntimeFrame.value?.contentWindow) return;
+  if (event.data?.type === 'ARTIFACT_DATA_RECEIVED') {
+    verificationEvent('data_received', { data_revision: event.data.revision });
+    return;
+  }
+  if (event.data?.type === 'ARTIFACT_READY' && event.source === fullscreenRuntimeFrame.value?.contentWindow) {
+    fullscreenReady.value = true;
+    sendDataToIframe();
+  } else if (event.data?.type === 'ARTIFACT_READY') {
     console.log('[ArtifactFrame] Iframe ready');
     iframeError.value = null;
     iframeReady.value = true;
     sendDataToIframe();
   } else if (event.data?.type === 'ARTIFACT_ERROR') {
+    verificationEvent('error', { source: 'runtime', message: event.data.payload?.message });
     console.error('[ArtifactFrame] Iframe render error:', event.data.payload?.message);
     iframeError.value = event.data.payload?.message || 'Unknown render error';
   } else if (event.data?.type === 'POLISH_ELEMENT_SELECTED') {
@@ -1997,35 +2757,40 @@ function handleIframeMessage(event: MessageEvent) {
     nextTick(() => polishInputRef.value?.focus());
   } else if (event.data?.type === 'ARTIFACT_SET_PARAMS') {
     // A control in the artifact committed param changes: run the consuming
-    // queries server-side and push fresh rows back down.
-    if (event.source === iframeRef.value?.contentWindow) {
-      paramAckSeq = Math.max(paramAckSeq, Number(event.data.seq) || 0);
-      runParamQueries(event.data.changes || {}, event.data.targets || null, {});
-    }
+    // queries server-side and push fresh rows back down (to both frames).
+    paramAckSeq = Math.max(paramAckSeq, Number(event.data.seq) || 0);
+    runParamQueries(event.data.changes || {}, event.data.targets || null, {});
   } else if (event.data?.type === 'ARTIFACT_REFRESH_PARAMS') {
-    if (event.source === iframeRef.value?.contentWindow) {
-      runParamQueries(null, event.data.targets || null, { force: true });
-    }
+    runParamQueries(null, event.data.targets || null, { force: true });
   }
 }
 
 // Send data to iframe via postMessage
 function sendDataToIframe() {
-  if (!iframeRef.value?.contentWindow || !iframeReady.value) return;
+  const targets = [
+    iframeReady.value ? iframeRef.value?.contentWindow : null,
+    fullscreenReady.value ? fullscreenRuntimeFrame.value?.contentWindow : null,
+  ].filter((w): w is Window => !!w);
+  if (!targets.length) return;
 
   const payload = JSON.parse(JSON.stringify({
     report: toRaw(reportData.value),
     visualizations: toRaw(visualizationsData.value),
     files: toRaw(filesData.value),
     current_user: toRaw(effectiveViewerContext.value),
-    params: paramsPayload()
+    params: paramsPayload(),
+    runtime: artifactRuntime(),
+    ...(props.verificationPreview ? { verification_revision: ++verificationRevision } : {}),
+    // Each push replaces the app's data: keep the preview's real policy in it.
+    ...(props.verificationPreview && previewConversationPolicy ? { _fixture_conversation_policy: previewConversationPolicy } : {}),
   }));
 
+  verificationEvent('data_sent', {
+    data_revision: verificationRevision,
+    request_ids: [...new Set(visualizationsData.value.map(v => verificationRequests.get(v.queryId)).filter(Boolean))],
+  });
   try {
-    iframeRef.value.contentWindow.postMessage({
-      type: 'ARTIFACT_DATA',
-      payload
-    }, window.location.origin);
+    for (const target of targets) target.postMessage({ type: 'ARTIFACT_DATA', payload }, '*');
   } catch (err: any) {
     console.error('[ArtifactFrame] Failed to send data to iframe:', err);
     iframeError.value = err?.message || 'Failed to send data to dashboard iframe';
@@ -2036,10 +2801,16 @@ function sendDataToIframe() {
   console.log('[ArtifactFrame] Data sent to iframe:', visualizationsData.value.length, 'visualizations');
 }
 
-// Fetch visualization data for the report (optionally filtered by artifact)
-async function fetchData(artifactId?: string) {
-  isLoading.value = true;
-  dataReady.value = false;
+// Fetch visualization data for the report (optionally filtered by artifact).
+// `inPlace` refreshes the rows of a dashboard that is already rendered: no
+// loading overlay, no srcdoc rebuild (which reloads the iframe — a visible
+// blank flash) and no reset of the viewer's control values; the fresh rows
+// reach the live document through postMessage like a param run.
+async function fetchData(artifactId?: string, { inPlace = false }: { inPlace?: boolean } = {}) {
+  if (!inPlace) {
+    isLoading.value = true;
+    dataReady.value = false;
+  }
 
   try {
     // Fetch report info
@@ -2065,7 +2836,16 @@ async function fetchData(artifactId?: string) {
 
     // Fetch queries with visualizations - filter by artifact_id if provided
     const queryParams = artifactId ? `?report_id=${props.reportId}&artifact_id=${artifactId}` : `?report_id=${props.reportId}`;
-    const { data: queriesRes } = await useMyFetch(`/api/queries${queryParams}`);
+    // First load: the report page may already have this exact request in
+    // flight (started before this frame mounted).
+    let prefetched: any = null;
+    const pf = props.prefetch;
+    if (!inPlace && pf?.queries && !pf.queriesUsed && !props.verificationPreview && artifactId && pf.artifactId === artifactId) {
+      pf.queriesUsed = true;
+      prefetched = await pf.queries;
+      if (prefetched?.error?.value || !Array.isArray(prefetched?.data?.value)) prefetched = null;
+    }
+    const { data: queriesRes } = prefetched || await useMyFetch(`/api/queries${queryParams}`);
     const queries = Array.isArray(queriesRes.value) ? queriesRes.value : [];
 
     // Build visualization data array
@@ -2074,6 +2854,12 @@ async function fetchData(artifactId?: string) {
     let anyOwnResult = false;
     let anyCredentialScoped = false;
     let failedReason: string | null = null;
+    const nextWithheldCharts: Array<{ title: string; noAccess: boolean }> = [];
+    let visibleQueries = 0;
+    // The owner's own steps that hydration could not run — banner, not gate.
+    let anyOwnerFailed = false;
+    let anyNoAccess = false;
+    let anyNeedsConnect = false;
 
     const nextParamSpecs: Record<string, any[]> = {};
     for (let qi = 0; qi < queries.length; qi++) {
@@ -2094,11 +2880,44 @@ async function fetchData(artifactId?: string) {
 
       // Per-viewer step-data policy markers: withheld snapshots gate the
       // render; an existing per-viewer result row gates auto-run.
-      if (step?.snapshot_withheld) anyWithheld = true;
       const vr = step?.viewer_result;
+      if (step?.snapshot_withheld) {
+        anyWithheld = true;
+        nextWithheldCharts.push({
+          title: query.title || 'Untitled',
+          noAccess: vr?.error_code === 'no_access',
+        });
+      } else if (step?.status === 'error' && step?.status_reason) {
+        // The step's OWNER seeing their own failed step — a forker whose
+        // hydration could run only part of the dashboard. `snapshot_withheld`
+        // is a viewer-only marker, always false here, so without this branch
+        // the two sentences hydrate_fork carefully writes onto the step reached
+        // nobody: the charts it could not run rendered blank, with no banner
+        // and no explanation. `error_code` tells "you may not read this" from
+        // "this query broke" without matching on prose.
+        //
+        // Sets its own flag, NOT `anyWithheld`: that one drives showViewerGate,
+        // and the owner must never be shown the viewer's sign-in/connect gate
+        // for their own fork. This feeds the banner alone.
+        anyOwnerFailed = true;
+        nextWithheldCharts.push({
+          title: query.title || 'Untitled',
+          noAccess: step.error_code === 'no_access',
+        });
+      } else if (step) {
+        // Only a step that actually loaded counts as viewable. A failed fetch
+        // (or a query with no default step) leaves `step` null, and
+        // `snapshot_withheld` then reads undefined — which counted it as
+        // visible, lifted the gate, and ran the artifact against rows that are
+        // uniformly empty: the render crash the gate exists to prevent. An
+        // unreadable step is not a readable one, so it stays out of the count.
+        visibleQueries += 1;
+      }
       if (vr) {
         anyOwnResult = true;
         if (vr.status === 'error' && !failedReason) failedReason = vr.status_reason || null;
+        if (vr.status === 'error' && vr.error_code === 'no_access') anyNoAccess = true;
+        if (vr.status === 'error' && vr.error_code === 'credentials_required') anyNeedsConnect = true;
       }
 
       // Process each visualization in the query
@@ -2108,9 +2927,17 @@ async function fetchData(artifactId?: string) {
           title: viz.title || query.title || 'Untitled',
           view: viz.view || {},
           rows: step?.data?.rows || [],
+          ...artifactRowCounts(step?.data),
           columns: step?.data?.columns || [],
           dataModel: step?.data_model || {},
           stepStatus: step?.status,
+          // Withheld from this viewer: rows are empty on purpose. Exposed so
+          // artifact code (and anything reading ARTIFACT_DATA) can tell an
+          // unavailable chart from one with genuinely no rows.
+          unavailable: !!step?.snapshot_withheld || step?.status === 'error',
+          // The reason this chart is empty, in the words the server chose.
+          // Empty for a chart that simply has no rows.
+          unavailableReason: step?.status === 'error' ? (step?.status_reason || '') : '',
           // Provenance surfaced in the built-in InfoPopover on prebuilt comps
           code: step?.code || '',
           description: viz.description || query.description || step?.description || '',
@@ -2120,6 +2947,7 @@ async function fetchData(artifactId?: string) {
       }
     }
     queryParamSpecs.value = nextParamSpecs;
+    watchHydration(artifactId, queries.map((q: any) => q.default_step).filter((st: any) => st && !st.snapshot_withheld));
 
     // Stable control choices (static options + options-source query rows).
     await resolveParamOptions(queries, async () => {
@@ -2129,8 +2957,9 @@ async function fetchData(artifactId?: string) {
 
     // Initialize applied values: declaration defaults, overridden by any
     // qp_<name> URL state (shareable dashboards). Identity params carry no
-    // client value — the server binds them per viewer.
-    {
+    // client value — the server binds them per viewer. An in-place refresh
+    // keeps whatever the viewer has applied since.
+    if (!inPlace) {
       const urlValues = readParamsFromUrl();
       const nextValues: Record<string, any> = {};
       for (const specs of Object.values(nextParamSpecs)) {
@@ -2148,6 +2977,8 @@ async function fetchData(artifactId?: string) {
 
     // Reorder vizData to match artifact's visualization_ids order
     // (artifact code references viz[0], viz[1], etc. by index)
+    // These are newly fetched snapshots, not the previous parameter-run results.
+    verificationRequests.clear();
     const vizIds = selectedArtifact.value?.content?.visualization_ids;
     if (vizIds && vizIds.length > 0) {
       const vizMap = new Map(vizData.map(v => [v.id, v]));
@@ -2162,6 +2993,11 @@ async function fetchData(artifactId?: string) {
       visualizationsData.value = vizData;
     }
     snapshotWithheld.value = anyWithheld;
+    withheldCharts.value = nextWithheldCharts;
+    ownerFailedCharts.value = anyOwnerFailed;
+    allWithheld.value = queries.length > 0 && visibleQueries === 0;
+    viewerRunNoAccess.value = anyNoAccess;
+    viewerRunNeedsConnect.value = anyNeedsConnect;
     hasOwnResult.value = anyOwnResult;
     credentialScoped.value = anyCredentialScoped;
     viewerRunFailedReason.value = failedReason;
@@ -2197,13 +3033,32 @@ async function fetchData(artifactId?: string) {
     // snapshot. Later updates (param runs, view-as swaps) flow via
     // postMessage into the live data store — never by recomputing srcdoc,
     // which would reload the iframe and lose control state.
-    srcdocSeed.value = JSON.parse(JSON.stringify({
+    // BOW's preview simulates conversations, but against the real policy, so
+    // an app the live page would refuse fails in the preview too.
+    if (!inPlace && props.verificationPreview && selectedArtifact.value?.artifact_id
+        && String(selectedArtifact.value?.content?.code || '').includes('conversations')) {
+      const { data } = await useMyFetch(`/api/artifacts/${selectedArtifact.value.artifact_id}/runtime/conversations/policy`);
+      previewConversationPolicy = data.value || null;
+    }
+    if (!inPlace) srcdocSeed.value = JSON.parse(JSON.stringify({
+      ...(previewConversationPolicy ? { _fixture_conversation_policy: previewConversationPolicy } : {}),
       report: toRaw(reportData.value),
       visualizations: toRaw(visualizationsData.value),
       files: toRaw(filesData.value),
       current_user: toRaw(effectiveViewerContext.value),
       params: paramsPayload(),
+      runtime: artifactRuntime(),
     }));
+
+    // The iframe libraries were requested at mount, in parallel with the data
+    // above — usually they are here already. Waiting keeps the loading
+    // overlay up instead of a blank frame.
+    if (!inPlace) {
+      const code = props.artifactCode || selectedArtifact.value?.content?.code;
+      if (code) {
+        try { await whenArtifactLibsSettled(inlineableArtifactLibs(frameIframeOptions(srcdocSeed.value, code))); } catch { /* falls back to <script src> */ }
+      }
+    }
 
     // Mark data as ready - triggers iframeSrcdoc to compute with loaded data
     dataReady.value = true;
@@ -2216,6 +3071,13 @@ async function fetchData(artifactId?: string) {
       sendDataToIframe();
     }
   }
+}
+
+// Refresh-on-view finished with new rows: the artifact itself is unchanged,
+// so update the data of the rendered dashboard rather than reloading it.
+// Before the first paint there is nothing to keep — take the full path.
+async function refreshDataInPlace() {
+  await fetchData(selectedArtifactId.value, { inPlace: dataReady.value });
 }
 
 // Refresh everything
@@ -2242,7 +3104,7 @@ function App() {
   if (!data) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="animate-pulse text-gray-400">Loading...</div>
+        <div className="animate-pulse text-ink-muted">Loading...</div>
       </div>
     );
   }
@@ -2265,7 +3127,7 @@ function App() {
       {visualizations.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 text-center">
           <div className="w-16 h-16 bg-gray-100 dark:bg-gray-800 rounded-full flex items-center justify-center mb-4">
-            <svg className="w-8 h-8 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg className="w-8 h-8 text-ink-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
           </div>
@@ -2320,7 +3182,7 @@ function VisualizationCard({ viz }) {
     <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden hover:shadow-md transition-shadow">
       <div className="px-5 py-4 border-b border-gray-50 dark:border-gray-800">
         <h3 className="font-semibold text-gray-900 dark:text-gray-100">{viz.title}</h3>
-        <span className="text-xs text-gray-400 uppercase tracking-wide">{viewType}</span>
+        <span className="text-xs text-ink-muted uppercase tracking-wide">{viewType}</span>
       </div>
       <div className="p-5">
         {viz.rows?.length > 0 ? (
@@ -2330,7 +3192,7 @@ function VisualizationCard({ viz }) {
             <div ref={chartRef} className="h-72 w-full" />
           )
         ) : (
-          <div className="h-72 flex items-center justify-center text-gray-400">
+          <div className="h-72 flex items-center justify-center text-ink-muted">
             No data available
           </div>
         )}
@@ -2373,7 +3235,7 @@ function TableView({ data }) {
         </tbody>
       </table>
       {rows.length > 10 && (
-        <div className="text-xs text-gray-400 p-2 text-center bg-gray-50 dark:bg-gray-800">
+        <div className="text-xs text-ink-muted p-2 text-center bg-gray-50 dark:bg-gray-800">
           Showing 10 of {rows.length} rows
         </div>
       )}
@@ -2513,10 +3375,13 @@ const iframeSrcdoc = computed(() => {
   // Wait for visualization data to be loaded
   if (!dataReady.value) return undefined;
 
-  // Snapshot withheld: the steps carry empty data, and generated artifact
-  // code routinely assumes rows exist — don't execute it at all. The
-  // ViewerRunGate covers this state until the viewer's own run resolves it.
-  if (snapshotWithheld.value) return undefined;
+  // Nothing of the dashboard is viewable yet: generated artifact code
+  // routinely assumes rows exist, so don't execute it against all-empty data —
+  // the ViewerRunGate covers this state. With SOME charts withheld it does
+  // run: those charts get empty rows (flagged `unavailable`) and the banner
+  // names them; a render failure then gets a viewer-appropriate message
+  // instead of "Fix Error".
+  if (showViewerGate.value) return undefined;
 
   // Slides without previews carry python-pptx source; it must never be
   // injected into the iframe (the browser would render it as raw text).
@@ -2538,17 +3403,31 @@ const iframeSrcdoc = computed(() => {
     files: filesData.value,
     current_user: effectiveViewerContext.value,
     params: paramsPayload(),
+    runtime: artifactRuntime(),
   };
-  return buildArtifactIframeHtml({
+  const opts = frameIframeOptions(seed, artifactCode);
+  // Wait for the host-fetched libraries (failed ones fall back to <script src>).
+  const inlineLibs = artifactLibSources(inlineableArtifactLibs(opts));
+  if (inlineLibs === null) return undefined;
+  return buildArtifactIframeHtml({ ...opts, inlineLibs });
+});
+
+function frameIframeOptions(seed: any, artifactCode: string) {
+  return {
     data: seed,
     code: artifactCode,
     mode: selectedArtifact.value?.mode || 'page',
-    polishMode: true,
+    polishMode: !props.verificationPreview,
+    fixtureMode: !!props.verificationPreview,
+    resourceApp: selectedArtifact.value?.content?.sdk_version === 1,
     loadingLabel: t('artifactFrame.loadingArtifact'),
-    reactBuild: 'development',
+    reactBuild: 'development' as const,
     colorMode: artifactColorMode,
-  });
-});
+    // Used only when its key matches artifactCode (artifactIframe.ts), so an
+    // artifactCode prop override or a stale selection always compiles in-frame.
+    precompiled: { js: selectedArtifact.value?.compiled_js, key: selectedArtifact.value?.compiled_js_key },
+  };
+}
 
 // Re-send data when it changes
 watch([visualizationsData, filesData, iframeReady], () => {

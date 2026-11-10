@@ -7,53 +7,57 @@
       <div class="flex items-center justify-between w-full min-w-0">
         <div class="flex items-center min-w-0">
           <Icon v-if="!expanded" :name="isCollapsed ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-3.5 h-3.5 me-1.5 text-gray-500 dark:text-gray-400 rtl-flip" />
-          <Icon v-else :name="showVisual ? 'heroicons:chart-bar' : 'heroicons:table-cells'" class="w-3.5 h-3.5 me-1.5 text-gray-400 flex-shrink-0" />
+          <Icon v-else :name="showVisual ? 'heroicons:chart-bar' : 'heroicons:table-cells'" class="w-3.5 h-3.5 me-1.5 text-ink-muted flex-shrink-0" />
           <h3 class="widget-title truncate" :class="{ 'text-sm': expanded }">{{ widgetTitle }}</h3>
+          <span v-if="effectiveStep?.data?.info?.source?.id === 'builtin:bow'" class="ms-2 shrink-0 text-chat-3 text-ink-muted inline-flex items-center gap-1">
+            <img src="/assets/logo-128.png" class="w-3 h-3 object-contain" alt="" />
+            {{ t('tools.createData.bowSource') }}
+          </span>
           <button
-            v-if="queryId && canEditCode && (canEdit || !readonly)"
+            v-if="queryId && canRunCustomCode && (canEdit || !readonly)"
             @click.stop="onEditClick"
-            class="text-xs px-2 py-0.5 text-gray-400 rounded transition-colors flex items-center"
-            :title="$t('tools.widgetPreview.editQueryCode')"
+            class="text-xs px-2 py-0.5 text-ink-muted rounded transition-colors flex items-center"
+            :title="t('tools.widgetPreview.editQueryCode')"
           >
             <Icon name="heroicons-pencil-square" class="w-3.5 h-3.5 me-1" />
-            {{ $t('tools.widgetPreview.edit') }}
+            {{ t('tools.widgetPreview.edit') }}
           </button>
         </div>
         <div class="flex items-center gap-3">
-          <UTooltip v-if="queryId" :text="$t('tools.widgetPreview.copyIdTooltip')">
+          <UTooltip v-if="queryId" :text="t('tools.widgetPreview.copyIdTooltip')">
             <button
               @click.stop="copyQueryId"
-              class="flex items-center gap-0.5 text-[10px] text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 font-mono transition-colors"
+              class="flex items-center gap-0.5 text-chat-3 text-ink-muted hover:text-gray-600 dark:hover:text-gray-300 font-mono transition-colors"
             >
               <Icon name="heroicons:clipboard-document" class="w-3 h-3" />
               {{ queryId.slice(0, 8) }}
             </button>
           </UTooltip>
-          <div v-if="rowCount" class="text-[11px] text-gray-400 leading-none flex items-center gap-1 whitespace-nowrap" data-testid="widget-row-count">
-            <Spinner v-if="isHydratingStep" class="w-3 h-3 text-gray-400" :title="$t('tools.widgetPreview.loadingRows')" />
-            {{ activeFilterCount > 0 ? $t('tools.widgetPreview.rowsFiltered', { filtered: filteredRowCount, total: rowCount }) : $t('tools.widgetPreview.rows', { count: rowCount }) }}
+          <div v-if="rowCount" class="text-chat-3 text-ink-muted leading-none flex items-center gap-1 whitespace-nowrap" data-testid="widget-row-count">
+            <Spinner v-if="isHydratingStep" class="w-3 h-3 text-ink-muted" :title="t('tools.widgetPreview.loadingRows')" />
+            {{ activeFilterCount > 0 ? t('tools.widgetPreview.rowsFiltered', { filtered: filteredRowCount, total: rowCount }) : t('tools.widgetPreview.rows', { count: rowCount }) }}
           </div>
           <UTooltip v-if="cardParamSpecs.length" text="Parameterized query">
-            <div class="text-[11px] text-gray-400 leading-none flex items-center gap-0.5" data-testid="card-param-chip">
+            <div class="text-chat-3 text-ink-muted leading-none flex items-center gap-0.5" data-testid="card-param-chip">
               <Icon name="heroicons:adjustments-horizontal" class="w-3 h-3" />{{ cardParamSpecs.length }}
             </div>
           </UTooltip>
 
-          <UTooltip v-if="canExpand && !expanded" :text="$t('tools.widgetPreview.openInPanel')">
+          <UTooltip v-if="canExpand && !expanded" :text="t('tools.widgetPreview.openInPanel')">
             <button
               type="button"
               @click.stop="openInPanel"
-              class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
-              :aria-label="$t('tools.widgetPreview.openInPanel')"
+              class="text-ink-muted hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
+              :aria-label="t('tools.widgetPreview.openInPanel')"
               data-testid="widget-open-panel"
             >
               <Icon name="heroicons:arrows-pointing-out" class="w-3.5 h-3.5" />
             </button>
           </UTooltip>
-          <UTooltip v-if="hasChartForDownload" :text="$t('tools.widgetPreview.downloadPng')">
+          <UTooltip v-if="hasChartForDownload" :text="t('tools.widgetPreview.downloadPng')">
             <button
               @click.stop="downloadChartPNG"
-              class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
+              class="text-ink-muted hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
             >
               <Icon name="heroicons:photo" class="w-3.5 h-3.5" />
             </button>
@@ -65,17 +69,17 @@
             :ui="{ width: 'w-48', item: { padding: 'px-2.5 py-1.5' } }"
             @click.stop
           >
-            <UTooltip :text="$t('tools.widgetPreview.download')">
+            <UTooltip :text="t('tools.widgetPreview.download')">
               <button
                 type="button"
-                class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
+                class="text-ink-muted hover:text-gray-600 dark:hover:text-gray-300 transition-colors flex items-center"
               >
                 <Icon name="heroicons:arrow-down-tray" class="w-3.5 h-3.5" />
                 <Icon name="heroicons:chevron-down" class="w-3 h-3 -ml-0.5 rtl-flip" />
               </button>
             </UTooltip>
             <template #item="{ item }">
-              <Icon :name="item.icon" class="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+              <Icon :name="item.icon" class="w-3.5 h-3.5 text-ink-muted flex-shrink-0" />
               <span class="text-xs truncate">{{ item.label }}</span>
             </template>
           </UDropdown>
@@ -92,8 +96,8 @@
       <div v-if="!isCollapsed" class="widget-content" :class="{ 'widget-content--expanded': expanded }">
         <!-- Error / empty state when step has an error -->
         <template v-if="hasStepError">
-          <div class="min-h-[80px] flex items-center text-xs text-gray-400">
-            {{ $t('tools.widgetPreview.noData') }}
+          <div class="min-h-[80px] flex items-center text-xs text-ink-muted">
+            {{ t('tools.widgetPreview.noData') }}
           </div>
         </template>
         <template v-else>
@@ -102,7 +106,7 @@
                changes through the editor's Save, never from here. -->
           <div v-if="cardParamSpecs.length" class="mb-2 flex flex-wrap items-center gap-2 text-xs border-b border-gray-50 dark:border-gray-800 pb-2" data-testid="param-value-bar" @click.stop>
             <label v-for="spec in editableCardSpecs" :key="spec.name" class="flex items-center gap-1 text-gray-500 dark:text-gray-400">
-              <span class="text-[11px]">{{ spec.label || spec.name }}</span>
+              <span class="text-2xs">{{ spec.label || spec.name }}</span>
               <select v-if="cardParamOptions[spec.name] && spec.type !== 'list'" v-model="cardParamValues[spec.name]"
                 class="px-1.5 py-0.5 border border-gray-200 dark:border-gray-700 rounded text-xs bg-white dark:bg-gray-900" :data-testid="`card-param-${spec.name}`">
                 <option :value="null">All</option>
@@ -114,7 +118,7 @@
                 :data-testid="`card-param-${spec.name}`" />
             </label>
             <span v-for="spec in identityCardSpecs" :key="spec.name"
-              class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-200 text-[10px]">
+              class="px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-200 text-2xs">
               {{ spec.label || spec.name }}: scoped to you
             </span>
             <button v-if="editableCardSpecs.length && !readonly" @click.stop="runCardParams" :disabled="cardRunLoading"
@@ -122,10 +126,10 @@
               data-testid="card-param-run">
               <Icon name="heroicons-play" class="w-3 h-3" />{{ cardRunLoading ? 'Running…' : 'Run' }}
             </button>
-            <span v-if="cardAppliedParams" class="text-[10px] text-gray-400" data-testid="card-applied">
+            <span v-if="cardAppliedParams" class="text-2xs text-ink-muted" data-testid="card-applied">
               ran with {{ formatAppliedParams(cardAppliedParams) }}
             </span>
-            <span v-if="cardRunError" class="text-[10px] text-red-500">{{ cardRunError }}</span>
+            <span v-if="cardRunError" class="text-2xs text-red-500">{{ cardRunError }}</span>
           </div>
 
           <!-- Tab Navigation -->
@@ -134,37 +138,37 @@
               v-if="showVisual"
               @click="activeTab = 'chart'"
               :class="[
-                'px-3 py-1.5 text-xs font-medium border-b-2 transition-colors',
+                'px-3 py-1.5 text-chat-2 font-medium border-b-2 transition-colors',
                 activeTab === 'chart'
                   ? 'border-blue-500 text-blue-600'
-                  : 'border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
+                  : 'border-transparent text-ink-muted hover:text-gray-600 dark:hover:text-gray-300'
               ]"
             >
-              {{ $t('tools.widgetPreview.tabChart') }}
+              {{ t('tools.widgetPreview.tabChart') }}
             </button>
             <button
               v-if="hasData"
               @click="activeTab = 'table'"
               :class="[
-                'px-3 py-1.5 text-xs font-medium border-b-2 transition-colors',
+                'px-3 py-1.5 text-chat-2 font-medium border-b-2 transition-colors',
                 activeTab === 'table'
                   ? 'border-blue-500 text-blue-600'
-                  : 'border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
+                  : 'border-transparent text-ink-muted hover:text-gray-600 dark:hover:text-gray-300'
               ]"
             >
-              {{ $t('tools.widgetPreview.tabData') }}
+              {{ t('tools.widgetPreview.tabData') }}
             </button>
             <button
               v-if="hasCode"
               @click="activeTab = 'code'"
               :class="[
-                'px-3 py-1.5 text-xs font-medium border-b-2 transition-colors',
+                'px-3 py-1.5 text-chat-2 font-medium border-b-2 transition-colors',
                 activeTab === 'code'
                   ? 'border-blue-500 text-blue-600'
-                  : 'border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300'
+                  : 'border-transparent text-ink-muted hover:text-gray-600 dark:hover:text-gray-300'
               ]"
             >
-              {{ $t('tools.widgetPreview.tabCode') }}
+              {{ t('tools.widgetPreview.tabCode') }}
             </button>
           </div>
 
@@ -183,7 +187,16 @@
             <!-- Chart Content -->
             <Transition name="fade" mode="out-in">
               <div ref="chartContainerRef" v-if="(showTabs && activeTab === 'chart') || (!showTabs && showVisual)" :class="{ 'h-full': expanded && !isMetricCardType }">
-                <div v-if="resolvedCompEl" :class="chartHeightClass" :style="chartHeightStyle">
+                <!-- A truncated preview is only the first rows: charting it
+                     draws a different chart that then jumps to the real one
+                     when the full set lands. Hold the slot (same height, no
+                     layout shift) until that fetch settles. -->
+                <div v-if="awaitingFullRows" :class="chartHeightClass" :style="chartHeightStyle" data-testid="chart-awaiting-rows">
+                  <div class="flex items-center justify-center w-full h-full">
+                    <Spinner class="w-5 h-5 text-ink-muted" />
+                  </div>
+                </div>
+                <div v-else-if="resolvedCompEl" :class="chartHeightClass" :style="chartHeightStyle">
                   <Suspense>
                     <component
                       :is="resolvedCompEl"
@@ -197,7 +210,7 @@
                     />
                     <template #fallback>
                       <div class="flex items-center justify-center w-full h-full">
-                        <Spinner class="w-5 h-5 text-gray-400" />
+                        <Spinner class="w-5 h-5 text-ink-muted" />
                       </div>
                     </template>
                   </Suspense>
@@ -207,7 +220,7 @@
                     <RenderVisual :widget="effectiveWidget" :data="filteredData" :data_model="effectiveStep?.data_model" :view="normalizedView" />
                     <template #fallback>
                       <div class="flex items-center justify-center w-full h-full">
-                        <Spinner class="w-5 h-5 text-gray-400" />
+                        <Spinner class="w-5 h-5 text-ink-muted" />
                       </div>
                     </template>
                   </Suspense>
@@ -239,33 +252,33 @@
                       <button
                         @click="showFullCode = false"
                         :class="[
-                          'px-2 py-0.5 text-[11px] rounded transition-colors',
+                          'px-2 py-0.5 text-2xs rounded transition-colors',
                           !showFullCode ? 'bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
                         ]"
                       >
-                        {{ $t('tools.widgetPreview.toggleQueries') }}
+                        {{ t('tools.widgetPreview.toggleQueries') }}
                       </button>
                       <button
                         @click="showFullCode = true"
                         :class="[
-                          'px-2 py-0.5 text-[11px] rounded transition-colors',
+                          'px-2 py-0.5 text-2xs rounded transition-colors',
                           showFullCode ? 'bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300'
                         ]"
                       >
-                        {{ $t('tools.widgetPreview.toggleFullCode') }}
+                        {{ t('tools.widgetPreview.toggleFullCode') }}
                       </button>
                     </div>
                     <div v-else></div>
 
                     <!-- Edit button -->
                     <button
-                      v-if="queryId && canEditCode && (canEdit || !readonly)"
+                      v-if="queryId && canRunCustomCode && (canEdit || !readonly)"
                       @click="onEditClick"
                       class="text-xs px-2 py-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors flex items-center"
-                      :title="$t('tools.widgetPreview.editCode')"
+                      :title="t('tools.widgetPreview.editCode')"
                     >
                       <Icon name="heroicons-pencil-square" class="w-3 h-3 me-1" />
-                      {{ $t('tools.widgetPreview.edit') }}
+                      {{ t('tools.widgetPreview.edit') }}
                     </button>
                   </div>
 
@@ -289,7 +302,7 @@
                             minimap: { enabled: false },
                             wordWrap: 'on',
                             scrollBeyondLastLine: false,
-                            fontSize: 12,
+                            fontSize: 13,
                             lineNumbers: 'off',
                             folding: false,
                             renderLineHighlight: 'none',
@@ -301,13 +314,13 @@
                         />
                         <template #fallback>
                           <div class="flex items-center justify-center w-full h-full">
-                            <Spinner class="w-5 h-5 text-gray-400" />
+                            <Spinner class="w-5 h-5 text-ink-muted" />
                           </div>
                         </template>
                       </Suspense>
                       <template #fallback>
                         <div class="flex items-center justify-center w-full h-full">
-                          <Spinner class="w-5 h-5 text-gray-400" />
+                          <Spinner class="w-5 h-5 text-ink-muted" />
                         </div>
                       </template>
                     </ClientOnly>
@@ -315,31 +328,31 @@
                 </div>
 
                 <!-- Execution details -->
-                <div v-if="executionDuration || rowCount" class="mt-2 flex items-center gap-3 text-[11px] text-gray-400 flex-shrink-0">
+                <div v-if="executionDuration || rowCount" class="mt-2 flex items-center gap-3 text-chat-3 text-ink-muted flex-shrink-0">
                   <span v-if="executionDuration">
                     <Icon name="heroicons-clock" class="w-3 h-3 inline-block me-1" />
                     {{ executionDuration }}
                   </span>
                   <span v-if="rowCount">
                     <Icon name="heroicons-table-cells" class="w-3 h-3 inline-block me-1" />
-                    {{ $t('tools.widgetPreview.rows', { count: rowCount }) }}
+                    {{ t('tools.widgetPreview.rows', { count: rowCount }) }}
                   </span>
                 </div>
 
                 <!-- Attempts section -->
                 <div v-if="attempts.length > 0" class="mt-3 border-t border-gray-100 dark:border-gray-800 pt-3 flex-shrink-0">
                   <div
-                    class="flex items-center text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
+                    class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300"
                     @click="attemptsExpanded = !attemptsExpanded"
                   >
                     <Icon :name="attemptsExpanded ? 'heroicons-chevron-down' : 'heroicons-chevron-right'" class="w-3 h-3 me-1.5 rtl-flip" />
-                    <span>{{ $t('tools.widgetPreview.attempts', { count: attempts.length }) }}</span>
+                    <span>{{ t('tools.widgetPreview.attempts', { count: attempts.length }) }}</span>
                   </div>
                   <Transition name="fade">
                     <div v-if="attemptsExpanded" class="mt-2 ms-4">
-                      <ul class="text-xs text-gray-600 dark:text-gray-400 space-y-1.5">
+                      <ul class="text-chat-2 text-gray-600 dark:text-gray-400 space-y-1.5">
                         <li v-for="(att, idx) in attempts" :key="idx" class="flex items-start">
-                          <span class="text-gray-400 me-2 flex-shrink-0">{{ idx + 1 }}.</span>
+                          <span class="text-ink-muted me-2 flex-shrink-0">{{ idx + 1 }}.</span>
                           <span class="text-red-500">{{ att }}</span>
                         </li>
                       </ul>
@@ -358,17 +371,17 @@
               v-if="isExcel && hasDataForDownload"
               class="text-xs px-2 py-0.5 rounded transition-colors flex items-center hover:bg-gray-50 dark:hover:bg-gray-800 text-green-600 hover:text-green-700"
               @click.stop="addToSpreadsheet"
-              :title="$t('tools.widgetPreview.addToSpreadsheetTitle')"
+              :title="t('tools.widgetPreview.addToSpreadsheetTitle')"
             >
               <Icon name="heroicons-table-cells" class="w-3.5 h-3.5 me-1" />
-              {{ $t('tools.widgetPreview.addToSpreadsheet') }}
+              {{ t('tools.widgetPreview.addToSpreadsheet') }}
             </button>
             <span
               v-else-if="canAddToDashboard && isAlreadyInDashboard"
               class="text-xs px-2 py-0.5 rounded flex items-center text-green-600"
             >
               <Icon name="heroicons:check-circle-solid" class="w-3.5 h-3.5 me-1" />
-              {{ $t('tools.widgetPreview.addedToDashboard') }}
+              {{ t('tools.widgetPreview.addedToDashboard') }}
             </span>
             <button
               v-else-if="canAddToDashboard"
@@ -378,7 +391,7 @@
             >
               <Icon v-if="!isAddingToDashboard" name="heroicons:squares-plus" class="w-3.5 h-3.5 me-1" />
               <Icon v-else name="heroicons:arrow-path" class="w-3.5 h-3.5 me-1 animate-spin" />
-              {{ $t('tools.widgetPreview.addToDashboard') }}
+              {{ t('tools.widgetPreview.addToDashboard') }}
             </button>
           </div>
           <div class="flex items-center space-x-2">
@@ -388,11 +401,11 @@
               @click.stop="openEntityModal = true"
             >
               <Icon name="heroicons-bookmark" class="w-3.5 h-3.5 text-blue-500 me-1" />
-              {{ $t('tools.widgetPreview.saveQuery') }}
+              {{ t('tools.widgetPreview.saveQuery') }}
             </button>
             <span v-else class="text-xs flex items-center">
               <Icon name="heroicons-check-badge" class="w-3.5 h-3.5 me-1 text-green-500" />
-              {{ $t('tools.widgetPreview.savedQuery') }}
+              {{ t('tools.widgetPreview.savedQuery') }}
             </span>
           </div>
         </div>
@@ -420,7 +433,13 @@
 import { computed, ref, watch, defineAsyncComponent, inject, onMounted, onUnmounted, unref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useMyFetch } from '~/composables/useMyFetch'
-import { useOrgSettings } from '~/composables/useOrgSettings'
+import { cardHydrationRequest, deriveViewerRun } from '~/utils/viewerRunHydration'
+import {
+  withSentRequests,
+  withSentRequestsAppended,
+  withSourceQueryIds,
+  withSourceQueryIdsAppended,
+} from '~/utils/sentRequests'
 import RenderVisual from '../RenderVisual.vue'
 import RenderTable from '../RenderTable.vue'
 import Spinner from '../Spinner.vue'
@@ -460,9 +479,12 @@ const props = defineProps<{
 }>()
 const emit = defineEmits(['toggleSplitScreen', 'editQuery', 'openDataPanel'])
 
-const { canEditCode } = useOrgSettings()
+// The "edit query" affordance needs both: something to show (`view_code`) and
+// the right to change it (`run_custom_code`, enforced on the run route).
+const canRunCustomCode = useCanRunCustomCode()
+const canViewCode = useCanViewCode()
 const { isExcel } = useExcel()
-const { t } = useI18n()
+const { t } = useResponseI18n()
 const toast = useToast()
 
 // Reactive state for collapsible behavior
@@ -534,6 +556,14 @@ const step = computed(() => {
   }
   return null
 })
+/**
+ * Non-null when this card shows one run_query parameter slice rather than the
+ * query's saved snapshot. Read off the execution so it survives every way the
+ * card gets mounted — inline in the transcript, and the separate component the
+ * side panel mounts from stored state.
+ */
+const viewerRun = computed(() => deriveViewerRun(props.toolExecution))
+
 const stepOverride = ref<any | null>(null)
 const effectiveStep = computed(() => stepOverride.value || step.value)
 
@@ -883,16 +913,55 @@ async function loadReportSnapshotIfNeeded() {
   } catch {}
 }
 
+/**
+ * The step payload this card should display, for every path that refreshes it.
+ *
+ * A viewer-run card shows one parameter slice; the query's default step
+ * answers the saved values, so fetching it would swap the rows out from under
+ * a header that still names the requested params. Re-request the same slice
+ * instead — it is served from the per-viewer cache (StepUserResult, keyed by
+ * the params fingerprint), so this is a lookup, not a re-execution, and it
+ * returns every row rather than the 20-row serialized preview.
+ *
+ * Identity-sourced values are dropped before submitting: the server resolves
+ * those from the session and rejects any the client sends.
+ */
+async function fetchCardStep(): Promise<any | null> {
+  const req = cardHydrationRequest({
+    viewerRun: viewerRun.value,
+    queryId: queryId.value,
+    currentApplied: cardAppliedParams.value,
+    paramSpecs: cardParamSpecs.value,
+  })
+  if (!req) return null
+
+  const { data, error } = await useMyFetch(
+    req.url,
+    req.method === 'POST' ? { method: 'POST', body: req.body } : { method: 'GET' },
+  )
+  if (error.value) return null
+
+  if (req.method === 'GET') return ((data.value as any) || {}).step || null
+
+  const res: any = data.value
+  if (!res || res.status === 'error') return null
+  // Keep the card's own view/data_model; only the rows and the values they
+  // answer come from the run.
+  const base = JSON.parse(JSON.stringify(effectiveStep.value || {}))
+  return {
+    ...base,
+    data: res.data || {},
+    applied_params: res.applied_params || req.body?.params || {},
+  }
+}
+
 async function hydrateLatestStep() {
+  const truncatedKey = truncatedStepKey.value
   isHydratingStep.value = true
   try {
-    const qid = queryId.value
-    if (qid) {
-      const { data, error } = await useMyFetch(`/api/queries/${qid}/default_step`, { method: 'GET' })
-      if (!error.value) {
-        const fetched = ((data.value as any) || {}).step || null
-        if (fetched) stepOverride.value = JSON.parse(JSON.stringify(fetched))
-      }
+    if (viewerRun.value?.queryId || queryId.value) {
+      const fetched = await fetchCardStep()
+      if (fetched) stepOverride.value = JSON.parse(JSON.stringify(fetched))
       return
     }
     // No query to resolve (legacy execute tools, deduplicated step payloads):
@@ -905,8 +974,30 @@ async function hydrateLatestStep() {
     }
   } catch {} finally {
     isHydratingStep.value = false
+    // Settled either way: on failure the chart falls back to the preview.
+    if (truncatedKey) settledTruncatedKeys.value.add(truncatedKey)
   }
 }
+
+// The step this card shows is a capped preview (see needsFullStep). Keyed so a
+// failed upgrade is attempted once per step, not on every re-render.
+const truncatedStepKey = computed<string | null>(() => {
+  const s: any = effectiveStep.value
+  if (!s?.data?.truncated) return null
+  return String(s.id || queryId.value || props.toolExecution?.id || 'preview')
+})
+const settledTruncatedKeys = ref(new Set<string>())
+const awaitingFullRows = computed(() =>
+  !!truncatedStepKey.value && !settledTruncatedKeys.value.has(truncatedStepKey.value))
+
+// The host can swap a full step back to its preview after mount (the report
+// page reloads the transcript when a run finishes). Upgrade it again rather
+// than leaving the card on the first rows.
+watch(truncatedStepKey, (key) => {
+  if (!key || isCollapsed.value || isHydratingStep.value) return
+  if (settledTruncatedKeys.value.has(key)) return
+  void hydrateLatestStep()
+})
 
 // Summary/fork cards start collapsed and hydrate when the user opens one.
 // Timeline cards mount already expanded, so they hydrate on mount — but only
@@ -1059,11 +1150,15 @@ const hasData = computed(() => {
   return !!effectiveStep.value
 })
 
-// Check if code is available
-const hasCode = computed(() => !!effectiveStep.value?.code)
+// Check if code is available. The permission is part of the condition, not just
+// the presence of a string: the server already redacts `code` to null, so this
+// is the belt to that braces — a payload cached client-side from before a role
+// change (or optimistic state from the live stream) must not resurrect the tab.
+const hasCode = computed(() => canViewCode.value && !!effectiveStep.value?.code)
 
 // Executed queries from backend (captured from client.execute_query calls)
 const executedQueries = computed(() => {
+  if (!canViewCode.value) return []
   const queries = props.toolExecution?.result_json?.executed_queries
   return Array.isArray(queries) ? queries : []
 })
@@ -1071,13 +1166,42 @@ const executedQueries = computed(() => {
 // Check if we have executed queries to show
 const hasExecutedQueries = computed(() => executedQueries.value.length > 0)
 
+// Per-query timing records; a connector that rewrote a query records the
+// request it actually sent there (`sent_request`). Redacted with the code.
+const queryTimings = computed(() => {
+  if (!canViewCode.value) return []
+  const timings = (props.toolExecution?.result_json as any)?.query_timings
+  return Array.isArray(timings) ? timings : []
+})
+
 // Code to display based on toggle state
 const displayedCode = computed(() => {
   if (showFullCode.value || !hasExecutedQueries.value) {
-    return effectiveStep.value?.code || ''
+    // The request actually sent, when the connector rewrote the query, follows
+    // the code as a comment (the editor is read-only; Edit uses step.code).
+    // The source's own query ids follow as one more comment block.
+    return withSourceQueryIdsAppended(
+      withSentRequestsAppended(
+        effectiveStep.value?.code || '',
+        queryTimings.value,
+        t('tools.widgetPreview.sentRequest'),
+      ),
+      queryTimings.value,
+      t('tools.widgetPreview.sourceQueryId'),
+    )
   }
-  // Join all executed queries with newlines
-  return executedQueries.value.join('\n\n')
+  // Each executed query, followed by the request actually sent when the
+  // connector rewrote it, separated by blank lines.
+  // Then the source's own id for the query, when it reported one.
+  return withSourceQueryIds(
+    withSentRequests(
+      executedQueries.value,
+      queryTimings.value,
+      t('tools.widgetPreview.sentRequest'),
+    ),
+    queryTimings.value,
+    t('tools.widgetPreview.sourceQueryId'),
+  ).join('\n\n')
 })
 
 // Language for Monaco editor based on toggle state
@@ -1402,22 +1526,20 @@ onMounted(() => {
       const detail: any = (ev as any)?.detail || {}
       if (!detail?.query_id) return
       if (String(detail.query_id) !== String(queryId.value || '')) return
-      // Always fetch the latest default step from backend to avoid stale payloads
+      // Always refetch from the backend to avoid stale payloads. On a
+      // viewer-run card that means re-running the same slice against the new
+      // default step — the broadcast payload is the default snapshot, which
+      // answers other values, so it is never adopted there.
       ;(async () => {
         try {
-          const { data, error } = await useMyFetch(`/api/queries/${detail.query_id}/default_step`, { method: 'GET' })
-          if (!error.value) {
-            const fetched = ((data.value as any) || {}).step || null
-            if (fetched) {
-              stepOverride.value = JSON.parse(JSON.stringify(fetched))
-            } else if (detail.step) {
-              stepOverride.value = JSON.parse(JSON.stringify(detail.step))
-            }
-          } else if (detail.step) {
+          const fetched = await fetchCardStep()
+          if (fetched) {
+            stepOverride.value = JSON.parse(JSON.stringify(fetched))
+          } else if (detail.step && !viewerRun.value?.queryId) {
             stepOverride.value = JSON.parse(JSON.stringify(detail.step))
           }
         } catch {
-          if (detail.step) {
+          if (detail.step && !viewerRun.value?.queryId) {
             stepOverride.value = JSON.parse(JSON.stringify(detail.step))
           }
         }
@@ -1437,12 +1559,9 @@ onMounted(() => {
       hydratedVisualization.value = null
       ;(async () => {
         try {
-          const { data, error } = await useMyFetch(`/api/queries/${qid}/default_step`, { method: 'GET' })
-          if (!error.value) {
-            const fetched = ((data.value as any) || {}).step || null
-            if (fetched) {
-              stepOverride.value = JSON.parse(JSON.stringify(fetched))
-            }
+          const fetched = await fetchCardStep()
+          if (fetched) {
+            stepOverride.value = JSON.parse(JSON.stringify(fetched))
           }
         } catch {}
       })()
@@ -1508,14 +1627,10 @@ async function handleEntitySaved() {
 
   // Refresh the step to get the updated created_entity_id
   try {
-    const qid = queryId.value
-    if (qid) {
-      const { data, error } = await useMyFetch(`/api/queries/${qid}/default_step`, { method: 'GET' })
-      if (!error.value) {
-        const fetched = ((data.value as any) || {}).step || null
-        if (fetched) {
-          stepOverride.value = JSON.parse(JSON.stringify(fetched))
-        }
+    if (queryId.value || viewerRun.value?.queryId) {
+      const fetched = await fetchCardStep()
+      if (fetched) {
+        stepOverride.value = JSON.parse(JSON.stringify(fetched))
       }
     }
   } catch (e) {
@@ -1542,7 +1657,7 @@ onMounted(() => {
 }
 
 .widget-title {
-  @apply text-xs font-medium text-gray-700 dark:text-gray-300 select-none;
+  @apply text-chat-2 font-medium text-gray-700 dark:text-gray-300 select-none;
 }
 
 .widget-content {

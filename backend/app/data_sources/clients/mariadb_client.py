@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import pandas as pd
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from typing import List, Generator
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
+from app.data_sources.routines import build_routine_tables, mysql_variants, with_routines
 from app.data_sources.fk_reflection import attach_foreign_keys
 from functools import cached_property
 from urllib.parse import quote_plus
@@ -22,8 +24,10 @@ class MariadbClient(DataSourceClient):
     # of literal dates that go stale when saved code is re-executed.
     relative_date_hint = "Relative dates (MariaDB): CURDATE(), CURDATE() - INTERVAL 7 DAY, DATE_FORMAT(CURDATE(), '%Y-%m-01') for month start; the clock is the DB server's."
 
-    def __init__(self, host, port, database, user, password):
+    def __init__(self, host, port, database, user, password, index_routines: bool = False):
         self.host = host
+        # Opt-in routine indexing (see app.data_sources.routines).
+        self.index_routines = bool(index_routines)
         self.port = port
         self.database = database
         self.user = user
@@ -52,6 +56,8 @@ class MariadbClient(DataSourceClient):
         try:
             engine = get_engine(self.mariadb_uri)
             conn = engine.connect()
+        except IndexingCancelled:
+            raise
         except Exception as e:
             if conn is not None:
                 conn.close()
@@ -94,7 +100,7 @@ class MariadbClient(DataSourceClient):
                     text(sql), {'database': self.database}).fetchall()
 
                 tables = {}
-                for row in result:
+                for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                     table_name, column_name, data_type = row
 
                     if table_name not in tables:
@@ -104,7 +110,10 @@ class MariadbClient(DataSourceClient):
                         TableColumn(name=column_name, dtype=data_type))
                 self._attach_foreign_keys(conn, tables)
             return list(tables.values())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("mariadb catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -128,9 +137,20 @@ class MariadbClient(DataSourceClient):
             key_fn=lambda schema, table: table,
         )
 
-    def get_schemas(self):
-        """Get schemas for all tables in the specified database."""
-        return self.get_tables()
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
+        """Tables and views, then stored procedures and functions (see
+        app.data_sources.routines)."""
+        tables = self.get_tables()
+        return with_routines(tables, lambda: self.get_routines(t.name for t in tables), source="mariadb",
+                             client=self, enabled=self.index_routines)
+
+    def get_routines(self, table_names=()) -> List[Table]:
+        """Stored procedures and functions as schema entries. Tables are named
+        bare (one database per connection), so routines are too."""
+        with self.connect() as conn:
+            variants = mysql_variants(conn, self.database)
+        return build_routine_tables(variants, table_names, lambda schema, name: name)
 
     def prompt_schema(self):
         schemas = self.get_schemas()

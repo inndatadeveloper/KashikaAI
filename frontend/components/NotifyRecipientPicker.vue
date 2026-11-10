@@ -28,24 +28,24 @@
                         class="w-full text-start px-2.5 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-800 flex flex-col"
                         @mousedown.prevent="addMember(member)">
                         <span class="text-gray-900 dark:text-white">{{ member.name || member.email }}</span>
-                        <span v-if="member.name" class="text-[11px] text-gray-400">{{ member.email }}</span>
+                        <span v-if="member.name" class="text-2xs text-ink-muted">{{ member.email }}</span>
                     </button>
                 </div>
             </div>
         </div>
 
         <!-- Optional message -->
-        <input v-model="message" type="text" placeholder="Add a note (optional)"
+        <input v-text-dir v-model="message" type="text" placeholder="Add a note (optional)"
             class="mt-2 w-full border border-gray-200 dark:border-gray-700 rounded-lg px-2.5 py-1.5 text-xs outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500" />
 
         <!-- Send button -->
         <div class="flex items-center justify-between mt-3">
-            <span v-if="sendStatus" class="text-[11px]" :class="sendStatus === 'sent' ? 'text-green-600' : 'text-red-500'">
+            <span v-if="sendStatus" class="text-2xs" :class="sendStatus === 'sent' ? 'text-green-600' : 'text-red-500'">
                 {{ sendStatus === 'sent' ? 'Sent!' : 'Failed to send' }}
             </span>
             <span v-else></span>
             <button @click="send" :disabled="recipients.length === 0 || isSending"
-                class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-500 rounded-lg hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed">
+                class="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed">
                 <Spinner v-if="isSending" class="w-3 h-3" />
                 <Icon v-else name="heroicons:paper-airplane" class="w-3 h-3" />
                 Send
@@ -61,6 +61,8 @@ const props = defineProps<{
     reportId: string
     notificationType: 'share_dashboard' | 'share_conversation' | 'schedule_report'
     shareUrl: string
+    // A dashboard's own notify route (phase 8), which builds its link itself
+    notifyPath?: string
 }>()
 
 const emit = defineEmits<{
@@ -167,7 +169,7 @@ const send = async () => {
     isSending.value = true
     sendStatus.value = null
     try {
-        const res = await useMyFetch(`/reports/${props.reportId}/notify`, {
+        const res = await useMyFetch(props.notifyPath || `/reports/${props.reportId}/notify`, {
             method: 'POST',
             body: {
                 type: props.notificationType,
@@ -178,6 +180,15 @@ const send = async () => {
             },
         })
         if (res.error.value) throw res.error.value
+        // The API reports per-channel outcomes; a 200 means the request was
+        // understood, not that the mail was accepted by a relay. Reporting
+        // "sent" regardless is how a share that never left the building looked
+        // like a success.
+        const failures = ((res.data.value as any)?.errors || []) as any[]
+        if (failures.length) {
+            throw new Error(failures.map((f: any) => f.error).filter(Boolean).join('; ')
+                || 'The mail server rejected the message')
+        }
         sendStatus.value = 'sent'
         toast.add({ title: 'Notifications sent', color: 'green' })
         emit('sent')
@@ -187,9 +198,13 @@ const send = async () => {
             message.value = ''
             sendStatus.value = null
         }, 2000)
-    } catch {
+    } catch (e: any) {
         sendStatus.value = 'failed'
-        toast.add({ title: 'Failed to send notifications', color: 'red' })
+        toast.add({
+            title: 'Failed to send notifications',
+            description: e?.data?.detail || e?.message || undefined,
+            color: 'red',
+        })
     } finally {
         isSending.value = false
     }

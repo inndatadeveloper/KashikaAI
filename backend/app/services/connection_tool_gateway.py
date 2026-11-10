@@ -41,9 +41,11 @@ from app.services.tool_policy_service import (
     resolve_effective_policy,
 )
 
+from app.services.remote_shell_policy import display_policy
+
 logger = logging.getLogger(__name__)
 
-TOOL_CONNECTION_TYPES = ("mcp", "custom_api")
+TOOL_CONNECTION_TYPES = ("mcp", "custom_api", "remote_ssh", "remote_smb")
 
 
 @dataclass
@@ -168,6 +170,10 @@ class ConnectionToolGateway:
         user-resolved ``effective_policy``.
         """
         data_source_ids = [str(i) for i in (data_source_ids or [])]
+        from app.services.connected_application_service import agent_ceiling
+        ceiling = await agent_ceiling(db, organization.id)
+        if ceiling is not None:
+            data_source_ids = [i for i in data_source_ids if i in ceiling]
         if not data_source_ids:
             return []
 
@@ -230,7 +236,7 @@ class ConnectionToolGateway:
                             policy=policy,
                             connection_tool_id=str(ct.id),
                             user_policy=user_policy,
-                            effective_policy=resolve_effective_policy(policy, user_policy),
+                            effective_policy=display_policy(conn, ct.name, policy, user_policy),
                         )
                     )
         return result
@@ -281,36 +287,6 @@ class ConnectionToolGateway:
                 blocked_by_policy="disabled",
             )
 
-        effective = tool.effective_policy or tool.policy
-        if effective == TOOL_POLICY_AUTO:
-            verdict = await self._auto_judge(
-                db, organization, current_user, tool, arguments or {}
-            )
-            if not verdict.approve:
-                return GatewayResult(
-                    success=False,
-                    content_type="text",
-                    error=(
-                        f"Tool '{tool_name}' was declined by automatic policy review: "
-                        f"{verdict.reason or 'not approved'}."
-                    ),
-                    input_schema=tool.input_schema,
-                    blocked_by_policy=TOOL_POLICY_AUTO,
-                )
-        elif effective != TOOL_POLICY_ALLOW and not (
-            effective == TOOL_POLICY_ASK and allow_confirm
-        ):
-            return GatewayResult(
-                success=False,
-                content_type="text",
-                error=(
-                    f"Tool '{tool_name}' is blocked by policy '{effective}' and "
-                    f"cannot be invoked through the MCP gateway."
-                ),
-                input_schema=tool.input_schema,
-                blocked_by_policy=effective,
-            )
-
         # Resolve the Connection ORM object and construct a provider client.
         conn = (
             await db.execute(
@@ -328,11 +304,60 @@ class ConnectionToolGateway:
                 input_schema=tool.input_schema,
             )
 
+        remote_shell = conn.type == "remote_ssh" and tool_name == "execute_shell"
+        if conn.type in ("remote_ssh", "remote_smb"):
+            from app.services.remote_server_access import remote_run_access
+            if not await remote_run_access(db, conn, current_user, [data_source_id]):
+                return GatewayResult(success=False, content_type="text", error="Remote connection access denied", blocked_by_policy="deny")
+        effective = tool.effective_policy or tool.policy
+        if remote_shell:
+            from app.services.remote_shell_policy import effective_shell_policy
+            record = await db.get(ConnectionTool, tool.connection_tool_id)
+            resolution = await ToolPolicyService().resolve_for_run(db, tool=record, data_source_ids=[data_source_id], user=current_user)
+            effective = await effective_shell_policy(db, conn, record, resolution, current_user, arguments or {})
+        if effective == TOOL_POLICY_AUTO:
+            verdict = await self._auto_judge(
+                db, organization, current_user, tool, arguments or {}
+            )
+            if not verdict.approve:
+                return GatewayResult(
+                    success=False,
+                    content_type="text",
+                    error=(
+                        f"Tool '{tool_name}' was declined by automatic policy review: "
+                        f"{verdict.reason or 'not approved'}."
+                    ),
+                    input_schema=tool.input_schema,
+                    blocked_by_policy=TOOL_POLICY_AUTO,
+                )
+        elif effective != TOOL_POLICY_ALLOW and not (
+            effective == TOOL_POLICY_ASK and allow_confirm and not remote_shell
+        ):
+            return GatewayResult(
+                success=False,
+                content_type="text",
+                error=(
+                    f"Tool '{tool_name}' is blocked by policy '{effective}' and "
+                    f"cannot be invoked through the MCP gateway."
+                ),
+                input_schema=tool.input_schema,
+                blocked_by_policy=effective,
+            )
+
         from app.services.connection_service import ConnectionService
 
         try:
             client = await ConnectionService().construct_client(db, conn, current_user)
-            raw = await client.acall_tool(tool_name, arguments or {})
+            from app.data_sources.clients.mcp_client import McpClient, is_read_only_tool
+            if isinstance(client, McpClient):
+                raw = await client.acall_tool(
+                    tool_name, arguments or {},
+                    read_only=is_read_only_tool(getattr(tool, "metadata_json", None)),
+                )
+            elif remote_shell:
+                raw = await client.acall_authorized(tool_name, arguments or {})
+            else:
+                raw = await client.acall_tool(tool_name, arguments or {})
         except BaseException as e:  # noqa: BLE001 — surface provider errors as data
             logger.error("ConnectionToolGateway.execute failed: %s", e, exc_info=True)
             return GatewayResult(

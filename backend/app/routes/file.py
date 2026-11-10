@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from app.dependencies import get_db
 from typing import Optional
+import asyncio
 import os
 import re
 from urllib.parse import quote
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dependencies import get_async_db
 from app.models.report import Report
 from app.ee.audit.service import audit_service
+from app.services import file_access_service as file_access
+from app.services import storage
 
 router = APIRouter(tags=["files"])
 file_service = FileService()
@@ -28,6 +31,26 @@ file_service = FileService()
 @router.post("/files", response_model=FileSchema)
 @requires_permission('manage_files')
 async def upload_file(request: Request, file: UploadFile = File(...), report_id: Optional[str] = Form(None), data_source_id: Optional[str] = Form(None), current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    # Attaching to a report is a write on it: owner only, like posting a
+    # completion. Checked before the bytes hit disk. 404 rather than 403 so
+    # other users' report ids don't leak.
+    if report_id:
+        from sqlalchemy.orm import lazyload
+        target = (await db.execute(
+            select(Report).options(lazyload("*")).where(
+                Report.id == report_id, Report.organization_id == organization.id,
+            )
+        )).scalar_one_or_none()
+        if not file_access.user_owns_report(current_user, target):
+            raise HTTPException(status_code=404, detail="Report not found")
+    # Attaching to an agent's library needs manage on that agent — the same
+    # gate as POST /data_sources/{id}/files.
+    if data_source_id:
+        from app.core.permissions_decorator import check_resource_permissions
+        await check_resource_permissions(
+            db, str(current_user.id), str(organization.id),
+            'data_source', [str(data_source_id)], 'manage',
+        )
     result = await file_service.upload_file(db, file, current_user, organization, report_id, data_source_id)
     try:
         await audit_service.log(
@@ -107,10 +130,10 @@ async def remove_file_from_data_source(
 @router.get("/reports/{report_id}/files", response_model=list[FileSchemaWithCompletionId])
 @requires_permission('manage_files', model=Report)
 async def get_files_by_report(report_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
-    return await file_service.get_files_by_report(db, report_id, organization)
+    return await file_service.get_files_by_report(db, report_id, organization, current_user)
 
 @router.delete("/reports/{report_id}/files/{file_id}")
-@requires_permission('manage_files', model=Report)
+@requires_permission('manage_files', model=Report, owner_only=True)
 async def remove_file_from_report(file_id: str, report_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
     # Capture the filename before removal for the event text.
     _f = await db.get(FileModel, file_id)
@@ -170,7 +193,7 @@ def _content_disposition(kind: str, filename: str) -> str:
 @router.get("/files", response_model=list[FileSchemaWithMetadata])
 @requires_permission('manage_files')
 async def get_files(current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
-    return await file_service.get_files(db, organization)
+    return await file_service.get_files(db, organization, current_user)
 
 @router.get("/files/{file_id}/content")
 @requires_permission('manage_files')
@@ -184,12 +207,7 @@ async def get_file_content(file_id: str, request: Request, current_user: User = 
     except (ValueError, AttributeError):
         raise HTTPException(status_code=404, detail="File not found")
 
-    stmt = select(FileModel).filter(FileModel.id == file_id, FileModel.organization_id == organization.id)
-    result = await db.execute(stmt)
-    file = result.scalar_one_or_none()
-
-    if not file:
-        raise HTTPException(status_code=404, detail="File not found")
+    file = await file_access.get_viewable_file_or_404(db, current_user, organization, file_id)
 
     if not file.path:
         raise HTTPException(status_code=404, detail="File content not found")
@@ -200,7 +218,7 @@ async def get_file_content(file_id: str, request: Request, current_user: User = 
     # directory-traversal sequences, so a tampered DB value can never make
     # open() escape uploads/files/.
     safe_path = os.path.join(os.getcwd(), "uploads", "files", os.path.basename(file.path))
-    if not os.path.exists(safe_path):
+    if not await storage.aensure_local(safe_path):
         raise HTTPException(status_code=404, detail="File content not found")
 
     try:
@@ -237,7 +255,7 @@ def _read_file_bytes_or_404(file: FileModel) -> bytes:
     if not file.path:
         raise HTTPException(status_code=404, detail="File content not found")
     safe_path = os.path.join(os.getcwd(), "uploads", "files", os.path.basename(file.path))
-    if not os.path.exists(safe_path):
+    if not storage.ensure_local(safe_path):
         raise HTTPException(status_code=404, detail="File content not found")
     with open(safe_path, "rb") as _fh:
         return _fh.read()
@@ -254,22 +272,19 @@ async def get_file_embed_token(
     """Mint a short-lived, file-scoped capability token for embedding.
 
     The token lets an artifact sandbox iframe (which can't send an auth header)
-    load this file via GET /files/{id}/embed?token=… . Authorized by org
-    membership here; the token is never persisted (minted fresh per render)."""
+    load this file via GET /files/{id}/embed?token=… . Authorized by the same
+    per-file access rule as /content; the token is never persisted (minted
+    fresh per render)."""
     import uuid as _uuid
     try:
         _uuid.UUID(file_id)
     except (ValueError, AttributeError):
         raise HTTPException(status_code=404, detail="File not found")
 
-    file = (await db.execute(
-        select(FileModel).filter(FileModel.id == file_id, FileModel.organization_id == organization.id)
-    )).scalar_one_or_none()
-    if not file:
-        raise HTTPException(status_code=404, detail="File not found")
+    await file_access.get_viewable_file_or_404(db, current_user, organization, file_id)
 
     from app.core.file_tokens import mint_file_token, file_embed_url
-    token = mint_file_token(file_id)
+    token = mint_file_token(file_id, organization_id=str(organization.id))
     return {"file_id": file_id, "token": token, "url": file_embed_url(file_id, token)}
 
 
@@ -290,24 +305,98 @@ async def get_file_embed(
     except (ValueError, AttributeError):
         raise HTTPException(status_code=404, detail="File not found")
 
-    from app.core.file_tokens import verify_file_token
-    if not verify_file_token(token, file_id):
+    from app.core.file_tokens import decode_file_token
+    claims = decode_file_token(token, file_id)
+    if claims is None:
         raise HTTPException(status_code=403, detail="Invalid or expired file token")
 
-    # Load by id only — the token is the capability, not the session.
+    # The token is the capability, not the session, but it is bound to the
+    # org (and, for published reports, the report) it was minted in; both are
+    # re-checked here against the file itself.
     file = (await db.execute(
         select(FileModel).filter(FileModel.id == file_id)
     )).scalar_one_or_none()
-    if not file:
+    if not file or str(file.organization_id) != str(claims["org"]):
         raise HTTPException(status_code=404, detail="File not found")
+    if claims.get("rid"):
+        from app.models.report import Report as _Report
+        bound_report = (await db.execute(
+            select(_Report.id).where(
+                _Report.id == str(claims["rid"]),
+                _Report.organization_id == str(claims["org"]),
+                _Report.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if bound_report is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        if claims.get("pub"):
+            # Minted through the public link: it is only as good as that link
+            # is now. Re-run the anonymous gate, so turning public sharing off
+            # or unsharing the dashboard revokes it before it expires.
+            from sqlalchemy.orm import lazyload
+            from app.errors import AppError
+            from app.services.report_service import ReportService
+            report_row = (await db.execute(
+                select(_Report).options(lazyload("*")).where(_Report.id == str(claims["rid"]))
+            )).scalar_one()
+            try:
+                await ReportService()._check_visibility(db, report_row, "artifact_visibility", None)
+            except (HTTPException, AppError):
+                raise HTTPException(status_code=403, detail="Invalid or expired file token")
+    if claims.get("rel"):
+        from app.models.artifact_release import ArtifactRelease as _Release
+        bound_release = (await db.execute(
+            select(_Release).where(
+                _Release.id == str(claims["rel"]),
+                _Release.organization_id == str(claims["org"]),
+                _Release.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if bound_release is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        if claims.get("pub"):
+            # Same as above, against the dashboard's own sharing (/d).
+            from app.errors import AppError
+            from app.models.artifact import Artifact as _Artifact
+            from app.services import dashboard_access
+            dashboard = (await db.execute(
+                select(_Artifact).where(_Artifact.id == str(bound_release.artifact_id),
+                                        _Artifact.deleted_at.is_(None))
+            )).scalar_one_or_none()
+            if dashboard is None:
+                raise HTTPException(status_code=403, detail="Invalid or expired file token")
+            try:
+                await dashboard_access.check_visibility(db, dashboard, None)
+            except (HTTPException, AppError):
+                raise HTTPException(status_code=403, detail="Invalid or expired file token")
 
-    content = _read_file_bytes_or_404(file)
+    content = await asyncio.to_thread(_read_file_bytes_or_404, file)
+    media_type = file.content_type or "application/octet-stream"
+    # This is served on the app's own origin and content_type is whatever the
+    # uploader's client claimed, so only passive types render inline (for
+    # <img>/<iframe>); HTML, SVG, scripts and unknowns download instead.
+    inline = _embed_renders_inline(media_type)
     return Response(
         content=content,
-        media_type=file.content_type or "application/octet-stream",
+        media_type=media_type,
         headers={
-            # inline so <img>/<iframe> render it rather than downloading
-            "Content-Disposition": _content_disposition("inline", file.filename or file_id),
+            "Content-Disposition": _content_disposition(
+                "inline" if inline else "attachment", file.filename or file_id
+            ),
             "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+            # Chrome's PDF viewer refuses a sandboxed document, so inline
+            # types get scripts switched off instead of a full sandbox.
+            "Content-Security-Policy": "script-src 'none'; object-src 'self'" if inline else "default-src 'none'; sandbox",
         },
     )
+
+
+_EMBED_INLINE_TYPES = {"application/pdf", "text/csv", "text/plain", "application/json"}
+
+
+def _embed_renders_inline(media_type: str) -> bool:
+    base = media_type.split(";", 1)[0].strip().lower()
+    if base.startswith("image/"):
+        return base != "image/svg+xml"
+    return base in _EMBED_INLINE_TYPES

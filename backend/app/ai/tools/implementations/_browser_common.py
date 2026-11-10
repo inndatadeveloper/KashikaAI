@@ -22,10 +22,14 @@ import ipaddress
 import logging
 import os
 import re
-import socket
 import time
+from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from app.core.egress import Policy, check_host
+from app.core.render_guard import RenderEgressProxy
+from app.core.url_safety import UnsafeURLError
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,29 @@ def _proxy_from_env() -> Optional[Dict[str, str]]:
     return proxy
 
 
+def _preview_cert_spki_pins() -> List[str]:
+    """SPKI hashes (base64 SHA-256) whose certs the artifact-preview browser may
+    trust even when the deployment uses a private/self-signed CA.
+
+    A self-hosted install reaches its own preview origin over its network, often
+    behind a private CA Chromium does not know, so page.goto fails
+    ERR_CERT_AUTHORITY_INVALID and the agent can never watch its own app run. An
+    operator opts in by pinning the deployment CA's SPKI in
+    BOW_ARTIFACT_PREVIEW_CERT_SPKI (comma-separated for a chain/rotation). Only a
+    cert whose public key hash matches is then trusted, so a MITM presenting any
+    other cert -- or a redirect to another host -- still fails the handshake.
+    Unset (the default) keeps strict verification for every deployment."""
+    raw = os.environ.get("BOW_ARTIFACT_PREVIEW_CERT_SPKI", "")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _ignore_https_errors_dev_flag() -> bool:
+    """General web browsing may reach arbitrary external origins; an untrusted
+    cert is accepted there only behind this explicit dev flag (a local MITM
+    debugging proxy), never by default and never for a preview."""
+    return os.environ.get("BOW_BROWSER_IGNORE_HTTPS_ERRORS", "").lower() in ("1", "true", "yes")
+
+
 def chromium_executable() -> Optional[str]:
     """Best-effort path to a pre-installed Chromium, or None to let Playwright
     resolve it. Honors PLAYWRIGHT_BROWSERS_PATH (set in the managed env)."""
@@ -80,6 +107,9 @@ def chromium_executable() -> Optional[str]:
         os.path.join(base, "chromium-*/chrome-linux/chrome"),
         os.path.join(base, "chromium-*/chrome-linux/headless_shell"),
         os.path.join(base, "chromium_headless_shell-*/chrome-linux/headless_shell"),
+        # Newer Playwright builds unpack into *-linux64 folders.
+        os.path.join(base, "chromium-*/chrome-linux64/chrome"),
+        os.path.join(base, "chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell"),
     ):
         hits = sorted(glob.glob(pat))
         if hits:
@@ -182,33 +212,68 @@ def url_matches_patterns(url: str, patterns: List[str]) -> bool:
     return False
 
 
-def _host_is_public(hostname: str, cache: Dict[str, bool]) -> bool:
-    """Resolve `hostname` and return True only if every address is public.
-    Mirrors web_fetch._is_safe_host; cached per session to bound DNS cost."""
-    if hostname in cache:
-        return cache[hostname]
-    ok = True
-    lowered = (hostname or "").lower()
-    if not lowered or lowered == "localhost" or lowered.endswith(".localhost"):
-        ok = False
-    else:
+def host_allowlisted(hostname: str, patterns: List[str]) -> bool:
+    """True if `hostname` is the host of an allowlist pattern (``*.vendor.com``
+    also covers the apex). Host-level: the egress proxy only sees host:port."""
+    host = (hostname or "").lower().rstrip(".")
+    for pat in patterns or []:
+        ph = _pattern_host(pat) or ""
+        if not ph:
+            continue
+        if ph.startswith("*."):
+            if host == ph[2:] or host.endswith(ph[1:]):
+                return True
+        elif host == ph:
+            return True
+    return False
+
+
+def _host_policy(hostname: str, patterns: List[str]) -> Policy:
+    """Admin tier for hosts the admin allowlisted (metadata / link-local
+    always refused, private only with block_private_outbound); public tier
+    for everything else (a page's public CDN assets)."""
+    return Policy.ADMIN if host_allowlisted(hostname, patterns) else Policy.PUBLIC
+
+
+def _host_ok(hostname: str, policy: Policy, cache: Dict[Any, bool]) -> bool:
+    """Resolve `hostname` and validate every address under `policy`
+    (app.core.egress); cached per session to bound DNS cost."""
+    key = (hostname, policy)
+    if key not in cache:
         try:
-            infos = socket.getaddrinfo(hostname, None)
-        except socket.gaierror:
-            ok = False
-        else:
-            for info in infos:
-                try:
-                    ip = ipaddress.ip_address(info[4][0])
-                except ValueError:
-                    ok = False
-                    break
-                if (ip.is_private or ip.is_loopback or ip.is_link_local
-                        or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
-                    ok = False
-                    break
-    cache[hostname] = ok
-    return ok
+            check_host(hostname, policy)
+            cache[key] = True
+        except UnsafeURLError:
+            cache[key] = False
+    return cache[key]
+
+
+def _host_is_public(hostname: str, cache: Dict[Any, bool]) -> bool:
+    """Strict (public) tier; see _host_ok."""
+    return _host_ok(hostname, Policy.PUBLIC, cache)
+
+
+def browser_egress_decider(session: "BrowserSession"):
+    """``decide(host, port)`` for the session's egress proxy: every connection
+    Chromium opens — including redirect hops and service-worker fetches the
+    route handler never sees — is validated and pinned here."""
+    def decide(host: str, port: int):
+        return check_host(host, _host_policy(host, session.patterns))
+    return decide
+
+
+def _is_top_level_document(request) -> bool:
+    """True for a navigation of a page's main frame. Playwright also labels
+    iframe loads as resource_type "document"; those are embedded content
+    (e.g. a reCAPTCHA widget from www.google.com) and must not be treated as
+    the agent leaving the allowlist. Fails closed: if the frame can't be
+    read, treat it as top-level."""
+    if request.resource_type != "document":
+        return False
+    try:
+        return request.frame.parent_frame is None
+    except Exception:
+        return True
 
 
 def _is_link_local_literal(hostname: str) -> bool:
@@ -226,7 +291,14 @@ def get_browser_connection(runtime_ctx: Dict[str, Any]) -> Optional[Tuple[List[s
     """Return (url_patterns, allow_downloads) from the report's first browser
     connection, or None if the report has none attached."""
     report = runtime_ctx.get("report")
-    for ds in (getattr(report, "data_sources", None) or []):
+    return browser_connection_for(getattr(report, "data_sources", None))
+
+
+def browser_connection_for(data_sources) -> Optional[Tuple[List[str], bool]]:
+    """(url_patterns, allow_downloads) of the first browser connection among
+    `data_sources`, or None. Reruns pass the sources they run with (a
+    published dashboard has no report)."""
+    for ds in (data_sources or []):
         for conn in (getattr(ds, "connections", None) or []):
             if getattr(conn, "type", None) != "browser":
                 continue
@@ -264,8 +336,16 @@ class BrowserSession:
         self.context = None
         self.page = None
         self.last_used = time.monotonic()
-        self._host_cache: Dict[str, bool] = {}
+        self._host_cache: Dict[Any, bool] = {}
         self.pending_downloads: List[dict] = []
+        self.scope = None
+        self.preview = None
+        self.frame = None
+        self.action_lock = asyncio.Lock()
+        # Keep connector pages across turns, but reclaim them only after all
+        # executions using them have finished (including exceptional exits).
+        self.active_execution_ids = set()
+        self.egress = None  # RenderEgressProxy when no environment proxy applies
 
     def touch(self):
         self.last_used = time.monotonic()
@@ -281,7 +361,8 @@ class BrowserSessionManager:
 
     async def _evict_idle(self):
         now = time.monotonic()
-        stale = [sid for sid, s in self._sessions.items() if now - s.last_used > SESSION_TTL_S]
+        stale = [sid for sid, s in self._sessions.items()
+                 if not s.preview and not s.active_execution_ids and now - s.last_used > SESSION_TTL_S]
         for sid in stale:
             await self._close(sid)
 
@@ -289,6 +370,11 @@ class BrowserSessionManager:
         s = self._sessions.pop(session_id, None)
         if not s:
             return
+        if s.preview:
+            try:
+                await s.preview.close()
+            except Exception:
+                pass
         for closer in (getattr(s, "context", None), getattr(s, "browser", None)):
             try:
                 if closer:
@@ -300,55 +386,143 @@ class BrowserSessionManager:
                 await s.playwright.stop()
         except Exception:
             pass
+        if getattr(s, "egress", None) is not None:
+            try:
+                await s.egress.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    async def close_session(self, session_id: str):
+        """Close one session by id (the sandbox's per-run browser)."""
+        async with self._lock:
+            await self._close(session_id)
 
     async def close_report(self, report_id: str):
-        await self._close(str(report_id))
+        for sid, s in list(self._sessions.items()):
+            if sid == str(report_id) or (s.scope and s.scope[2] == str(report_id)):
+                await self._close(sid)
 
-    def get(self, session_id: str) -> Optional[BrowserSession]:
+    async def close_preview(self, runtime_ctx):
+        for sid, s in list(self._sessions.items()):
+            if s.preview and s.scope == self.scope_for(runtime_ctx):
+                await self._close(sid)
+
+    def get(self, session_id: str, runtime_ctx=None, *, strict=False) -> Optional[BrowserSession]:
         s = self._sessions.get(session_id)
+        if s and s.scope is not None and (runtime_ctx is None or s.scope != self.scope_for(runtime_ctx, internal=s.preview is not None)):
+            if strict:
+                raise PermissionError("This session cannot be used in the current scope")
+            return None
         if s:
             s.touch()
+            self._track_execution(s, runtime_ctx)
         return s
 
-    async def open(self, report_id: str, patterns: List[str], allow_downloads: bool) -> BrowserSession:
+    @staticmethod
+    def _track_execution(session, runtime_ctx):
+        execution_id = (runtime_ctx or {}).get("agent_execution_id")
+        if not session.preview and execution_id:
+            session.active_execution_ids.add(str(execution_id))
+
+    @staticmethod
+    def scope_for(ctx, *, internal=True):
+        # Connector browsers keep their authorized report session across turns;
+        # an internal preview belongs only to the execution that opened it.
+        # A sub-agent gets its own connector browser, kept across its own turns:
+        # parallel children (and the parent) never drive the same page.
+        execution = str(ctx.get("agent_execution_id") or "") if internal else ""
+        sub_agent = "" if internal else str(ctx.get("sub_agent_id") or "")
+        return tuple(str(getattr(ctx.get(k), "id", "")) for k in ("organization", "user", "report")) + (
+            execution or (f"sub_agent:{sub_agent}" if sub_agent else ""),)
+
+    async def close_execution(self, execution_id):
+        for sid, s in list(self._sessions.items()):
+            if s.preview and s.scope and s.scope[-1] == str(execution_id):
+                await self._close(sid)
+            elif str(execution_id) in s.active_execution_ids:
+                s.active_execution_ids.discard(str(execution_id))
+                s.touch()
+
+    async def open(self, report_id: str, patterns: List[str], allow_downloads: bool, *, runtime_ctx=None, preview=None, viewport=None) -> BrowserSession:
         from playwright.async_api import async_playwright
 
-        session_id = str(report_id)
+        scope = self.scope_for(runtime_ctx, internal=preview is not None) if runtime_ctx else None
+        session_id = str(uuid4()) if scope else str(report_id)
         async with self._lock:
             await self._evict_idle()
-            existing = self._sessions.get(session_id)
+            existing = next((s for s in self._sessions.values() if scope and s.scope == scope and not s.preview), None) if not preview else None
+            if not scope:
+                existing = self._sessions.get(session_id)
             if existing:
                 existing.touch()
+                self._track_execution(existing, runtime_ctx)
                 existing.patterns = patterns  # pick up config edits
                 existing.allow_downloads = allow_downloads
                 return existing
             if len(self._sessions) >= MAX_CONCURRENT_SESSIONS:
-                # Evict the least-recently-used to honor the cap.
-                lru = min(self._sessions.values(), key=lambda s: s.last_used)
-                await self._close(lru.session_id)
+                idle = [s for s in self._sessions.values() if not s.preview and not s.active_execution_ids]
+                if not idle:
+                    raise RuntimeError("Browser capacity is busy with active sessions; retry when a session is available")
+                await self._close(min(idle, key=lambda s: s.last_used).session_id)
 
             s = BrowserSession(session_id, patterns, allow_downloads)
-            s.playwright = await async_playwright().start()
-            launch_kwargs: Dict[str, Any] = {"headless": True}
-            exe = chromium_executable()
-            if exe:
-                launch_kwargs["executable_path"] = exe
-            proxy = _proxy_from_env()
-            if proxy:
-                launch_kwargs["proxy"] = proxy
-            s.browser = await s.playwright.chromium.launch(**launch_kwargs)
-            ctx_kwargs: Dict[str, Any] = {
-                "viewport": DEFAULT_VIEWPORT,
-                "accept_downloads": allow_downloads,
-            }
-            # Sandbox/dev only: trust a MITM proxy's cert. Never set in prod.
-            if os.environ.get("BOW_BROWSER_IGNORE_HTTPS_ERRORS", "").lower() in ("1", "true", "yes"):
-                ctx_kwargs["ignore_https_errors"] = True
-            s.context = await s.browser.new_context(**ctx_kwargs)
-            await self._install_guard(s)
-            s.page = await s.context.new_page()
+            s.scope = scope
+            s.preview = preview
+            self._track_execution(s, runtime_ctx)
             self._sessions[session_id] = s
-            return s
+            try:
+                s.playwright = await async_playwright().start()
+                launch_kwargs: Dict[str, Any] = {"headless": True}
+                exe = chromium_executable()
+                if exe:
+                    launch_kwargs["executable_path"] = exe
+                # An artifact preview reaches only the deployment's own origin.
+                # On a self-hosted install with a private CA, an operator may pin
+                # that CA's SPKI so Chromium trusts exactly that cert -- not any
+                # cert, which would let a MITM forge the page the agent verifies,
+                # and unlike a blanket bypass it is off unless explicitly set.
+                if preview:
+                    pins = _preview_cert_spki_pins()
+                    if pins:
+                        launch_kwargs.setdefault("args", []).append(
+                            "--ignore-certificate-errors-spki-list=" + ",".join(pins)
+                        )
+                proxy = _proxy_from_env()
+                if proxy:
+                    # The deployment's egress proxy resolves names and is the
+                    # control point; the route guard below still applies.
+                    launch_kwargs["proxy"] = proxy
+                elif not preview:
+                    # Route handlers never see redirect hops; this local proxy
+                    # does, and pins each connection to a validated address.
+                    # (An internal artifact preview only ever reaches the
+                    # app's own origin — its route handler fulfils or aborts
+                    # everything else — so it needs no proxy.)
+                    s.egress = RenderEgressProxy(browser_egress_decider(s), label="browser tool")
+                    await s.egress.__aenter__()
+                    launch_kwargs.update(s.egress.launch_kwargs())
+                s.browser = await s.playwright.chromium.launch(**launch_kwargs)
+                ctx_kwargs: Dict[str, Any] = {
+                    "viewport": viewport or DEFAULT_VIEWPORT,
+                    "accept_downloads": allow_downloads,
+                    "service_workers": "block" if preview else "allow",
+                }
+                # General browsing may reach arbitrary external origins; trust an
+                # untrusted cert there only behind the dev flag, never for a
+                # preview (which pins its own CA above instead). See the helpers.
+                if not preview and _ignore_https_errors_dev_flag():
+                    ctx_kwargs["ignore_https_errors"] = True
+                s.context = await s.browser.new_context(**ctx_kwargs)
+                await self._install_guard(s)
+                if preview:
+                    await s.context.route("**/*", preview.route)
+                    await s.context.route_web_socket("**/*", lambda ws: ws.close())
+                s.page = await s.context.new_page()
+                return s
+            except BaseException:
+                await self._close(session_id)
+                raise
+
 
     async def _install_guard(self, s: BrowserSession):
         """Confine every request to the allowlist; refuse link-local always and
@@ -362,11 +536,16 @@ class BrowserSessionManager:
                     return
                 allowed = url_matches_patterns(url, s.patterns)
                 if allowed:
-                    await route.continue_()
+                    # Allowlisted is not a pass for metadata: admin tier.
+                    if await asyncio.to_thread(_host_ok, host, Policy.ADMIN, s._host_cache):
+                        await route.continue_()
+                    else:
+                        await route.abort()
                     return
                 # Not allowlisted: permit only if it is a public host (lets a
-                # page pull public CDN assets) and never for the main document.
-                if request.resource_type == "document":
+                # page pull public CDN assets and embed public iframes such
+                # as reCAPTCHA) and never for a top-level page.
+                if _is_top_level_document(request):
                     await route.abort()
                     return
                 if await asyncio.to_thread(_host_is_public, host, s._host_cache):
@@ -474,7 +653,7 @@ async def _restore_secret_inputs(page, saved_values):
         pass
 
 
-async def build_snapshot(page, *, full: bool = False, max_chars: int = 8000) -> Tuple[str, bool]:
+async def build_snapshot(page, *, full: bool = False, max_chars: int = 8000, root=None) -> Tuple[str, bool]:
     """Return (snapshot_text, truncated). Secret-shaped input values are blanked
     for the duration of the snapshot so they never appear in the tree."""
     saved = None
@@ -486,10 +665,10 @@ async def build_snapshot(page, *, full: bool = False, max_chars: int = 8000) -> 
     except Exception:
         saved = None
     try:
-        snap = await page.locator("body").aria_snapshot(mode="ai")
+        snap = await (root if root is not None else page.locator("body")).aria_snapshot(mode="ai")
     except Exception:
         try:
-            snap = await page.locator("body").aria_snapshot()
+            snap = await (root if root is not None else page.locator("body")).aria_snapshot()
         except Exception:
             snap = ""
     finally:
@@ -504,12 +683,20 @@ async def build_snapshot(page, *, full: bool = False, max_chars: int = 8000) -> 
 
     if not full:
         # Drop pure structural containers with no accessible name to shrink the tree.
+        # Their children move up one level per dropped ancestor, so the filtered
+        # tree keeps the real nesting (a dropped list after an alert must not put
+        # its items under that alert).
         lines = []
+        dropped = []  # indents of the dropped containers enclosing the current line
         for ln in snap.splitlines():
             stripped = ln.strip()
-            if re.match(r'^-\s+(generic|group|paragraph|list|listitem)\s+\[ref=', stripped) and '"' not in stripped:
+            indent = len(ln) - len(ln.lstrip(" "))
+            while dropped and indent <= dropped[-1]:
+                dropped.pop()
+            if re.fullmatch(r'-\s+(generic|group|paragraph|list|listitem)\s+\[ref=[^\]]+\]:?', stripped):
+                dropped.append(indent)
                 continue
-            lines.append(ln)
+            lines.append(ln[min(indent, 2 * len(dropped)):] if stripped else ln)
         snap = "\n".join(lines)
 
     truncated = False

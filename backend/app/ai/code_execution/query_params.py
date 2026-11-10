@@ -19,7 +19,8 @@ import ast
 import hashlib
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.schemas.param_schema import (
@@ -53,6 +54,81 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+
 _NUM_RE = re.compile(r"^-?\d+(\.\d+)?$")
 
 
+def _parse_iso_temporal(value: str) -> date | datetime:
+    # fromisoformat normalizes offset minutes such as +01:60; reject them.
+    offset = re.search(r"[+-](\d{2}):?(\d{2})$", value) if len(value) > 10 else None
+    if offset and (int(offset[1]) > 23 or int(offset[2]) > 59):
+        raise ValueError("invalid UTC offset")
+    return date.fromisoformat(value) if len(value) == 10 else datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _temporal_key(value: str) -> tuple[str, int, Decimal]:
+    """Compare ISO bounds without discarding sub-microsecond precision."""
+    parsed = _parse_iso_temporal(value)
+    seconds = parsed.toordinal() * 86400
+    if not isinstance(parsed, datetime):
+        return "date", seconds, Decimal(0)
+    seconds += parsed.hour * 3600 + parsed.minute * 60 + parsed.second
+    offset = parsed.utcoffset()
+    if offset is not None:
+        seconds -= int(offset.total_seconds())
+    fraction = re.search(r"\.(\d+)", value)
+    return ("aware" if offset is not None else "naive"), seconds, (Decimal("0." + fraction[1]) if fraction else Decimal(0))
+
+
+def calendar_date_bounds(value: Any) -> tuple[str | None, str | None]:
+    """Calendar-only [from, day-after-to) bounds for DATE/local timestamp queries.
+
+    No timezone conversion or SQL generation. Zoned timestamp columns require
+    explicit source/report timezone conversion in the connector's SQL. Exact
+    timestamp ranges must not use this calendar helper.
+    """
+    bounds = coerce_param_value(ParamSpec(name="date_range", type="date_range"), value) or {}
+    if any(len(v) != 10 for v in bounds.values()):
+        raise ParamError("calendar_date_bounds accepts calendar dates only, not timestamps")
+    start, end = bounds.get("from"), bounds.get("to")
+    if start and end and start > end:
+        raise ParamError("calendar_date_bounds: range 'from' must not be after 'to'")
+    try:
+        exclusive_end = (date.fromisoformat(end) + timedelta(days=1)).isoformat() if end else None
+    except OverflowError as exc:
+        raise ParamError("date range upper bound has no representable following day") from exc
+    return start, exclusive_end
+
+
+def date_range_issue(value: Any) -> str | None:
+    """Diagnose range semantics without changing legacy query execution.
+
+    Each endpoint retains its own date/timezone convention. Mixed conventions
+    need source-specific interpretation, so never invent a conversion or order.
+    """
+    try:
+        bounds = coerce_param_value(ParamSpec(name="date_range", type="date_range"), value) or {}
+    except ParamError:
+        return "invalid_date_range"
+    if "from" not in bounds or "to" not in bounds:
+        return None
+    start, end = (_temporal_key(bounds[k]) for k in ("from", "to"))
+    if start[0] != end[0]:
+        return "mixed_date_range"
+    if start[1:] > end[1:]:
+        return "reversed_date_range"
+    return None
+
+
+def param_values_equal(spec: ParamSpec, expected: Any, applied: Any) -> bool:
+    """Compare semantic values without changing stored/executed representations."""
+    try:
+        left, right = (coerce_param_value(spec, v) for v in (expected, applied))
+        if spec.type == "date":
+            return (_temporal_key(left) if left else None) == (_temporal_key(right) if right else None)
+        if spec.type == "date_range":
+            return {k: _temporal_key(v) for k, v in (left or {}).items()} == {k: _temporal_key(v) for k, v in (right or {}).items()}
+        return left == right
+    except (ParamError, ValueError, TypeError):
+        return False
+
+
 def _coerce_scalar(spec: ParamSpec, value: Any) -> Any:
     t = spec.type
     if value is None:
@@ -72,6 +148,10 @@ def _coerce_scalar(spec: ParamSpec, value: Any) -> Any:
         s = str(value).strip()
         if not _DATE_RE.match(s):
             raise ParamError(f"param '{spec.name}': '{value}' is not an ISO date")
+        try:
+            _parse_iso_temporal(s)
+        except ValueError as exc:
+            raise ParamError(f"param '{spec.name}': '{value}' is not a valid ISO date/timestamp") from exc
         return s
     if t in ("string", "id"):
         if isinstance(value, (dict, list)):
@@ -97,6 +177,10 @@ def coerce_param_value(spec: ParamSpec, value: Any) -> Any:
             raise ParamError(
                 f"param '{spec.name}': date_range must be an object with 'from'/'to'"
             )
+        # This also executes existing saved queries: retain their wire contract.
+        # UI metadata is discarded and valid bounds keep their original order
+        # and conventions. Semantic checks belong to the opt-in calendar helper
+        # and verification, not a new global rejection of legacy inputs.
         out = {}
         for k in ("from", "to"):
             if value.get(k) is not None:
@@ -186,6 +270,18 @@ def resolve_param_values(
             raise ParamError(f"param '{spec.name}' is required")
         resolved[spec.name] = value
     return resolved
+
+
+def missing_required_inputs(specs: List[ParamSpec], values: Optional[Dict[str, Any]]) -> List[str]:
+    """Required `input` params with no default that `values` leaves empty (absent or None).
+
+    The run must not happen without them: Publish and a refresh leave such a
+    step unrun, and a reader's run waits for the reader's value. Identity
+    params are never "missing" here -- they bind the runner as before.
+    """
+    values = values or {}
+    return [s.name for s in specs
+            if s.source == "input" and s.required and s.default is None and values.get(s.name) is None]
 
 
 # ---------------------------------------------------------------------------
@@ -351,13 +447,74 @@ def check_params_not_formatted(code: str) -> Optional[str]:
     return None
 
 
+def check_date_range_code(code: str, specs: List[ParamSpec]) -> List[str]:
+    """Catch literal wrong-bound reads before a null-default preview hides them.
+
+    Conservative static check, not a proof that arbitrary Python applies a filter.
+    Track straight-line aliases within each function; reassignment clears them.
+    """
+    names = {s.name for s in specs if s.type == "date_range"}
+    if not names:
+        return []
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+    errors = set()
+
+    class Reads(ast.NodeVisitor):
+        def __init__(self):
+            self.aliases = set()
+
+        def is_range(self, node):
+            if isinstance(node, ast.Name):
+                return node.id in self.aliases
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+                return self.is_range(node.values[0]) and all(isinstance(v, ast.Dict) and not v.keys for v in node.values[1:])
+            base, key = self.lookup(node)
+            return isinstance(base, ast.Name) and base.id == "params" and key in names
+
+        @staticmethod
+        def lookup(node):
+            if isinstance(node, ast.Subscript):
+                return node.value, node.slice.value if isinstance(node.slice, ast.Constant) else None
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and node.args:
+                return node.func.value, node.args[0].value if isinstance(node.args[0], ast.Constant) else None
+            return None, None
+
+        def visit_FunctionDef(self, node):
+            previous = self.aliases
+            self.aliases = set()
+            for stmt in node.body:
+                self.visit(stmt)
+            self.aliases = previous
+
+        def visit_Assign(self, node):
+            self.visit(node.value)
+            is_range = self.is_range(node.value)
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.aliases.discard(target.id)
+                    if is_range:
+                        self.aliases.add(target.id)
+
+        def visit(self, node):
+            base, key = self.lookup(node)
+            if base is not None and key is not None and self.is_range(base) and key not in ("from", "to"):
+                errors.add("date_range uses 'from'/'to', not " + repr(key) + "; use calendar_date_bounds for inclusive calendar dates and open bounds")
+            return super().visit(node)
+
+    Reads().visit(tree)
+    return sorted(errors)
+
+
 def check_declarations_vs_code(code: str, specs: List[ParamSpec]) -> List[str]:
     """Consistency errors between declarations and the code's params usage.
 
     Declared-but-unreferenced params would render dead controls in the UI;
     referenced-but-undeclared names would never receive a value. Only applies
     when the code opts into params (declares the argument)."""
-    errors: List[str] = []
+    errors: List[str] = check_date_range_code(code, specs)
     declared = {s.name for s in specs}
     referenced = extract_code_param_names(code)
     if not code_accepts_params(code):
@@ -373,28 +530,93 @@ def check_declarations_vs_code(code: str, specs: List[ParamSpec]) -> List[str]:
     return errors
 
 
+_SQL_COMMENT_RE = re.compile(
+    r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")|--[^\n]*|/\*.*?\*/", re.S
+)
+_SQL_READS_RE = re.compile(r"\bFROM\b", re.I)
+_SQL_START_RE = re.compile(r"^\s*(\(\s*)*(SELECT|WITH|VALUES|SET|SHOW|DESCRIBE|DESC|EXPLAIN|PRAGMA|USE)\b", re.I)
+_SQL_PREDICATE_RE = re.compile(r"\b(WHERE|ON|HAVING|QUALIFY|USING)\b", re.I)
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Drop ``--`` and ``/* */`` comments, leaving quoted literals intact (a
+    ``--`` inside a string is data, not a comment)."""
+    return _SQL_COMMENT_RE.sub(lambda m: m.group(1) or " ", sql)
+
+
+def _heuristic_binds_value(capture: str, needles: List[str]) -> bool:
+    """Legacy text heuristic: whether one executed query carries an identity
+    value where it can actually filter rows. Used only when the structural
+    check (identity_bind.structural_binds) cannot decide.
+
+    SQL: the value must appear AFTER a predicate keyword (WHERE/ON/HAVING/...),
+    once comments are stripped — a value echoed in the SELECT list or hidden in
+    a comment scopes nothing. Non-SQL captures (structured/keyword calls to
+    API connectors) have no grammar to check, so containment is all we can
+    ask. This is a heuristic backstop, not a proof: ``WHERE 'x' = 'x'`` still
+    satisfies it. Hard isolation belongs in the database (RLS / per-user
+    credentials)."""
+    if not _SQL_START_RE.match(_strip_sql_comments(capture)):
+        return any(n in capture for n in needles)
+    sql = _strip_sql_comments(capture)
+    if not _SQL_READS_RE.search(sql):
+        # Reads no table (``SELECT 1``, ``SET ...``): no rows to leak.
+        return True
+    first = _SQL_PREDICATE_RE.search(sql)
+    if first is None:
+        return False
+    tail = sql[first.start():]
+    return any(n in tail for n in needles)
+
+
+def _query_binds_value(capture: str, needles: List[str], param: str = "") -> bool:
+    """Whether one executed query restricts its rows by an identity value.
+
+    Structural first (sqlglot for SQL/SOQL, a small tokenizer for Splunk SPL —
+    see identity_bind); when the structure can't be decided (parse error,
+    unsupported shape, non-SQL API capture) falls back to the legacy text
+    heuristic, unchanged, and logs a structured warning."""
+    from app.ai.code_execution.identity_bind import log_fallback, structural_binds
+
+    client_type = getattr(capture, "client_type", None)
+    stripped = _strip_sql_comments(capture)
+    looks_sql = bool(_SQL_START_RE.match(stripped))
+    verdict = structural_binds(str(capture), client_type, tuple(needles), looks_sql)
+    if verdict is not None:
+        return verdict
+    if looks_sql or client_type == "SplunkClient":
+        log_fallback(str(capture), client_type, param)
+    return _heuristic_binds_value(capture, needles)
+
+
 def verify_identity_binds_in_queries(
     captured_queries: List[str],
     values: Dict[str, Any],
     specs: List[ParamSpec],
 ) -> Optional[str]:
     """Post-execution check: every identity-locked param whose value is set
-    must appear (as its rendered literal content) in at least one executed
-    query. Prevents "the LLM forgot the WHERE clause" from silently serving
-    unscoped rows to a viewer. Returns an error message or None."""
-    identity_specs = [s for s in specs if s.source == "identity"]
-    if not identity_specs or not captured_queries:
+    must be applied, as a filter, in EVERY executed query that reads a table.
+    Prevents "the LLM forgot the WHERE clause" from silently serving unscoped
+    rows to a viewer — including the multi-query case where one query is
+    scoped and another is not. Code that issues no query at all (params
+    applied in pandas over files or a BOW source) has nothing to verify here
+    and passes, as before. Returns an error message or None."""
+    identity_specs = [
+        s for s in specs
+        if s.source == "identity" and values.get(s.name) not in (None, "", [])
+    ]
+    if not identity_specs:
         return None
-    haystack = "\n".join(q for q in captured_queries if isinstance(q, str))
+    queries = [q for q in (captured_queries or []) if isinstance(q, str) and q.strip()]
+    if not queries:
+        return None
     for spec in identity_specs:
         value = values.get(spec.name)
-        if value in (None, "", []):
-            continue
-        needles = value if isinstance(value, list) else [value]
-        found = any(str(n) in haystack for n in needles if n not in (None, ""))
-        if not found:
-            return (
-                f"identity parameter '{spec.name}' was not applied in any executed query; "
-                "refusing to serve unscoped results"
-            )
+        needles = [str(n) for n in (value if isinstance(value, list) else [value]) if n not in (None, "")]
+        for q in queries:
+            if not _query_binds_value(q, needles, spec.name):
+                return (
+                    f"identity parameter '{spec.name}' was not applied as a filter in every "
+                    "executed query; refusing to serve unscoped results"
+                )
     return None

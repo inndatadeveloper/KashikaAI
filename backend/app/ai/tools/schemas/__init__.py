@@ -13,7 +13,9 @@ from .create_instruction import CreateInstructionInput, CreateInstructionOutput
 from .edit_instruction import EditInstructionInput, EditInstructionOutput
 from .create_artifact import CreateArtifactInput, CreateArtifactOutput
 from .read_artifact import ReadArtifactInput, ReadArtifactOutput
+from .read_artifact_activity import ReadArtifactActivityInput, ReadArtifactActivityOutput
 from .read_query import ReadQueryInput, ReadQueryOutput, ReadQueryResult
+from .run_query import RunQueryInput, RunQueryOutput, MissingParam
 from .add_parameter import AddParameterInput, AddParameterOutput
 from .search_reports import SearchReportsInput, SearchReportsOutput, SearchReportsItem
 from .read_report import (
@@ -28,8 +30,12 @@ from .create_doc import CreateDocInput, CreateDocOutput
 from .edit_doc import EditDocInput, EditDocOutput, DocEditOp
 from .create_note import CreateNoteInput, CreateNoteOutput
 from .edit_note import EditNoteInput, EditNoteOutput, NoteEditOp
-from .update_user_memory import UpdateUserMemoryInput, UpdateUserMemoryOutput
-from .search_mcps import SearchMCPsInput, SearchMCPsOutput
+from .memory import (
+    CreateMemoryInput, CreateMemoryOutput, EditMemoryInput, EditMemoryOutput,
+    SearchMemoryInput, SearchMemoryOutput,
+)
+from .search_tools import SearchToolsInput, SearchToolsOutput
+from .call_tool import CallToolInput, CallToolOutput
 from .execute_mcp import ExecuteMCPInput, ExecuteMCPOutput
 from .list_mcp_resources import ListMcpResourcesInput, ListMcpResourcesOutput
 from .read_mcp_resource import ReadMcpResourceInput, ReadMcpResourceOutput
@@ -58,6 +64,8 @@ from .events import (
 )
 
 __all__ = [
+    "ReadArtifactActivityInput",
+    "ReadArtifactActivityOutput",
     "CreateWidgetInput",
     "CreateWidgetOutput",
     "CreateDataInput",
@@ -85,6 +93,9 @@ __all__ = [
     "ReadArtifactInput",
     "ReadArtifactOutput",
     "ReadQueryInput",
+    "RunQueryInput",
+    "RunQueryOutput",
+    "MissingParam",
     "ReadQueryOutput",
     "ReadQueryResult",
     "SearchReportsInput",
@@ -96,8 +107,10 @@ __all__ = [
     "ReadReportArtifact",
     "EditArtifactInput",
     "EditArtifactOutput",
-    "SearchMCPsInput",
-    "SearchMCPsOutput",
+    "SearchToolsInput",
+    "CallToolInput",
+    "SearchToolsOutput",
+    "CallToolOutput",
     "ExecuteMCPInput",
     "ExecuteMCPOutput",
     "ListMcpResourcesInput",

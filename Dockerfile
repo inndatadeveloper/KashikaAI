@@ -5,9 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
-      python3 \
-      python3-venv \
-      python3-dev \
+      ca-certificates \
       build-essential \
       libpq-dev \
       gcc \
@@ -22,17 +20,28 @@ WORKDIR /app/backend
 # independently of application source changes.
 COPY ./backend/pyproject.toml ./backend/uv.lock ./
 
-# Create and use a virtual environment for dependencies
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:0.10.9 /uv /usr/local/bin/uv
+
+# Python 3.13 from uv's standalone builds (Ubuntu 24.04 only ships 3.12).
+# Installed under /opt/python so the runtime stage can copy it to the same
+# path and the venv's interpreter symlink keeps resolving.
+ARG PYTHON_VERSION=3.13
+ENV UV_PYTHON_INSTALL_DIR=/opt/python \
+    UV_PYTHON_PREFERENCE=only-managed
+RUN uv python install ${PYTHON_VERSION} && \
+    uv venv --python ${PYTHON_VERSION} /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # Install locked main deps into the venv; dev group excluded from image.
 # The kerberos extra (python-gssapi) enables per-user constrained delegation
 # (S4U) for on-prem SQL Server SSO; it builds against libkrb5-dev above.
 RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --frozen --no-dev --no-install-project --extra kerberos
+
+# pyspark is used only as a Spark Connect client (gRPC to a remote cluster), so
+# its ~250 bundled JVM jars (324 MB) never run — the image has no Java. They
+# carried most of the image's critical/high CVEs (netty, jackson, avro, ...).
+RUN rm -rf /opt/venv/lib/python3*/site-packages/pyspark/jars
 
 # Copy the full backend source after deps are installed
 COPY ./backend /app/backend
@@ -113,9 +122,13 @@ ENV PIP_NO_CACHE_DIR=1 \
 # Install Python runtime and minimal system libs. Node.js is no longer
 # needed at runtime: the frontend is pre-generated as static files by the
 # frontend-builder stage and served directly by FastAPI.
-RUN apt-get update && \
+# Bump APT_REFRESH to force a fresh `apt-get upgrade` past the registry
+# build cache when Trivy flags an OS package that already has a fix.
+ARG APT_REFRESH=2026-11-08
+RUN echo "apt refresh: ${APT_REFRESH}" && \
+    apt-get update && \
     apt-get upgrade -y && \
-    apt-get install -y --no-install-recommends curl ca-certificates gnupg git openssh-client python3 python3-venv tini libpq5 vim-tiny && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg git openssh-client tini libpq5 vim-tiny && \
     # Kerberos runtime for Windows Integrated auth to SQL Server: GSSAPI libs
     # for the ODBC driver / python-gssapi, plus kinit/klist for keytab ops.
     # Mount /etc/krb5.conf and a keytab (see docs/sql-server-kerberos.md).
@@ -182,10 +195,13 @@ RUN groupadd -r app \
     && mkdir -p /home/app /app/backend/db /app/frontend \
     && chown -R app:app /app /home/app
 
-# Copy Python virtual environment and application code
+# Copy the Python interpreter, virtual environment and application code
+COPY --from=backend-builder /opt/python /opt/python
 COPY --from=backend-builder --chown=app:app /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 COPY --from=backend-builder --chown=app:app /app/backend /app/backend
+# Administrator-installable remote readers; never auto-installed on target hosts.
+COPY ./tools/remote_server /app/tools/remote_server
 
 # Streaming QVD → Parquet converter (bounded RAM; replaces in-process qvdrs wheel)
 COPY --from=qvd2parquet-builder /build/qvd2parquet/target/release/qvd2parquet /usr/local/bin/qvd2parquet
@@ -221,7 +237,7 @@ RUN mkdir -p /app/certs && \
 # These paths match volume mounts in docker-compose.yaml; they must exist with
 # app-user ownership so Docker seeds named volumes with writable perms on first run.
 RUN mkdir -p /app/backend/uploads/files /app/backend/uploads/branding \
-             /app/backend/branding_uploads /app/backend/logs && \
+             /app/backend/branding_uploads /app/backend/logs /app/backend/data && \
     chown -R app:app /app
 
 WORKDIR /app

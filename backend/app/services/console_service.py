@@ -1,5 +1,6 @@
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, text, literal, Integer, case, or_, not_
+from sqlalchemy import select, func, text, literal, Integer, case, or_, not_, and_
 from app.models.organization import Organization
 from app.models.user import User
 from app.models.completion import Completion
@@ -15,11 +16,8 @@ from app.schemas.console_schema import (
     TableUsageData, TableUsageMetrics, TableJoinsHeatmap, TableJoinData,
     TopUserData, TopUsersMetrics, RecentNegativeFeedbackData, RecentNegativeFeedbackMetrics,
     TraceData, TraceCompletionData, TraceStepData, TraceFeedbackData,
-    CompactIssuesResponse, CompactIssueItem,
     AgentExecutionSummaryItem, AgentExecutionSummariesResponse,
     LLMUsageMetrics, LLMUsageItem,
-    DiagnosisStatusPoint, DiagnosisTimeSeriesMetrics,
-    DiagnosisUser, DiagnosisUsersResponse
 )
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta, timezone
@@ -50,6 +48,7 @@ from app.models.completion_feedback import CompletionFeedback
 from app.models.step import Step
 from sqlalchemy.orm import aliased
 from app.schemas.console_schema import ToolUsageMetrics, ToolUsageItem
+from app.ai.llm import pricing
 from app.models.llm_usage_record import LLMUsageRecord
 from app.models.llm_model import LLMModel
 from app.models.usage_policy import UsageEvent
@@ -61,6 +60,10 @@ from app.models.group_membership import GroupMembership
 from app.schemas.console_schema import CostMetrics, CostBreakdownItem, CostTimeSeriesPoint
 
 logger = get_logger(__name__)
+
+# "All time" starts on the organization's creation day; this floor only applies
+# to a legacy org row with no created_at at all.
+ALL_TIME_FALLBACK_FLOOR = datetime(2020, 1, 1)
 
 # LLM usage scopes that are NOT part of answering a user's turn. These are
 # background / observability calls recorded against the report for cost
@@ -82,6 +85,9 @@ _NON_TURN_USAGE_SCOPE_PREFIXES = (
 _NON_TURN_USAGE_SCOPES = (
     "tool_call_judge",
     "webhook_classifier",
+    # Agent check-ins: planner/judge are priced on their own check-in card.
+    "checkin_planner",
+    "checkin_judge",
 )
 
 
@@ -96,22 +102,36 @@ def _turn_usage_scope_clause():
     return not_(is_non_turn)
 
 
+def _cache_beside_prompt(provider_type: Optional[str], model_id: Optional[str] = None) -> bool:
+    """Whether a row's cache reads/writes are reported beside prompt_tokens
+    (Anthropic Messages, Bedrock Converse) and so must be added to its total,
+    rather than already counted inside it (OpenAI wire format, which a Claude
+    model behind a custom gateway also uses).
+
+    Delegates to app.ai.llm.pricing so token accounting here, cost accounting
+    in LLMUsageRecorderService and the run rollup follow one rule.
+    """
+    return not pricing.cache_inside_prompt_tokens(provider_type, model_id)
+
+
 def _row_total_tokens_expr():
     """SQLAlchemy per-row token total that doesn't double-count cache, for use
-    inside func.sum(). Mirrors ConsoleService._row_total_tokens: Anthropic
-    reports cache_read/cache_creation SEPARATELY from prompt_tokens (add them
-    in), while OpenAI/Azure fold cache_read into prompt_tokens already (must
-    not re-add, or the cached prefix is counted twice). Other providers record
-    zero cache tokens, so the else-branch is a no-op for them."""
+    inside func.sum(). The SQL form of _cache_beside_prompt: cache is already
+    inside prompt_tokens for the OpenAI wire format (openai and custom always;
+    azure unless it serves a Claude or Gemini deployment) and reported beside
+    it everywhere else. Rows that record no cache tokens make the branch a no-op."""
+    model = func.lower(func.coalesce(LLMUsageRecord.model_id, ""))
+    non_openai_model = or_(*(model.like(f"%{tag}%") for tag in ("claude", "anthropic", "gemini", "bison", "gecko")))
+    cache_inside = or_(
+        LLMUsageRecord.provider_type.in_(("openai", "custom")),
+        and_(LLMUsageRecord.provider_type == "azure", not_(non_openai_model)),
+    )
     return (
         LLMUsageRecord.prompt_tokens
         + LLMUsageRecord.completion_tokens
         + case(
-            (
-                LLMUsageRecord.provider_type == "anthropic",
-                LLMUsageRecord.cache_read_tokens + LLMUsageRecord.cache_creation_tokens,
-            ),
-            else_=0,
+            (cache_inside, 0),
+            else_=LLMUsageRecord.cache_read_tokens + LLMUsageRecord.cache_creation_tokens,
         )
     )
 
@@ -185,27 +205,48 @@ class ConsoleService:
         # Treat naive datetime as UTC-naive
         return dt
 
-    def _normalize_date_range(self, start_date: Optional[datetime], end_date: Optional[datetime]) -> tuple[datetime, datetime]:
-        """Normalize date range to ensure end_date includes the full day"""
-        
+    @staticmethod
+    def all_time_floor(organization: Organization) -> datetime:
+        """The start of "all time" for an organization: the day it was created.
+        Nothing in an org predates the org, so this bounds every query without
+        a `min(created_at)` round trip, and keeps the day-by-day zero-fill in
+        the timeseries endpoints proportional to the org's age."""
+        created = getattr(organization, "created_at", None)
+        if created is None:
+            created = ALL_TIME_FALLBACK_FLOOR
+        return created.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _normalize_date_range(
+        self,
+        start_date: Optional[datetime],
+        end_date: Optional[datetime],
+        organization: Organization,
+    ) -> tuple[datetime, datetime]:
+        """Normalize a date range to whole days (UTC-naive).
+
+        A missing end is "now". A missing start is "all time" — the org's
+        creation day — because that is what every console page sends for its
+        "All time" period. (This used to default to the last 30 days, so "All
+        time" silently showed a month.)
+        """
+
         # Normalize timezone to UTC-naive if provided
         if end_date:
             end_date = self._to_utc_naive(end_date)
         if start_date:
             start_date = self._to_utc_naive(start_date)
 
-        # Default to last 30 days if no dates provided (UTC-naive)
         if not end_date:
             end_date = datetime.utcnow()
         if not start_date:
-            start_date = end_date - timedelta(days=30)
-            
+            start_date = self.all_time_floor(organization)
+
         # Ensure end_date includes the full day (set to end of day)
         end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
-        
-        # Ensure start_date starts from beginning of day  
+
+        # Ensure start_date starts from beginning of day
         start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        
+
         return start_date, end_date
     
     async def get_organization_metrics(
@@ -216,7 +257,7 @@ class ConsoleService:
     ) -> SimpleMetrics:
         """Get organization metrics with optional date filtering"""
 
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
 
         # Base filters
@@ -361,13 +402,12 @@ class ConsoleService:
     ) -> MetricsComparison:
         """Get metrics with previous period comparison"""
         
-        # Default to last 30 days if no dates provided, normalize to UTC-naive
-        end_date = params.end_date or datetime.utcnow()
-        start_date = params.start_date or (end_date - timedelta(days=30))
+        # No start means "all time" (see _normalize_date_range). There is no
+        # period before all time to compare against, so `changes` is empty and
+        # the cards show plain totals instead of a made-up trend.
+        all_time = params.start_date is None
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
 
-        end_date = self._to_utc_naive(end_date)
-        start_date = self._to_utc_naive(start_date)
-        
         # Calculate period length and previous period dates
         period_length = end_date - start_date
         prev_end_date = start_date
@@ -385,7 +425,7 @@ class ConsoleService:
         previous_metrics = await self.get_organization_metrics(db, organization, prev_params)
         
         # Calculate changes
-        changes = self._calculate_changes(current_metrics, previous_metrics)
+        changes = {} if all_time else self._calculate_changes(current_metrics, previous_metrics)
         
         return MetricsComparison(
             current=current_metrics,
@@ -435,7 +475,7 @@ class ConsoleService:
     ) -> TimeSeriesMetrics:
         """Get time-series metrics data for charts"""
 
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
 
         # Build data source filter subquery if needed
@@ -610,188 +650,6 @@ class ConsoleService:
             )
         )
 
-    async def get_compact_issues(
-        self,
-        db: AsyncSession,
-        organization: Organization,
-        params: MetricsQueryParams,
-        page: int = 1,
-        page_size: int = 50,
-        issue_filter: Optional[str] = None
-    ) -> CompactIssuesResponse:
-        """Return compact completion-anchored issues (tool errors or negative feedback)."""
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
-        ds_filter_subquery = self._reports_in_scope(params)
-
-        # Base completions in org and date range
-        base_query = (
-            select(
-                Completion.id.label('completion_id'),
-                Completion.created_at.label('created_at'),
-                Completion.completion.label('completion_content'),
-                Completion.role.label('completion_role'),
-                Report.id.label('report_id'),
-                func.coalesce(User.name, 'Unknown User').label('user_name'),
-                func.coalesce(User.email, '').label('user_email'),
-                Step.id.label('step_id'),
-                Step.status.label('step_status')
-            )
-            .select_from(Completion)
-            .join(Report, Completion.report_id == Report.id)
-            .outerjoin(User, Report.user_id == User.id)
-            .outerjoin(Step, Completion.step_id == Step.id)
-            .where(
-                Report.organization_id == organization.id,
-                Completion.created_at >= start_date,
-                Completion.created_at <= end_date
-            )
-            .order_by(Completion.created_at.desc())
-        )
-        if ds_filter_subquery is not None:
-            base_query = base_query.where(Report.id.in_(ds_filter_subquery))
-
-        result = await db.execute(base_query)
-        base_rows = result.all()
-
-        if not base_rows:
-            return CompactIssuesResponse(
-                items=[],
-                total_items=0,
-                date_range=DateRange(start=start_date.isoformat(), end=end_date.isoformat())
-            )
-
-        completion_ids = [r.completion_id for r in base_rows]
-        step_ids = [r.step_id for r in base_rows if r.step_id]
-
-        # Failed tool executions per step
-        te_rows = []
-        if step_ids:
-            te_query = (
-                select(ToolExecution)
-                .where(
-                    ToolExecution.created_step_id.in_(step_ids),
-                    ToolExecution.success == False
-                )
-                .order_by(
-                    ToolExecution.created_step_id.asc(),
-                    ToolExecution.attempt_number.desc(),
-                    func.coalesce(ToolExecution.completed_at, ToolExecution.created_at).desc()
-                )
-            )
-            te_result = await db.execute(te_query)
-            te_rows = te_result.scalars().all()
-
-        # Keep first failure per step
-        step_id_to_te: Dict[str, ToolExecution] = {}
-        for te in te_rows:
-            if te.created_step_id and te.created_step_id not in step_id_to_te:
-                step_id_to_te[te.created_step_id] = te
-
-        # Negative feedback per completion
-        cf_query = (
-            select(
-                CompletionFeedback.completion_id,
-                CompletionFeedback.direction,
-                CompletionFeedback.message,
-                CompletionFeedback.created_at
-            )
-            .where(
-                CompletionFeedback.completion_id.in_(completion_ids),
-                CompletionFeedback.direction == -1
-            )
-        )
-        cf_result = await db.execute(cf_query)
-        cf_rows = cf_result.all()
-        completion_id_to_cf = {r.completion_id: r for r in cf_rows}
-
-        # Head prompt snippets for reports
-        report_ids = list({r.report_id for r in base_rows})
-        head_prompts: Dict[str, str] = {}
-        if report_ids:
-            hp_query = (
-                select(Completion.report_id, Completion.prompt, Completion.created_at)
-                .where(Completion.report_id.in_(report_ids), Completion.role == 'user')
-                .order_by(Completion.report_id.asc(), Completion.created_at.asc())
-            )
-            hp_result = await db.execute(hp_query)
-            for rep_id, prompt, _ in hp_result.all():
-                if rep_id not in head_prompts:
-                    if isinstance(prompt, dict):
-                        head_prompts[rep_id] = str(prompt.get('content') or '')
-                    else:
-                        head_prompts[rep_id] = str(prompt or '')
-
-        def classify_error(message: Optional[str]) -> str:
-            return self._classify_error_type(message)
-
-        include_all = issue_filter in ('all_queries',)
-
-        items: List[CompactIssueItem] = []
-        for r in base_rows:
-            cf = completion_id_to_cf.get(r.completion_id)
-            te = step_id_to_te.get(r.step_id) if r.step_id else None
-
-            issue_type = None
-            summary_text = None
-            full_message = None
-            tool_name = None
-            tool_action = None
-
-            if te is not None:
-                issue_type = classify_error(te.error_message)
-                full_message = te.error_message or ''
-                summary_text = (str(full_message).split('\n', 1)[0]) if full_message else 'Error'
-                tool_name = te.tool_name
-                tool_action = te.tool_action
-            elif cf is not None:
-                issue_type = 'negative_feedback'
-                full_message = cf.message or ''
-                summary_text = (str(full_message).split('\n', 1)[0]) if full_message else 'Negative feedback'
-            else:
-                if not include_all:
-                    continue
-                issue_type = 'no_issue'
-                # Derive a helpful summary from completion content
-                try:
-                    content_val = r.completion_content
-                    if isinstance(content_val, dict):
-                        content_text = str(content_val.get('content') or content_val.get('text') or '')
-                    else:
-                        content_text = str(content_val or '')
-                    content_text = content_text.strip()
-                    summary_text = content_text.split('\n', 1)[0][:140] if content_text else (r.completion_role.title() + ' Completion' if r.completion_role else 'Completion')
-                except Exception:
-                    summary_text = 'Completion'
-
-            if issue_filter and issue_filter not in ('all', 'all_queries') and issue_type != issue_filter:
-                continue
-
-            items.append(CompactIssueItem(
-                completion_id=str(r.completion_id),
-                created_at=r.created_at,
-                issue_type=issue_type,
-                summary_text=summary_text,
-                full_message=full_message,
-                tool_name=tool_name,
-                tool_action=tool_action,
-                user_name=r.user_name,
-                user_email=r.user_email,
-                head_prompt_snippet=(head_prompts.get(r.report_id) or '')[:140],
-                report_id=str(r.report_id),
-                trace_url=f"/reports/{r.report_id}"
-            ))
-
-        total_items = len(items)
-        start_idx = (page - 1) * page_size
-        end_idx = start_idx + page_size
-        paged = items[start_idx:end_idx]
-
-        return CompactIssuesResponse(
-            items=paged,
-            total_items=total_items,
-            date_range=DateRange(start=start_date.isoformat(), end=end_date.isoformat())
-        )
-
     async def get_table_usage_metrics(
         self, 
         db: AsyncSession, 
@@ -800,7 +658,7 @@ class ConsoleService:
     ) -> TableUsageMetrics:
         """Get table usage statistics using precomputed TableStats within date range"""
 
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
 
         # TableStats carries its own data_source_id, so the agent filter applies
@@ -869,7 +727,7 @@ class ConsoleService:
     ) -> TableJoinsHeatmap:
         """Get table joins heatmap showing which tables are used together"""
 
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         ds_filter_subquery = self._reports_in_scope(params)
 
         # Get all steps within date range for this organization
@@ -945,7 +803,7 @@ class ConsoleService:
         params: MetricsQueryParams
     ) -> ToolUsageMetrics:
         """Count tool executions for specific tools within date range, mapped to friendly labels."""
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
 
         # Build data source filter subquery if needed
@@ -1007,7 +865,7 @@ class ConsoleService:
         params: MetricsQueryParams
     ) -> LLMUsageMetrics:
         """Aggregate token/cost usage per LLM model for the selected date range."""
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         ds_report_ids = self._reports_in_scope(params)
 
         total_cost_expr = func.coalesce(func.sum(LLMUsageRecord.total_cost_usd), 0)
@@ -1029,6 +887,8 @@ class ConsoleService:
                 completion_tokens_expr.label('completion_tokens'),
                 cache_read_tokens_expr.label('cache_read_tokens'),
                 cache_creation_tokens_expr.label('cache_creation_tokens'),
+                func.coalesce(func.sum(LLMUsageRecord.cache_write_1h_tokens), 0).label('cache_write_1h_tokens'),
+                func.coalesce(func.sum(LLMUsageRecord.reasoning_tokens), 0).label('reasoning_tokens'),
                 input_cost_expr.label('input_cost'),
                 output_cost_expr.label('output_cost'),
                 total_cost_expr.label('total_cost'),
@@ -1072,13 +932,20 @@ class ConsoleService:
             #   - OpenAI/Azure already fold cached tokens INTO prompt_tokens
             #     (and have no cache_creation concept), so adding cache_read
             #     again would over-count. Mirror the cost model's split.
-            if (row.provider_type or "") == "anthropic":
+            # Use the shared family helper rather than the provider string:
+            # Claude on Vertex/Bedrock/Azure reports Anthropic-shaped usage and
+            # was being totalled with the OpenAI rule right here.
+            if _cache_beside_prompt(row.provider_type, row.model_id):
                 row_total_tokens = (
                     prompt_tokens + completion_tokens
                     + cache_read_tokens + cache_creation_tokens
                 )
             else:
                 row_total_tokens = prompt_tokens + completion_tokens
+            row_cache_hit_rate = pricing.cache_hit_rate(
+                prompt_tokens, cache_read_tokens, cache_creation_tokens,
+                row.provider_type, row.model_id,
+            )
             total_calls += int(row.total_calls or 0)
             total_prompt_tokens += prompt_tokens
             total_completion_tokens += completion_tokens
@@ -1100,6 +967,9 @@ class ConsoleService:
                     completion_tokens=completion_tokens,
                     cache_read_tokens=cache_read_tokens,
                     cache_creation_tokens=cache_creation_tokens,
+                    cache_write_1h_tokens=int(getattr(row, "cache_write_1h_tokens", 0) or 0),
+                    reasoning_tokens=int(getattr(row, "reasoning_tokens", 0) or 0),
+                    cache_hit_rate=row_cache_hit_rate,
                     total_tokens=row_total_tokens,
                     input_cost_usd=input_cost,
                     output_cost_usd=output_cost,
@@ -1184,19 +1054,32 @@ class ConsoleService:
         )
 
     # Providers whose pricing we can only estimate (no first-party price feed):
-    # custom/self-hosted, Azure (customer-negotiated), and Bedrock.
-    _ESTIMATED_PROVIDERS = ("custom", "azure", "bedrock")
+    # custom/self-hosted, Azure (customer-negotiated), Bedrock, and Vertex
+    # (per-publisher billing, and third-party MaaS models carry no list price
+    # in our catalog at all).
+    _ESTIMATED_PROVIDERS = ("custom", "azure", "bedrock", "vertex")
 
     def _is_estimated_provider(self, provider_type: Optional[str]) -> bool:
         pt = (provider_type or "").lower()
         return pt in self._ESTIMATED_PROVIDERS or pt.startswith("bedrock")
 
     def _row_total_tokens(self, provider_type: Optional[str], prompt: int, completion: int,
-                          cache_read: int, cache_creation: int) -> int:
-        """Token total that doesn't double-count cache. Mirrors get_llm_usage_metrics:
-        Anthropic reports cache tokens separately (add them in); OpenAI/Azure fold
-        cache_read into prompt_tokens already (don't re-add)."""
-        if (provider_type or "") == "anthropic":
+                          cache_read: int, cache_creation: int,
+                          model_id: Optional[str] = None) -> int:
+        """Token total that doesn't double-count cache.
+
+        Whether cache tokens are additive is a property of the wire format the
+        provider's client speaks (see _cache_beside_prompt): Anthropic's
+        Messages API — first-party, Vertex, Azure — and Bedrock Converse report
+        cache_read/cache_creation beside prompt_tokens; the OpenAI format,
+        including a Claude model behind a custom gateway, already counts them
+        inside it, so re-adding them would count the cached prefix twice.
+
+        ``model_id`` is therefore the primary signal and provider_type the
+        fallback for rows where the caller only has the group's provider (see
+        get_cost_metrics' breakdown, where one group can span several models).
+        """
+        if _cache_beside_prompt(provider_type, model_id):
             return prompt + completion + cache_read + cache_creation
         return prompt + completion
 
@@ -1220,7 +1103,7 @@ class ConsoleService:
         therefore exceed the headline total by design. Records with no
         report/data-source/user/group resolve to an "Unattributed" bucket.
         """
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
         group_by = (group_by or "model").lower()
         if group_by not in ("model", "provider", "user", "data_source", "group", "scope"):
@@ -1243,6 +1126,10 @@ class ConsoleService:
             select(
                 LLMUsageRecord.created_at.label("created_at"),
                 LLMUsageRecord.provider_type.label("provider_type"),
+                # Needed to decide cache-token accounting per row: the model
+                # family, not the host, determines whether cache tokens are
+                # additive (see _row_total_tokens).
+                LLMUsageRecord.model_id.label("model_id"),
                 LLMUsageRecord.prompt_tokens.label("prompt_tokens"),
                 LLMUsageRecord.completion_tokens.label("completion_tokens"),
                 LLMUsageRecord.cache_read_tokens.label("cache_read_tokens"),
@@ -1265,7 +1152,7 @@ class ConsoleService:
             c = int(r.completion_tokens or 0)
             cr = int(r.cache_read_tokens or 0)
             cc = int(r.cache_creation_tokens or 0)
-            rt = self._row_total_tokens(r.provider_type, p, c, cr, cc)
+            rt = self._row_total_tokens(r.provider_type, p, c, cr, cc, model_id=r.model_id)
             cost = float(r.total_cost or 0)
             total_prompt += p
             total_completion += c
@@ -1428,7 +1315,19 @@ class ConsoleService:
             completion = int(row.completion_tokens or 0)
             cache_read = int(row.cache_read_tokens or 0)
             cache_creation = int(row.cache_creation_tokens or 0)
-            row_tokens = self._row_total_tokens(provider_type, prompt, completion, cache_read, cache_creation)
+            # These sums are already aggregated, so cache accounting can only be
+            # decided per group. Grouping by model gives us the model id
+            # (sublabel) and an exact answer; every other grouping can span
+            # several models at once, where provider_type is the best available
+            # signal — Claude hosted on an estimated provider can still be
+            # under-counted there. Not worth conditioning the SQL sums for:
+            # these groupings are read as cost shares, and cost itself is summed
+            # from per-row values that were priced correctly.
+            row_model_id = row.sublabel if group_by == "model" else None
+            row_tokens = self._row_total_tokens(
+                provider_type, prompt, completion, cache_read, cache_creation,
+                model_id=row_model_id,
+            )
 
             existing = merged.get(key)
             if existing is None:
@@ -1475,7 +1374,7 @@ class ConsoleService:
     ) -> TopUsersMetrics:
         """Get top users by activity"""
 
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
 
         # Get current period user metrics (simplified without trend calculation)
@@ -1566,7 +1465,7 @@ class ConsoleService:
     ) -> RecentNegativeFeedbackMetrics:
         """Get recent negative feedback with completion context"""
 
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         ds_filter_subquery = self._reports_in_scope(params)
         # The agent filter reaches feedback through the completion's report.
         feedback_report_filter = None
@@ -1660,7 +1559,7 @@ class ConsoleService:
         report = report_result.scalar_one_or_none()
         
         if not report:
-            raise ValueError(f"Report {report_id} not found")
+            raise HTTPException(status_code=404, detail="Report not found")
         
         # Get user info
         user = None
@@ -1867,7 +1766,7 @@ class ConsoleService:
         ae_result = await db.execute(ae_query)
         agent_execution = ae_result.scalar_one_or_none()
         if not agent_execution:
-            raise ValueError("Agent execution not found")
+            raise HTTPException(status_code=404, detail="Agent execution not found")
 
         # Fetch blocks associated to this AE ordered by (seq, block_index)
         blocks_query = (
@@ -2012,6 +1911,7 @@ class ConsoleService:
         total_codegen_llm_ms = 0.0
         total_db_ms = 0.0
         iterations: List[IterationTimingSchema] = []
+        seen_decisions: set[str] = set()
         for b in blocks:
             tool_ms: float | None = None
             sub_timings = None
@@ -2040,10 +1940,16 @@ class ConsoleService:
                     # No sub_timings at all — entire tool duration is execution
                     total_db_ms += tool_ms
 
+            # Full planner LLM call for this iteration (thinking is only a
+            # slice of it). A decision that fans out into several tools yields
+            # several blocks; attribute its planner time to the first only.
             llm_ms: float | None = None
-            if b.plan_decision and b.plan_decision.metrics_json:
-                m = b.plan_decision.metrics_json
-                llm_ms = m.get("thinking_ms") or m.get("generation_ms")
+            pd = b.plan_decision
+            if pd and pd.metrics_json and pd.id not in seen_decisions:
+                m = pd.metrics_json
+                llm_ms = m.get("total_duration_ms") or m.get("thinking_ms") or m.get("generation_ms")
+            if pd:
+                seen_decisions.add(pd.id)
 
             iterations.append(IterationTimingSchema(
                 loop_index=b.loop_index,
@@ -2158,14 +2064,87 @@ class ConsoleService:
         ae_res = await db.execute(ae_query)
         ae = ae_res.scalar_one_or_none()
         if not ae:
-            raise ValueError("Agent execution not found for completion")
+            raise HTTPException(status_code=404, detail="Agent execution not found for completion")
         return await self.get_agent_execution_trace(db, organization, ae.id)
+
+    async def _turn_memory_sections(self, db: AsyncSession, rows, ae_ids, viewer_id: Optional[str]) -> dict:
+        """Per-turn memory activity. Text only when the viewer owns the memory
+        (the turn's user); admins and everyone else see handles/counts."""
+        from app.models.memory_entry import MemoryEntry
+        from app.schemas.agent_execution_trace_schema import TurnMemorySchema, TurnMemoryItemSchema
+
+        memory_tools = ("create_memory", "edit_memory", "search_memory")
+        tool_rows: dict[str, list] = {}
+        if ae_ids:
+            q = (
+                select(ToolExecution)
+                .where(ToolExecution.agent_execution_id.in_(ae_ids), ToolExecution.tool_name.in_(memory_tools))
+                .order_by(ToolExecution.created_at.asc())
+            )
+            for te in (await db.execute(q)).scalars().all():
+                tool_rows.setdefault(str(te.agent_execution_id), []).append(te)
+
+        # Entry texts, loaded only for turns the viewer owns.
+        owned_ids: set[str] = set()
+        for r in rows:
+            mc = r.memory_context_json if isinstance(r.memory_context_json, dict) else {}
+            if viewer_id and r.ae_user_id and str(r.ae_user_id) == str(viewer_id):
+                for it in (mc.get("injection") or {}).get("injected") or []:
+                    if it.get("id"):
+                        owned_ids.add(str(it["id"]))
+        texts: dict[str, str] = {}
+        if owned_ids:
+            q = select(MemoryEntry.id, MemoryEntry.text).where(
+                MemoryEntry.id.in_(list(owned_ids)), MemoryEntry.user_id == str(viewer_id)
+            )
+            texts = {str(i): (t or "") for i, t in (await db.execute(q)).all()}
+
+        out: dict[str, TurnMemorySchema] = {}
+        for r in rows:
+            ae = str(r.ae_id)
+            mc = r.memory_context_json if isinstance(r.memory_context_json, dict) else {}
+            tes = tool_rows.get(ae, [])
+            if not mc and not tes:
+                continue
+            owner = bool(viewer_id and r.ae_user_id and str(r.ae_user_id) == str(viewer_id))
+            inj = mc.get("injection") or {}
+            mem = TurnMemorySchema(
+                owner_view=owner,
+                chars=int(inj.get("chars") or 0),
+                total_entries=int(inj.get("total_entries") or 0),
+                hidden=int(inj.get("hidden") or 0),
+            )
+            for it in inj.get("injected") or []:
+                mem.injected.append(TurnMemoryItemSchema(
+                    handle=it.get("handle"), dated=it.get("dated"), tier=it.get("tier"),
+                    text=texts.get(str(it.get("id"))) if owner else None,
+                ))
+            for te in tes:
+                args = te.arguments_json if isinstance(te.arguments_json, dict) else {}
+                res = te.result_json if isinstance(te.result_json, dict) else {}
+                text = None
+                if owner:
+                    text = args.get("text") or args.get("query") or None
+                mem.tool_calls.append(TurnMemoryItemSchema(
+                    tool=te.tool_name, action=args.get("action"),
+                    handle=res.get("handle") or args.get("handle"),
+                    dated=bool(args.get("date")) if te.tool_name == "create_memory" else None,
+                    success=bool(te.success), text=text,
+                ))
+            for ref in mc.get("refusals") or []:
+                mem.refusals.append(TurnMemoryItemSchema(
+                    tool=ref.get("tool"), code=ref.get("code"), handle=ref.get("handle"),
+                    text=ref.get("text") if owner else None,
+                ))
+            out[ae] = mem
+        return out
 
     async def get_report_conversation(
         self,
         db: AsyncSession,
         organization: Organization,
         report_id: str,
+        viewer_id: Optional[str] = None,
     ) -> ConversationTraceResponse:
         """Return a whole report conversation as ordered user→assistant turns.
 
@@ -2183,7 +2162,7 @@ class ConsoleService:
         )
         report = (await db.execute(report_q)).scalar_one_or_none()
         if not report:
-            raise ValueError("Report not found")
+            raise HTTPException(status_code=404, detail="Report not found")
 
         # Every agent execution in the report = one assistant turn. Join the
         # system completion and its parent user completion (which holds the
@@ -2197,10 +2176,13 @@ class ConsoleService:
                 AgentExecution.status.label('ae_status'),
                 AgentExecution.total_duration_ms.label('total_duration_ms'),
                 AgentExecution.created_at.label('created_at'),
+                AgentExecution.user_id.label('ae_user_id'),
+                AgentExecution.memory_context_json.label('memory_context_json'),
                 SystemCompletion.completion.label('assistant_completion'),
                 UserCompletion.id.label('user_completion_id'),
                 UserCompletion.prompt.label('user_prompt'),
                 UserCompletion.role.label('user_role'),
+                UserCompletion.trigger_source.label('trigger_source'),
                 UserCompletion.external_platform.label('external_platform'),
                 UserCompletion.instructions_effectiveness.label('instructions_effectiveness'),
                 UserCompletion.context_effectiveness.label('context_effectiveness'),
@@ -2360,6 +2342,10 @@ class ConsoleService:
             tail = _re.sub(r'\s+', ' ', tail).strip()
             return tail
 
+        checkins = await self._report_checkins(db, organization, str(report.id))
+        checkin_by_run = {c.run_completion_id: c.id for c in checkins if c.run_completion_id}
+        memory_by_ae = await self._turn_memory_sections(db, rows, ae_ids, viewer_id)
+
         turns: List[ConversationTurnSchema] = []
         failed_turns = 0
         negative_feedback_turns = 0
@@ -2370,7 +2356,12 @@ class ConsoleService:
             turn_llm_tokens = usage.get(_METRIC_LLM_TOKENS) or None
             _cost_micro = usage.get(_METRIC_LLM_COST) or 0
             turn_llm_cost_usd = round(_cost_micro / 1_000_000, 6) if _cost_micro else None
-            derived_status = 'error' if (counts.get('failed', 0) or 0) > 0 else (r.ae_status or 'success')
+            # A turn is an error when the run itself failed (planner retries
+            # exhausted, step limit, crash). A tool that failed inside an
+            # otherwise completed turn is reported by total_failed_tools; it
+            # used to flip the whole turn to 'error', so a parent that launched
+            # a wave and the one child that finished both read as failures.
+            derived_status = r.ae_status or 'success'
             if derived_status == 'error':
                 failed_turns += 1
             if fb['status'] == 'negative':
@@ -2380,6 +2371,8 @@ class ConsoleService:
                 user_completion_id=str(r.user_completion_id) if r.user_completion_id else None,
                 user_prompt=_text(r.user_prompt)[:2000],
                 role=r.user_role or 'user',
+                trigger_source=r.trigger_source,
+                checkin_id=checkin_by_run.get(str(r.completion_id)) if r.completion_id else None,
                 completion_id=str(r.completion_id) if r.completion_id else None,
                 agent_execution_id=str(r.ae_id),
                 assistant_content=_clean_answer(r.assistant_completion)[:2000],
@@ -2401,6 +2394,7 @@ class ConsoleService:
                 llm_cost_usd=turn_llm_cost_usd,
                 created_at=r.created_at,
                 completion_blocks=blocks_by_ae.get(str(r.ae_id), []),
+                memory=memory_by_ae.get(str(r.ae_id)),
             ))
 
         # Conversation-level origin platform = first turn that carries one
@@ -2456,7 +2450,92 @@ class ConsoleService:
             total_llm_tokens=total_llm_tokens,
             total_llm_cost_usd=total_llm_cost_usd,
             turns=turns,
+            checkins=checkins,
         )
+
+    async def _report_checkins(self, db: AsyncSession, organization: Organization, report_id: str) -> list:
+        """Every agent check-in row for the report, with planner/judge LLM usage
+        (llm_usage_records scoped checkin_planner / checkin_judge, keyed by the
+        check-in id)."""
+        from app.models.agent_checkin import AgentCheckin
+        from app.schemas.agent_execution_trace_schema import CheckinTraceSchema
+
+        rows = (await db.execute(
+            select(AgentCheckin).where(
+                AgentCheckin.report_id == report_id,
+                AgentCheckin.organization_id == str(organization.id),
+                AgentCheckin.deleted_at.is_(None),
+            ).order_by(AgentCheckin.created_at.asc())
+        )).scalars().all()
+        if not rows:
+            return []
+        ids = [str(r.id) for r in rows]
+        usage: dict = {}
+        uq = (
+            select(
+                LLMUsageRecord.scope_ref_id,
+                LLMUsageRecord.scope,
+                func.coalesce(func.sum(_row_total_tokens_expr()), 0),
+                func.coalesce(func.sum(LLMUsageRecord.total_cost_usd), 0),
+            )
+            .where(
+                LLMUsageRecord.scope.in_(("checkin_planner", "checkin_judge")),
+                LLMUsageRecord.scope_ref_id.in_(ids),
+            )
+            .group_by(LLMUsageRecord.scope_ref_id, LLMUsageRecord.scope)
+        )
+        for ref_id, scope, tokens, cost in (await db.execute(uq)).all():
+            usage[(str(ref_id), scope)] = (int(tokens or 0) or None, round(float(cost or 0), 6) or None)
+        out = []
+        for r in rows:
+            p_tok, p_cost = usage.get((str(r.id), "checkin_planner"), (None, None))
+            j_tok, j_cost = usage.get((str(r.id), "checkin_judge"), (None, None))
+            out.append(CheckinTraceSchema(
+                id=str(r.id), status=r.status, status_reason=r.status_reason,
+                source_completion_id=r.source_completion_id, run_completion_id=r.run_completion_id,
+                note=r.note, plan_reason=r.plan_reason, due_at=r.due_at,
+                judge_decision=r.judge_decision, judge_reason=r.judge_reason, judge_focus=r.judge_focus,
+                judged_at=r.judged_at, notified=bool(r.notified), notify_subject=r.notify_subject,
+                sent_at=r.sent_at,
+                planner_llm_tokens=p_tok, planner_llm_cost_usd=p_cost,
+                judge_llm_tokens=j_tok, judge_llm_cost_usd=j_cost,
+                created_at=r.created_at,
+            ))
+        return out
+
+    async def _search_encrypted_prompts(self, db: AsyncSession, organization_id, search: str) -> list[str]:
+        """Ids of *encrypted* user completions whose prompt contains ``search``.
+
+        get_agent_execution_summaries ILIKEs over Completion.prompt cast to
+        text; a row stored as a ciphertext envelope (enterprise
+        data_encryption) never matches that way. Only enveloped rows are
+        hydrated here — the column type decrypts them — and tested with the
+        same case-insensitive substring rule over the serialized JSON. On an
+        instance that has never encrypted this selects nothing.
+        """
+        from app.ee.encryption import envelope_marker_expr
+        from app.models.report import Report
+
+        rows = (await db.execute(
+            select(Completion.id, Completion.prompt)
+            .join(Report, Report.id == Completion.report_id)
+            .where(
+                Report.organization_id == organization_id,
+                envelope_marker_expr(Completion.prompt),
+            )
+        )).all()
+        needle = search.lower()
+        hits: list[str] = []
+        for cid, prompt in rows:
+            if prompt is None:
+                continue
+            try:
+                haystack = json.dumps(prompt, ensure_ascii=False)
+            except (TypeError, ValueError):
+                haystack = str(prompt)
+            if needle in haystack.lower():
+                hits.append(str(cid))
+        return hits
 
     async def get_agent_execution_summaries(
         self,
@@ -2471,7 +2550,7 @@ class ConsoleService:
         security_data_source_ids: Optional[list] = None,
     ) -> AgentExecutionSummariesResponse:
         """Aggregate agent executions joined with completion, feedback, tool counts, and report/user metadata."""
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
         parsed_user_ids = self._parse_user_ids(params.user_ids)
 
@@ -2588,11 +2667,17 @@ class ConsoleService:
             from sqlalchemy.orm import aliased
             PromptSystemCompletion = aliased(Completion)
             PromptUserCompletion = aliased(Completion)
+            prompt_match = sa_cast(PromptUserCompletion.prompt, Text).ilike(f'%{prompt_search}%')
+            # Prompts written under enterprise data_encryption are ciphertext
+            # in SQL, so the ILIKE cannot see them; match those in Python.
+            encrypted_hits = await self._search_encrypted_prompts(db, organization.id, prompt_search)
+            if encrypted_hits:
+                prompt_match = or_(prompt_match, PromptUserCompletion.id.in_(encrypted_hits))
             base_query = (
                 base_query
                 .join(PromptSystemCompletion, PromptSystemCompletion.id == AgentExecution.completion_id, isouter=True)
                 .join(PromptUserCompletion, PromptUserCompletion.id == PromptSystemCompletion.parent_id, isouter=True)
-                .where(sa_cast(PromptUserCompletion.prompt, Text).ilike(f'%{prompt_search}%'))
+                .where(prompt_match)
             )
 
         # Recalculate total with filters
@@ -2756,7 +2841,12 @@ class ConsoleService:
             report_link = f"/reports/{r.report_id}" if r.report_id else None
 
             # Derive status: if any tool failed in this AE, mark as error
-            derived_status = 'error' if (counts.get('failed', 0) or 0) > 0 else (r.ae_status or 'success')
+            # A turn is an error when the run itself failed (planner retries
+            # exhausted, step limit, crash). A tool that failed inside an
+            # otherwise completed turn is reported by total_failed_tools; it
+            # used to flip the whole turn to 'error', so a parent that launched
+            # a wave and the one child that finished both read as failures.
+            derived_status = r.ae_status or 'success'
 
             items.append(AgentExecutionSummaryItem(
                 agent_execution_id=str(r.ae_id),
@@ -2794,7 +2884,7 @@ class ConsoleService:
         params: MetricsQueryParams
     ) -> Dict[str, int]:
         """Get dashboard metrics for diagnosis page."""
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
+        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date, organization)
         parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
         parsed_user_ids = self._parse_user_ids(params.user_ids)
 
@@ -2902,117 +2992,3 @@ class ConsoleService:
             'low_confidence': low_confidence,
             'low_instruction_coverage': low_instruction_coverage
         }
-
-    async def get_diagnosis_timeseries(
-        self,
-        db: AsyncSession,
-        organization: Organization,
-        params: MetricsQueryParams
-    ) -> DiagnosisTimeSeriesMetrics:
-        """Agent executions bucketed daily by derived status (success vs error).
-
-        An execution is counted as 'error' if its own status is 'error' or if any
-        of its tool executions failed — mirroring the derived status shown in the
-        diagnosis table. Everything else counts as 'success'.
-        """
-        start_date, end_date = self._normalize_date_range(params.start_date, params.end_date)
-        parsed_data_source_ids = self._parse_data_source_ids(params.data_source_ids)
-        parsed_user_ids = self._parse_user_ids(params.user_ids)
-
-        ds_filter_subquery = self._reports_in_scope(params)
-
-        def apply_common_filters(query):
-            if ds_filter_subquery is not None:
-                query = query.where(AgentExecution.report_id.in_(ds_filter_subquery))
-            if parsed_user_ids:
-                query = query.where(AgentExecution.user_id.in_(parsed_user_ids))
-            return query
-
-        # Fetch all agent executions in range (id, created_at, status)
-        ae_query = (
-            select(AgentExecution.id, AgentExecution.created_at, AgentExecution.status)
-            .where(
-                AgentExecution.organization_id == organization.id,
-                AgentExecution.created_at >= start_date,
-                AgentExecution.created_at <= end_date
-            )
-        )
-        ae_query = apply_common_filters(ae_query)
-        ae_result = await db.execute(ae_query)
-        ae_rows = ae_result.all()
-
-        # Set of agent execution ids that have at least one failed tool execution
-        failed_ae_query = (
-            select(func.distinct(ToolExecution.agent_execution_id))
-            .join(AgentExecution, AgentExecution.id == ToolExecution.agent_execution_id)
-            .where(
-                AgentExecution.organization_id == organization.id,
-                AgentExecution.created_at >= start_date,
-                AgentExecution.created_at <= end_date,
-                ToolExecution.success == False
-            )
-        )
-        failed_ae_query = apply_common_filters(failed_ae_query)
-        failed_ae_result = await db.execute(failed_ae_query)
-        failed_ae_ids = {str(r[0]) for r in failed_ae_result.all()}
-
-        # Pre-seed every day in range so the chart has continuous buckets
-        buckets: dict[str, dict] = {}
-        current = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        while current <= end_date:
-            buckets[current.strftime('%Y-%m-%d')] = {'success': 0, 'error': 0}
-            current += timedelta(days=1)
-
-        for ae_id, created_at, status in ae_rows:
-            if not created_at:
-                continue
-            date_str = created_at.strftime('%Y-%m-%d')
-            bucket = buckets.get(date_str)
-            if bucket is None:
-                bucket = {'success': 0, 'error': 0}
-                buckets[date_str] = bucket
-            is_error = status == 'error' or str(ae_id) in failed_ae_ids
-            bucket['error' if is_error else 'success'] += 1
-
-        points = [
-            DiagnosisStatusPoint(date=date_str, success=vals['success'], error=vals['error'])
-            for date_str, vals in sorted(buckets.items())
-        ]
-
-        return DiagnosisTimeSeriesMetrics(
-            date_range=DateRange(start=start_date.isoformat(), end=end_date.isoformat()),
-            points=points
-        )
-
-    async def get_diagnosis_users(
-        self,
-        db: AsyncSession,
-        organization: Organization,
-        scope_data_source_ids: Optional[List[str]] = None,
-    ) -> DiagnosisUsersResponse:
-        """Distinct users that have agent executions in this org (facet for the
-        diagnosis user filter). Deliberately unscoped by date so the dropdown
-        stays stable while the user plays with the time range.
-
-        ``scope_data_source_ids`` narrows the facet to reports the caller may
-        read, so a scoped console doesn't name users it has no window into."""
-        q = (
-            select(
-                User.id,
-                func.coalesce(User.name, 'Unknown User').label('name'),
-                func.coalesce(User.email, '').label('email'),
-            )
-            .join(AgentExecution, AgentExecution.user_id == User.id)
-            .where(AgentExecution.organization_id == organization.id)
-            .group_by(User.id, User.name, User.email)
-            .order_by(func.coalesce(User.name, 'Unknown User'))
-        )
-        ds_filter_subquery = self._reports_of_data_sources([], scope_data_source_ids)
-        if ds_filter_subquery is not None:
-            q = q.where(AgentExecution.report_id.in_(ds_filter_subquery))
-        res = await db.execute(q)
-        users = [
-            DiagnosisUser(id=str(r.id), name=r.name, email=r.email)
-            for r in res.all()
-        ]
-        return DiagnosisUsersResponse(users=users)

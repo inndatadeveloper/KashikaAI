@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Optional, List, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # PostgreSQL
@@ -114,6 +115,12 @@ class SapDatasphereConfig(BaseModel):
         description="Authorize endpoint (needed only for per-user sign-in), e.g. https://<subdomain>.authentication.<region>.hana.ondemand.com/oauth/authorize",
         json_schema_extra={"ui:type": "string"},
     )
+    scopes: Optional[str] = Field(
+        None,
+        title="OAuth Scopes",
+        description="Optional space-separated OAuth scopes sent with the token request. Leave empty for a standard Datasphere OAuth client.",
+        json_schema_extra={"ui:type": "string"},
+    )
     space: Optional[str] = Field(
         None,
         title="Space",
@@ -138,6 +145,29 @@ class SapDatasphereConfig(BaseModel):
         description="Verify the server TLS certificate. Disable only for test endpoints with self-signed certificates.",
         json_schema_extra={"ui:type": "boolean"},
     )
+
+    @field_validator("authorization_url")
+    @classmethod
+    def _authorization_url_is_http(cls, v):
+        return _require_http_url(v, "authorization_url")
+
+    @field_validator("token_url")
+    @classmethod
+    def _token_url_is_http(cls, v):
+        # The technical user's client secret is POSTed here; refuse anything
+        # that is not an absolute http(s) URL.
+        return _require_http_url(v, "token_url")
+
+
+def _require_http_url(v, field: str):
+    """Browser-navigation URLs (OAuth authorize endpoints) must be absolute
+    http(s); a javascript: value would execute when the user clicks Sign in."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return v
+    from app.core.url_safety import is_safe_http_url
+    if not is_safe_http_url(v.strip()):
+        raise ValueError(f"{field} must be an absolute http(s) URL")
+    return v
 
 
 class SapDatasphereCredentials(BaseModel):
@@ -302,6 +332,18 @@ class PostgreSQLConfig(BaseModel):
         description="libpq sslmode: disable, allow, prefer, require, verify-ca, verify-full. Use 'require' for IAM-authenticated connections (e.g. AWS RDS), which reject unencrypted logins.",
         json_schema_extra={"ui:type": "select", "ui:options": ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]}
     )
+    index_routines: bool = Field(
+        False,
+        title="Index stored procedures & functions",
+        description="Also index procedures and functions with their source. The agent reads their logic and may call functions inside queries; use a read-only database account.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    include_system_schemas: bool = Field(
+        False,
+        title="Index system catalog",
+        description="Also index pg_catalog and information_schema (pg_stat_activity, pg_locks, ...) so the agent can answer questions about the database itself.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
 
 
 # SQLite (local file database)
@@ -345,6 +387,13 @@ class SQLConfig(BaseModel):
     host: str = Field(..., title="Host", description="", json_schema_extra={"ui:type": "string"})
     port: int = Field(..., ge=1, le=65535, title="Port", description="", json_schema_extra={"ui:type": "number"})
     database: str = Field(..., title="Database", description="", json_schema_extra={"ui:type": "string"})
+    # MySQL, MariaDB and SQL Server (MssqlConfig) — the clients that index routines.
+    index_routines: bool = Field(
+        False,
+        title="Index stored procedures & functions",
+        description="Also index procedures and functions with their source. The agent reads their logic and may call functions inside queries; use a read-only database account.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
 
 
 # Snowflake
@@ -407,6 +456,21 @@ class SnowflakeConfig(BaseModel):
         None,
         title="Role",
         description="Optional Snowflake role to use for this connection",
+        json_schema_extra={"ui:type": "string"},
+    )
+    query_tag_enabled: bool = Field(
+        True,
+        title="Tag queries",
+        description="Set a JSON QUERY_TAG on every query (report, conversation turn, run and user IDs) so admins can match QUERY_HISTORY rows to Bag of Words sessions. Turn off if you already set your own QUERY_TAG.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    query_tag_label: Optional[str] = Field(
+        None,
+        max_length=100,
+        # Same character set app/data_sources/query_tag.py lets into a tag.
+        pattern=r"^[A-Za-z0-9 _.:/@-]*$",
+        title="Query tag label",
+        description="Optional label added to the query tag as \"label\", e.g. a team or cost center. Letters, digits, spaces and _ . : / @ - only (max 100).",
         json_schema_extra={"ui:type": "string"},
     )
 
@@ -789,6 +853,94 @@ class PriorityErpConfig(BaseModel):
     )
 
 
+# Microsoft Configuration Manager (SCCM / MECM) — AdminService REST API
+class MecmNtlmCredentials(BaseModel):
+    """Windows credentials, sent with NTLM / Negotiate."""
+    username: str = Field(
+        ...,
+        min_length=1,
+        title="Domain username",
+        description=(
+            "DOMAIN\\username or user@domain. The account must be a Configuration Manager "
+            "administrative user — the Read-only Analyst role is enough. Its security scopes "
+            "decide which devices and collections it can see."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(..., min_length=1, title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class MecmKerberosCredentials(BaseModel):
+    """Kerberos service account from a keytab or ticket cache mounted on the server."""
+    kerberos: bool = Field(True, json_schema_extra={"ui:hidden": True})
+    principal: str | None = Field(
+        None,
+        title="Service principal",
+        description=(
+            "Optional service-account principal (svc_bow@CONTOSO.COM). Administrators mount "
+            "krb5.conf and the client keytab (KRB5_CLIENT_KTNAME) on the Bag of Words server. "
+            "Requests run as this account, not as the signed-in user."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+
+    @model_validator(mode="after")
+    def require_kerberos(self):
+        if not self.kerberos:
+            raise ValueError("Kerberos must be enabled for this authentication variant.")
+        return self
+
+
+class MecmConfig(BaseModel):
+    server_url: str = Field(
+        ...,
+        title="SMS Provider",
+        description=(
+            "Host name of the server with the SMS Provider role (usually the site server), e.g. "
+            "cm01.contoso.com — or the full https://cm01.contoso.com/AdminService URL."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    classes: str | None = Field(
+        None,
+        title="Classes",
+        description=(
+            "Optional comma-separated list of classes to expose, e.g. SMS_R_System, SMS_Collection, "
+            "SMS_G_System_INSTALLED_SOFTWARE, v1.0/Device. If empty, a curated set of device, "
+            "collection, inventory, application, deployment and update classes is used."
+        ),
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    discover_all: bool = Field(
+        False,
+        title="Discover all classes",
+        description="Index every class the site exposes (700+, including custom hardware inventory classes) instead of the curated set.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    include_v1: bool = Field(
+        False,
+        title="Include v1.0 entities",
+        description="Also index the versioned v1.0 route (Device and related entities). Needs Configuration Manager 1906 or later.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    ca_certificate: str | None = Field(
+        None,
+        title="SMS Provider certificate (PEM)",
+        description=(
+            "By default the site uses a self-signed certificate for the administration service. "
+            "Paste it here (or the issuing CA's certificate) to trust exactly that certificate "
+            "instead of turning verification off."
+        ),
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the server certificate. Turn off only for an isolated test lab.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+
+
 # AppDynamics (Cisco / Splunk AppDynamics)
 class AppDynamicsUserPassCredentials(BaseModel):
     username: str = Field(
@@ -832,6 +984,49 @@ class AppDynamicsConfig(BaseModel):
         True,
         title="Verify SSL",
         description="Verify the controller's TLS certificate. Disable only for self-signed or private-CA certs on trusted networks (e.g. on-prem controllers).",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+
+
+# CrowdStrike Falcon
+class CrowdStrikeApiClientCredentials(BaseModel):
+    client_id: str = Field(
+        ...,
+        title="Client ID",
+        description="From Support and resources → API clients and keys in the Falcon console. Grant read-only scopes: Hosts, Host groups, Alerts, Incidents, Vulnerabilities, Prevention policies, IOC Management.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    client_secret: str = Field(
+        ...,
+        title="Client Secret",
+        description="Shown once when the API client is created. Short-lived OAuth tokens are fetched and refreshed automatically.",
+        json_schema_extra={"ui:type": "password"},
+    )
+    member_cid: Optional[str] = Field(
+        None,
+        title="Member CID (optional)",
+        description="Flight Control (MSSP) only: the child tenant's CID to read from. Leave empty for a single tenant.",
+        json_schema_extra={"ui:type": "string"},
+    )
+
+
+class CrowdStrikeConfig(BaseModel):
+    region: Literal["auto", "us-1", "us-2", "eu-1", "us-gov-1", "us-gov-2"] = Field(
+        "auto",
+        title="Cloud Region",
+        description="The Falcon cloud your tenant lives in (the console URL tells you: falcon.us-2.crowdstrike.com → us-2). \"auto\" detects it from the API client.",
+        json_schema_extra={"ui:type": "select", "ui:options": ["auto", "us-1", "us-2", "eu-1", "us-gov-1", "us-gov-2"]},
+    )
+    base_url: Optional[str] = Field(
+        None,
+        title="API Base URL (optional)",
+        description="Overrides the region, e.g. for an API gateway or proxy in front of the Falcon API. Leave empty to use the region.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the API's TLS certificate. Disable only behind a TLS-intercepting proxy on a trusted network.",
         json_schema_extra={"ui:type": "boolean"},
     )
 
@@ -997,6 +1192,112 @@ class AriaOperationsConfig(BaseModel):
     )
 
 
+
+# VMware vCenter Server / ESXi — vSphere Web Services API (SOAP vim25) + Automation REST (tags)
+class VCenterUserPassCredentials(BaseModel):
+    username: str = Field(
+        ...,
+        title="Username",
+        description="A vCenter SSO or Active Directory user, e.g. svc-bow@vsphere.local. Grant it the built-in Read-only role on the vCenter root with 'Propagate to children'.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
+
+
+class VCenterConfig(BaseModel):
+    host: str = Field(
+        ...,
+        title="vCenter Server",
+        description="Host name or URL of the vCenter Server (or a standalone ESXi host), e.g. vcenter.acme.local. HTTPS only.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    port: int = Field(443, ge=1, le=65535, title="Port", description="HTTPS port (443 unless your vCenter uses another).",
+                      json_schema_extra={"ui:type": "number"})
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the vCenter certificate. vCenter usually presents a certificate from its own VMCA: paste the VMCA root below rather than turning this off.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    ca_certificate: Optional[str] = Field(
+        None,
+        title="CA certificate (optional)",
+        description="PEM certificate of the CA that signed the vCenter certificate (the VMCA root, from https://<vcenter>/certs/download.zip).",
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    include_tags: bool = Field(
+        True,
+        title="Include vSphere tags",
+        description="Read tags and categories through the vSphere Automation REST API (vCenter 7.0 U2 or later).",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    default_lookback_hours: int = Field(
+        24, ge=1, le=720, title="Default lookback (hours)",
+        description="Window for events and tasks when a question gives no explicit time range.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    timeout: int = Field(60, ge=5, le=300, title="Request timeout (seconds)", json_schema_extra={"ui:type": "number"})
+
+
+# DX NetOps Spectrum (Broadcom / CA Spectrum) — OneClick Web Services API
+class SpectrumUserPassCredentials(BaseModel):
+    username: str = Field(
+        ...,
+        title="Username",
+        description="A user from Spectrum's LOCAL user database (SSO-only accounts cannot call the REST API). Read access (GET + POST searches) is enough.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
+
+
+class SpectrumTokenCredentials(BaseModel):
+    token: str = Field(
+        ...,
+        title="Bearer Token",
+        description="A token generated by an administrator in OneClick → Administration → Token Configuration (Spectrum 24.3.10 or later). Sent as Authorization: Bearer.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class SpectrumConfig(BaseModel):
+    url: str = Field(
+        ...,
+        title="OneClick URL",
+        description="The OneClick web server, e.g. https://oneclick.acme.local:8443 (the /spectrum/restful path is appended automatically).",
+        json_schema_extra={"ui:type": "string"},
+    )
+    landscapes: str = Field(
+        "",
+        title="Landscapes (optional)",
+        description="Comma-separated landscape handles or names to restrict queries to, e.g. 0x100000, ss-dc2. Empty = every landscape this OneClick serves.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the OneClick TLS certificate. Disable only for self-signed certificates on trusted networks; prefer a CA bundle.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    ca_bundle: Optional[str] = Field(
+        None,
+        title="CA Bundle Path (optional)",
+        description="Path on the server to a PEM bundle for a private CA, so TLS verification can stay on.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    request_timeout_s: int = Field(
+        600,
+        title="Request Timeout (seconds)",
+        description="Broadcom recommends at least 600 seconds: OneClick can take minutes to build large inventory responses.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    throttlesize: int = Field(
+        500,
+        title="Page Size (throttlesize)",
+        description="Models/alarms/events fetched per page. Broadcom suggests 250–500 so each batch completes within the timeout.",
+        json_schema_extra={"ui:type": "number"},
+    )
+
+
 # Service Demo
 class ServiceDemoCredentials(BaseModel):
     access_key: str = Field(..., title="Access Key", description="", json_schema_extra={"ui:type": "string"})
@@ -1110,18 +1411,63 @@ class PrestoConfig(BaseModel):
     protocol: str = Field("http", title="Protocol", description="", json_schema_extra={"ui:type": "string"})
 
 
-# Trino
+# Trino / Starburst (Galaxy and Enterprise)
 class TrinoCredentials(BaseModel):
-    user: str = Field(..., title="User", description="", json_schema_extra={"ui:type": "string"})
-    password: str = Field("", title="Password", description="Required for HTTPS only", json_schema_extra={"ui:type": "password"})
+    user: str = Field(..., title="User", description="Starburst Galaxy: the service account's name (user@account.galaxy.starburst.io) or a user's email; Enterprise: the LDAP / password-file user", json_schema_extra={"ui:type": "string"})
+    password: str = Field("", title="Password", description="Required over HTTPS; leave blank only for an unauthenticated coordinator over HTTP", json_schema_extra={"ui:type": "password"})
+
+
+class TrinoTokenCredentials(BaseModel):
+    access_token: str = Field(..., title="Access token", description="A JWT or personal access token issued by the cluster (Starburst Galaxy: a user or service-account token; Enterprise: a JWT the coordinator's OAuth2 / JWT authenticator accepts)", json_schema_extra={"ui:type": "password"})
+    user: str = Field("", title="User", description="Optional session user the token acts as; leave blank to use the token's identity", json_schema_extra={"ui:type": "string"})
 
 
 class TrinoConfig(BaseModel):
-    host: str = Field(..., title="Host", description="", json_schema_extra={"ui:type": "string"})
-    port: int = Field(8080, ge=1, le=65535, title="Port", description="", json_schema_extra={"ui:type": "number"})
-    catalog: str = Field(..., title="Catalog", description="", json_schema_extra={"ui:type": "string"})
-    schema: str = Field(..., title="Schema", description="", json_schema_extra={"ui:type": "string"})
-    protocol: str = Field("http", title="Protocol", description="http or https", json_schema_extra={"ui:type": "string"})
+    host: str = Field(..., title="Host", description="Coordinator hostname, without http:// (Starburst Galaxy: <account>-<cluster>.trino.galaxy.starburst.io)", json_schema_extra={"ui:type": "string"})
+    port: int = Field(8080, ge=1, le=65535, title="Port", description="8080 for plain HTTP, 8443 for a TLS-enabled Starburst Enterprise coordinator, 443 for Starburst Galaxy", json_schema_extra={"ui:type": "number"})
+    protocol: str = Field("http", title="Protocol", description="https for any authenticated or TLS-enabled coordinator (required for Starburst)", json_schema_extra={"ui:type": "select", "ui:options": ["http", "https"]})
+    catalog: str = Field(..., title="Catalog", description="The catalog queries run in by default; its tables are listed as schema.table", json_schema_extra={"ui:type": "string"})
+    schema: Optional[str] = Field(
+        None,
+        title="Schema",
+        description="Optional schema or comma-separated list of schemas to index; blank indexes every schema in the catalog",
+        json_schema_extra={"ui:type": "string"},
+    )
+    additional_catalogs: Optional[str] = Field(
+        None,
+        title="Additional catalogs",
+        description="Optional comma-separated list of other catalogs to index; their tables are listed as catalog.schema.table and can be joined with the primary catalog",
+        json_schema_extra={"ui:type": "string"},
+    )
+    role: Optional[str] = Field(
+        None,
+        title="Role",
+        description="Optional Starburst role to assume for the session (built-in access control); blank uses the login's default role",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the coordinator's TLS certificate. Disable only for a self-signed certificate in a lab; for an internal CA paste its certificate below instead",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    ca_certificate: Optional[str] = Field(
+        None,
+        title="CA certificate (PEM)",
+        description="Optional PEM certificate chain of the internal CA that signed the coordinator's certificate (Starburst Enterprise on-prem)",
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    timezone: Optional[str] = Field(
+        None,
+        title="Timezone",
+        description="Optional IANA timezone for the session (for example Europe/Berlin); relative dates such as current_date are computed in it. Blank uses the cluster default",
+        json_schema_extra={"ui:type": "string"},
+    )
+
+
+class StarburstConfig(TrinoConfig):
+    port: int = Field(443, ge=1, le=65535, title="Port", description="443 for Starburst Galaxy, 8443 for a TLS-enabled Starburst Enterprise coordinator", json_schema_extra={"ui:type": "number"})
+    protocol: str = Field("https", title="Protocol", description="Starburst requires TLS for every authentication method; keep https", json_schema_extra={"ui:type": "select", "ui:options": ["https", "http"]})
 
 
 # Google Analytics
@@ -1259,7 +1605,7 @@ class TeradataCredentials(BaseModel):
 
 class TeradataConfig(BaseModel):
     host: str = Field(..., title="Host", description="Teradata system hostname or IP (e.g. the TPA/COP name)", json_schema_extra={"ui:type": "string"})
-    port: int = Field(1025, ge=1, le=65535, title="Port", description="Teradata listener port (default 1025)", json_schema_extra={"ui:type": "number"})
+    port: int = Field(1025, ge=1, le=65535, title="Port", description="Teradata listener port (default 1025). TLS connections use port 443 unless https_port is set under additional parameters.", json_schema_extra={"ui:type": "number"})
     database: str = Field(
         ...,
         title="Database",
@@ -1269,8 +1615,32 @@ class TeradataConfig(BaseModel):
     logmech: str = Field(
         "TD2",
         title="Logon Mechanism",
-        description="Authentication mechanism. TD2 (default) for native users; LDAP/KRB5/TDNEGO for directory-based logon (common on-prem).",
-        json_schema_extra={"ui:type": "select", "ui:options": ["TD2", "LDAP", "KRB5", "TDNEGO"]},
+        description="TD2 (default) for database users; LDAP for directory users.",
+        json_schema_extra={"ui:type": "select", "ui:options": ["TD2", "LDAP"]},
+    )
+    sslmode: str = Field(
+        "PREFER",
+        title="SSL Mode",
+        description="PREFER uses TLS when the server offers it, without checking the certificate. REQUIRE always uses TLS. VERIFY-CA also checks the certificate is trusted; VERIFY-FULL also checks it matches the host name.",
+        json_schema_extra={"ui:type": "select", "ui:options": ["DISABLE", "ALLOW", "PREFER", "REQUIRE", "VERIFY-CA", "VERIFY-FULL"]},
+    )
+    ssl_ca: Optional[str] = Field(
+        None,
+        title="CA Certificate (PEM)",
+        description="Certificate authority to trust for VERIFY-CA / VERIFY-FULL, pasted as PEM text. Leave empty to use the system trust store.",
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    encryptdata: bool = Field(
+        True,
+        title="Encrypt data",
+        description="Encrypt data on non-TLS connections. TLS connections are always encrypted.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    additional_params: Optional[dict] = Field(
+        default_factory=dict,
+        title="Additional Connection Parameters",
+        description="Extra teradatasql driver parameters, e.g. cop=false or coplast=true when DNS is slow, account, charset, tmode. Credentials, TLS and encryption settings cannot be set here.",
+        json_schema_extra={"ui:type": "keyvalue"},
     )
 
 
@@ -1456,6 +1826,191 @@ class MongoDBConfig(BaseModel):
         json_schema_extra={"ui:type": "boolean"}
     )
 
+
+
+# Neo4j
+class Neo4jConfig(BaseModel):
+    uri: str = Field(
+        ...,
+        title="URI",
+        description=(
+            "neo4j+s://xxxx.databases.neo4j.io for Aura, or bolt://host:7687. BOW connects directly to "
+            "this host (a neo4j:// URI is read as bolt://). No username or password here."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    database: str = Field(
+        "neo4j",
+        title="Database",
+        description="Database name (default: neo4j)",
+        json_schema_extra={"ui:type": "string"},
+    )
+    max_rows: int = Field(
+        10_000,
+        ge=1,
+        le=100_000,
+        title="Row limit",
+        description="Most rows one query returns. Larger results are cut off and the agent is told to aggregate.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    schema_sample_size: int = Field(
+        100,
+        ge=1,
+        le=10_000,
+        title="Schema sample size",
+        description=(
+            "Nodes or relationships sampled per label to find properties, used only when the "
+            "database's schema procedures are restricted for this user."
+        ),
+        json_schema_extra={"ui:type": "number"},
+    )
+    allow_gds: bool = Field(
+        False,
+        title="Allow graph algorithms (GDS)",
+        description=(
+            "Let the agent run Graph Data Science algorithms in stream / stats mode (PageRank, "
+            "community detection, similarity, paths). Needs the GDS plugin. Write and mutate modes stay blocked."
+        ),
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    kerberos_service: str = Field(
+        "neo4j",
+        title="Kerberos service name",
+        description=(
+            "Only for Kerberos: the service part of Neo4j's Kerberos principal "
+            "(neo4j for neo4j/host@REALM)."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+
+    @field_validator("uri")
+    @classmethod
+    def _uri_is_a_neo4j_uri(cls, v: str) -> str:
+        from app.data_sources.clients.neo4j_client import validate_uri
+
+        return validate_uri(v)
+
+    @field_validator("kerberos_service")
+    @classmethod
+    def _service_is_one_name(cls, v: str) -> str:
+        v = (v or "neo4j").strip()
+        if not v or any(c in v for c in "/@ "):
+            raise ValueError("Enter only the service name, e.g. neo4j (no host or realm).")
+        return v
+
+
+class Neo4jCredentials(BaseModel):
+    username: str = Field(
+        ...,
+        title="Username",
+        description="A Neo4j user. A user with a reader role is enough. LDAP users sign in here too.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(
+        ...,
+        title="Password",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class Neo4jBearerCredentials(BaseModel):
+    """A token from the identity provider Neo4j's SSO (OIDC) is set up with."""
+    token: str = Field(
+        ...,
+        min_length=1,
+        title="Access token",
+        description=(
+            "An OIDC access or ID token that Neo4j's SSO accepts (the JWT itself, without "
+            "\"Bearer\"). Tokens expire: replace it when the connection test fails."
+        ),
+        json_schema_extra={"ui:type": "password"},
+    )
+
+    @field_validator("token")
+    @classmethod
+    def _strip_bearer(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v.lower() == "bearer" or v.lower().startswith(("bearer ", "bearer\t")):
+            v = v[6:].strip()
+        if not v:
+            raise ValueError("The token is empty.")
+        return v
+
+
+class Neo4jNoAuthCredentials(BaseModel):
+    """A server with authentication disabled (dbms.security.auth_enabled=false)."""
+    pass
+
+
+class Neo4jImpersonationCredentials(BaseModel):
+    """A service user that runs each query as another Neo4j user.
+
+    Neo4j checks the impersonated user's own roles on every query. The service
+    user needs the IMPERSONATE privilege (Neo4j Enterprise or Aura Enterprise).
+    """
+    username: str = Field(
+        ...,
+        title="Service username",
+        description="A Neo4j user granted IMPERSONATE on the users BOW should act as.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(
+        ...,
+        title="Service password",
+        json_schema_extra={"ui:type": "password"},
+    )
+    impersonated_user: str | None = Field(
+        None,
+        title="Run queries as",
+        description=(
+            "The Neo4j user queries run as. Under \"Require user authentication\", map it to a "
+            "member attribute so each member runs as their own Neo4j user."
+        ),
+        json_schema_extra={"ui:type": "string", "ui:memberBindable": True},
+    )
+
+
+class Neo4jKerberosCredentials(BaseModel):
+    """BOW's own Kerberos identity (keytab or default credential cache).
+
+    Needs Neo4j Enterprise with the Kerberos add-on, and krb5 configured on
+    the BOW server.
+    """
+    use_kerberos: bool = Field(
+        True,
+        title="Use Kerberos",
+        description="Sign in with the BOW server's Kerberos identity. Needs krb5 on the BOW server (keytab + krb5.conf).",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    kerberos_principal: str | None = Field(
+        None,
+        title="Service principal (optional)",
+        description="Client principal to sign in as, e.g. svc-bow@CORP.EXAMPLE.COM. Needs a matching keytab entry. Leave blank for the default credential cache.",
+        json_schema_extra={"ui:type": "string"},
+    )
+
+    @model_validator(mode="after")
+    def _kerberos_stays_on(self) -> Neo4jKerberosCredentials:
+        if not self.use_kerberos:
+            raise ValueError("Kerberos must remain enabled for this authentication method.")
+        return self
+
+
+class Neo4jKerberosDelegatedCredentials(BaseModel):
+    """Per-user Kerberos SSO via constrained delegation (S4U2Self + S4U2Proxy),
+    the same flow as SQL Server's."""
+    use_kerberos: bool = Field(
+        True,
+        title="Use Kerberos SSO",
+        description="Queries run under your own Active Directory identity via Kerberos Constrained Delegation.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+
+    @model_validator(mode="after")
+    def _kerberos_stays_on(self) -> Neo4jKerberosDelegatedCredentials:
+        if not self.use_kerberos:
+            raise ValueError("Kerberos must remain enabled for this authentication method.")
+        return self
 
 # OpenSearch
 class OpenSearchCredentials(BaseModel):
@@ -1654,6 +2209,73 @@ class ElasticsearchConfig(BaseModel):
         json_schema_extra={"ui:type": "string"},
     )
 
+    # ---- Query guardrails (admin-set; enforced on every agent query) ---- #
+    block_all_indices_search: bool = Field(
+        True,
+        title="Block All-Index Searches",
+        description=(
+            "Reject queries that target every index at once (`_all`, `*`, or a "
+            "target made only of wildcards) — the equivalent of GET /_search. "
+            "Applies to DSL, SQL and ES|QL queries."
+        ),
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    allowed_index_patterns: Optional[str] = Field(
+        None,
+        title="Allowed Query Targets",
+        description=(
+            "Optional comma-separated index names or globs queries may target "
+            "(e.g. logs-*,metrics-*). Every index a query names must fall under "
+            "one of them. Empty: any index the credentials can read."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    max_result_size: Optional[int] = Field(
+        None,
+        ge=1,
+        le=10_000,
+        title="Max Documents per Query",
+        description=(
+            "Upper bound on documents one query may return (size + from for DSL; "
+            "row cap for SQL and ES|QL). Empty: 10,000 (the engine's limit)."
+        ),
+        json_schema_extra={"ui:type": "number"},
+    )
+    max_aggregations: Optional[int] = Field(
+        None,
+        ge=1,
+        title="Max Aggregations per Query",
+        description="Upper bound on the number of aggregations in one DSL query (all nesting levels). Empty: no limit.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    max_aggregation_depth: Optional[int] = Field(
+        None,
+        ge=1,
+        title="Max Aggregation Nesting Depth",
+        description="Upper bound on how deeply aggregations may nest in one DSL query. Empty: no limit.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    max_aggregation_buckets: Optional[int] = Field(
+        None,
+        ge=1,
+        title="Max Aggregation Buckets",
+        description=(
+            "Upper bound on the buckets one DSL query may request: a single "
+            "terms/composite size, and the sizes multiplied down nested levels. "
+            "Empty: no limit (the cluster's search.max_buckets still applies)."
+        ),
+        json_schema_extra={"ui:type": "number"},
+    )
+    aggregation_limits_observe_only: bool = Field(
+        False,
+        title="Aggregation Limits: Log Only",
+        description=(
+            "Log queries that exceed the aggregation limits instead of rejecting "
+            "them — use to measure real queries before enforcing."
+        ),
+        json_schema_extra={"ui:type": "boolean"},
+    )
+
 
 # Azure Data Explorer (Kusto)
 class AzureDataExplorerCredentials(BaseModel):
@@ -1670,6 +2292,39 @@ class AzureDataExplorerConfig(BaseModel):
         json_schema_extra={"ui:type": "string"}
     )
     database: str = Field(..., title="Database", description="Database name", json_schema_extra={"ui:type": "string"})
+
+
+# Azure Cost Management — the Azure counterpart of AWS Cost Explorer.
+class AzureCostServicePrincipalCredentials(BaseModel):
+    tenant_id: str = Field(..., title="Tenant ID", description="Microsoft Entra ID (Azure AD) tenant ID.", json_schema_extra={"ui:type": "string"})
+    client_id: str = Field(..., title="Client ID", description="Application (client) ID of the app registration.", json_schema_extra={"ui:type": "string"})
+    client_secret: str = Field(..., title="Client Secret", description="Client secret of the app registration. Grant the app the Cost Management Reader role on the scope.", json_schema_extra={"ui:type": "password"})
+
+
+class AzureCostDefaultCredentials(BaseModel):
+    """No stored secret — azure-identity's DefaultAzureCredential resolves a
+    managed identity, workload identity, or AZURE_* environment variables."""
+    class Config:
+        extra = 'allow'
+
+
+class AzureCostConfig(BaseModel):
+    scope: str = Field(
+        ...,
+        title="Scope",
+        description=(
+            "What to report on. A subscription ID, or a scope path such as "
+            "/subscriptions/<id>, /subscriptions/<id>/resourceGroups/<name>, "
+            "/providers/Microsoft.Management/managementGroups/<id>, or a billing scope "
+            "like /providers/Microsoft.Billing/billingAccounts/<id>."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    cost_type: Literal["ActualCost", "AmortizedCost"] = Field(
+        "ActualCost",
+        title="Default cost view",
+        description="Actual cost matches your invoice. Amortized cost spreads reservation and savings plan purchases across their term.",
+    )
 
 
 # PostHog
@@ -2185,14 +2840,76 @@ class SharePointConfig(BaseModel):
         ),
         json_schema_extra={"ui:type": "number"},
     )
+    walk_concurrency: int = Field(
+        4,
+        ge=1,
+        le=16,
+        title="Parallel Graph Requests",
+        description=(
+            "Folders listed in parallel while browsing sub-folders. Microsoft "
+            "throttles per app registration, so lower this (1-2) if the tenant "
+            "reports HTTP 429 / 'rate limit' errors; raise it only for small, "
+            "fast libraries. Full-library indexing uses Graph's delta feed and "
+            "is not affected."
+        ),
+        json_schema_extra={"ui:type": "number"},
+    )
 
 
-# SharePoint Server uses Windows auth and its own REST API, not Graph.
+# SharePoint Server uses Windows auth with modern REST or legacy SOAP APIs.
 class SharePointOnpremConfig(SharePointConfig):
+    drive_name: Optional[str] = Field(
+        "*", title="Document Library",
+        description="Document library name, or * for all visible libraries. Blank selects the default library in Modern REST mode only.",
+        json_schema_extra={"ui:type": "string", "ui:descriptionKey": "data.sharepointApi.libraryDescription"},
+    )
+    # Graph-only tuning is inherited for stored-config compatibility, but unused.
+    walk_concurrency: int = Field(4, ge=1, le=16, json_schema_extra={"ui:hidden": True})
+    api_mode: Literal["modern", "2010"] = Field(
+        "modern", title="SharePoint API",
+        description="SharePoint 2010 uses legacy services; live search matches filenames only. Enter a library name or *; do not leave the library blank.",
+        json_schema_extra={"ui:type": "select", "ui:order": -1, "ui:titleKey": "data.sharepointApi.title",
+                           "ui:descriptionKey": "data.sharepointApi.description",
+                           "ui:enumLabels": {"modern": "Modern REST", "2010": "SharePoint 2010"},
+                           "ui:enumLabelKeys": {"modern": "data.sharepointApi.modern", "2010": "data.sharepointApi.legacy"}},
+    )
+
+    @model_validator(mode="after")
+    def legacy_library_required(self):
+        if self.drive_name is not None:
+            self.drive_name = self.drive_name.strip()
+        if self.api_mode == "2010" and not (self.drive_name or "").strip():
+            raise ValueError("SharePoint 2010 requires a document library name or * for all libraries.")
+        return self
+
     site_url: str = Field(..., title="Site URL", description="SharePoint Server site URL, including /sites/name. Not the Central Administration URL.", json_schema_extra={"ui:type": "string"})
     allow_http: bool = Field(False, title="Allow HTTP (test labs only)", description="Allow unencrypted HTTP for an isolated lab. Use HTTPS with a trusted certificate for customer deployments.", json_schema_extra={"ui:type": "boolean"})
     max_file_size_mb: int = Field(50, ge=1, le=250, title="Max file size (MB)", description="Reject oversized downloads before parsing; files are never silently truncated.", json_schema_extra={"ui:type": "number"})
     max_catalog_objects: int = Field(5000, ge=1, le=50000, title="Max Files", json_schema_extra={"ui:type": "number"})
+    index_mode: str = Field(
+        "metadata",
+        title="Indexing",
+        description=(
+            "How much to cache from the library. 'none' → nothing cached; the "
+            "agent lists and reads live every time. 'metadata' → cache the file "
+            "list on a schedule. 'content' → also extract keywords from "
+            "PDF/Word/PowerPoint/Excel/CSV/text/email (.eml/.msg) files so "
+            "search_files can find files by topic without crawling the "
+            "library; unchanged files are "
+            "not downloaded again on later runs. The keyword catalog is only "
+            "used for service-account (system) connections; per-user "
+            "connections always search live. Reads are always live regardless."
+        ),
+        json_schema_extra={
+            "ui:type": "select",
+            "enum": ["none", "metadata", "content"],
+            "ui:enumLabels": {
+                "none": "None (live only)",
+                "metadata": "File list",
+                "content": "Contents (searchable)",
+            },
+        },
+    )
 
 
 class SharePointOnpremNtlmCredentials(BaseModel):
@@ -2211,8 +2928,256 @@ class SharePointOnpremKerberosCredentials(BaseModel):
         return self
 
 
+# OpenText Documentum (Documentum REST Services, read-only file connector).
+class DocumentumConfig(BaseModel):
+    rest_url: str = Field(
+        ...,
+        title="REST Services URL",
+        description="Documentum REST Services base URL, e.g. https://dctm.example.com/dctm-rest (also accepts a D2 REST root).",
+        json_schema_extra={"ui:type": "string"},
+    )
+    repository: str = Field(
+        ...,
+        title="Repository",
+        description="Repository (docbase) name, e.g. corp_docs. One connection reads one repository.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    root_path: str = Field(
+        "/",
+        title="Root Folder",
+        description=(
+            "Cabinet or folder path that bounds this connection, e.g. /Finance/Reports. "
+            "Everything outside it is invisible and unreadable. Use '/' for every cabinet the identity can see."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    include_globs: Optional[str] = Field(
+        None,
+        title="Include Patterns (globs)",
+        description=(
+            "Glob patterns relative to the root folder — the connection's scope. When set, ONLY matching "
+            "documents are visible AND readable. '2026/**/*.pdf' (PDFs under 2026), '**/*.xlsx' (all Excel "
+            "files). Comma-separated; '**' crosses subfolders, '*' is one segment. Leave blank to allow the whole root."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    object_types: Optional[str] = Field(
+        None,
+        title="Object Types",
+        description=(
+            "Comma-separated Documentum document types to expose (e.g. 'bow_invoice, dm_document'). "
+            "Leave blank (or include dm_document) for every document type."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    recursive: bool = Field(
+        True,
+        title="Include Subfolders",
+        description="Recursively enumerate subfolders when listing and indexing.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    index_mode: str = Field(
+        "metadata",
+        title="Indexing",
+        description=(
+            "How much to cache from the repository. 'none' → nothing cached; the agent lists and reads "
+            "live every time. 'metadata' → cache the document list on a schedule. Reads are always live."
+        ),
+        json_schema_extra={
+            "ui:type": "select",
+            "enum": ["none", "metadata"],
+            "ui:enumLabels": {"none": "None (live only)", "metadata": "Document list"},
+        },
+    )
+    max_catalog_objects: int = Field(5000, ge=1, le=50000, title="Max Documents",
+        description="Safety cap on how many documents are enumerated into the catalog. Narrow the root folder or include patterns instead of raising this.",
+        json_schema_extra={"ui:type": "number"})
+    max_file_size_mb: int = Field(50, ge=1, le=250, title="Max file size (MB)",
+        description="Reject oversized downloads before parsing; files are never silently truncated.",
+        json_schema_extra={"ui:type": "number"})
+    allow_http: bool = Field(False, title="Allow HTTP (test labs only)",
+        description="Allow unencrypted HTTP for an isolated lab. Use HTTPS with a trusted certificate for customer deployments.",
+        json_schema_extra={"ui:type": "boolean"})
+
+
+class DocumentumUserPassCredentials(BaseModel):
+    """Repository (or OTDS-synchronized) username and password — HTTP Basic."""
+    username: str = Field(..., min_length=1, title="Username",
+        description="Documentum login name (user_login_name). For OTDS-backed repositories this is usually the UPN or userid@partition.",
+        json_schema_extra={"ui:type": "string"})
+    password: str = Field(..., min_length=1, title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class DocumentumOtdsClientCredentials(BaseModel):
+    """A confidential OTDS OAuth client. Alone it acts as the client's service
+    user (client-credentials grant); combined with the per-user impersonation
+    overlay it mints tokens for each BOW user (RFC 8693 token exchange)."""
+    otds_url: str = Field(..., title="OTDS URL",
+        description="OpenText Directory Services base URL, e.g. https://otds.example.com (the /otdsws suffix is optional).",
+        json_schema_extra={"ui:type": "string"})
+    client_id: str = Field(..., min_length=1, title="OAuth client ID",
+        description="Confidential OTDS OAuth client. Enable 'Allow impersonation' on it (and on the repository resource) for per-user access.",
+        json_schema_extra={"ui:type": "string"})
+    client_secret: str = Field(..., min_length=1, title="OAuth client secret", json_schema_extra={"ui:type": "password"})
+    partition: Optional[str] = Field(None, title="OTDS partition",
+        description="Partition the users live in (appended as userid@partition when a login has no '@'). Leave blank if logins already carry it.",
+        json_schema_extra={"ui:type": "string"})
+
+
+class DocumentumImpersonationCredentials(BaseModel):
+    """Per-user identity for OTDS impersonation (overlay over the connection's
+    OTDS client). Holds NO secret: the admin's OAuth client stays on the
+    connection and Documentum evaluates every call with this user's ACLs."""
+    documentum_login: str = Field(..., min_length=1, title="Documentum login",
+        description="Your Documentum user (user_login_name), e.g. jane.doe@corp.example.com or jdoe@Corp. Usually your work email or UPN.",
+        json_schema_extra={"ui:type": "string"})
+
+
+# KMS Lighthouse (knowledge articles and decision-tree scenarios, read-only file connector).
+class KmsLighthouseConfig(BaseModel):
+    base_url: str = Field(
+        ...,
+        title="KMS Lighthouse URL",
+        description="Tenant base URL, e.g. https://example.lighthouse-cloud.com (the API prefix may be included).",
+        json_schema_extra={"ui:type": "string"},
+    )
+    api_prefix: str = Field(
+        "/kms/lh/api",
+        title="API path prefix",
+        description="Path of the KMS public API under the base URL. Change it only if your tenant serves the API elsewhere.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    layout_id: Optional[int] = Field(
+        None, ge=1, title="Layout ID",
+        description="Optional KMS layout that search is limited to. Leave blank to search every layout the identity can see.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    root_folder_id: Optional[int] = Field(
+        None, ge=0, title="Root folder ID",
+        description=(
+            "Optional KMS folder that browsing starts from. It limits browsing only: search and reads "
+            "cover everything the identity can see in KMS."
+        ),
+        json_schema_extra={"ui:type": "number"},
+    )
+    include_offline: bool = Field(
+        False, title="Include offline content",
+        description="Also show articles and scenarios that are not Online (drafts, offline). Off by default.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    max_results: int = Field(
+        200, ge=1, le=1000, title="Max results",
+        description="Upper bound on articles and scenarios returned by one search or listing.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    allow_http: bool = Field(False, title="Allow HTTP (test labs only)",
+        description="Allow unencrypted HTTP for an isolated lab. Use HTTPS with a trusted certificate for customer deployments.",
+        json_schema_extra={"ui:type": "boolean"})
+    # No catalog (live only): keeps the index_mode consumers reporting "Live".
+    index_mode: str = Field("none", title="Indexing", json_schema_extra={"ui:hidden": True})
+
+    @field_validator("index_mode")
+    @classmethod
+    def _live_only(cls, value):
+        if value != "none":
+            raise ValueError("KMS Lighthouse connections are live only (no indexing).")
+        return value
+
+
+class KmsLighthouseUserPassCredentials(BaseModel):
+    """A KMS Lighthouse login (username and password)."""
+    # A validation error must not echo the rejected input (it may be the password).
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    username: str = Field(..., min_length=1, title="Username",
+        description="KMS Lighthouse login name.", json_schema_extra={"ui:type": "string"})
+    password: str = Field(..., min_length=1, title="Password",
+        description=("This login relies on an undocumented KMS call that sends the password in the URL, where "
+                     "KMS, a firewall or a proxy can log it. Use an API token when you can."),
+        json_schema_extra={"ui:type": "password"})
+
+    @field_validator("username", "password")
+    @classmethod
+    def _not_blank(cls, value):
+        if not value.strip():
+            raise ValueError("Enter a value, not only spaces.")
+        return value
+
+    @field_validator("username")
+    @classmethod
+    def _trim_username(cls, value):
+        # A copied login name may carry stray spaces; the password is kept exactly as typed.
+        return value.strip()
+
+
+# Visible ASCII only: a token goes into an HTTP header as-is. Use fullmatch
+# (\Z, not $: `$` also matches before a trailing newline).
+KMS_TOKEN_RE = re.compile(r"\A[\x21-\x7e]+\Z")
+KMS_TOKEN_FORMAT_MESSAGE = (
+    "The KMS API token can contain only plain letters, digits and punctuation, with no spaces. "
+    "Copy it again from KMS Lighthouse and paste it as plain text."
+)
+
+
+class KmsLighthouseTokenCredentials(BaseModel):
+    """A pasted KMS Lighthouse API token, sent as a Bearer token."""
+    # A validation error must not echo the rejected token.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    api_token: str = Field(..., min_length=1, title="API token",
+        description="KMS Lighthouse access token for this identity.", json_schema_extra={"ui:type": "password"})
+
+    @field_validator("api_token")
+    @classmethod
+    def _plain_token(cls, value):
+        value = value.strip()
+        if not KMS_TOKEN_RE.fullmatch(value):
+            raise ValueError(KMS_TOKEN_FORMAT_MESSAGE)
+        return value
+
+
 # SharePoint Lists (Microsoft Graph — same auth as SharePoint, but surfaces
 # the site's LISTS as queryable tables instead of its libraries as files).
+# Microsoft Intune (Microsoft Graph, app-only). Tenant-wide device inventory is
+# read with *application* permissions, so only the app registration is needed.
+class IntuneCredentials(BaseModel):
+    tenant_id: str = Field(
+        ...,
+        title="Tenant ID",
+        description="Microsoft Entra tenant ID (Directory ID) that holds your Intune subscription.",
+        json_schema_extra={"ui:type": "string"}
+    )
+    client_id: str = Field(
+        ...,
+        title="Client ID",
+        description=(
+            "Application (client) ID of an Entra app registration granted, with admin consent, "
+            "the read-only Microsoft Graph application permissions "
+            "DeviceManagementManagedDevices.Read.All, DeviceManagementConfiguration.Read.All, "
+            "DeviceManagementApps.Read.All and DeviceManagementServiceConfig.Read.All. "
+            "Tables whose permission is missing are simply left out."
+        ),
+        json_schema_extra={"ui:type": "string"}
+    )
+    client_secret: str = Field(
+        ...,
+        title="Client Secret",
+        description="A client secret of that app registration.",
+        json_schema_extra={"ui:type": "password"}
+    )
+
+
+class IntuneConfig(BaseModel):
+    max_rows: int = Field(
+        50000,
+        ge=1,
+        le=50000,
+        title="Max Rows Per Query",
+        description="Safety cap on how many records a single query may page through.",
+        json_schema_extra={"ui:type": "number"},
+    )
+
+
 class SharePointListsCredentials(SharePointCredentials):
     """SharePoint Lists uses the same Microsoft Graph auth as SharePoint."""
     pass
@@ -2289,6 +3254,20 @@ class OneDriveConfig(BaseModel):
         description=(
             "Safety cap on how many files are enumerated into one user's "
             "catalog. Drives with more than this are truncated."
+        ),
+        json_schema_extra={"ui:type": "number"},
+    )
+    walk_concurrency: int = Field(
+        4,
+        ge=1,
+        le=16,
+        title="Parallel Graph Requests",
+        description=(
+            "Folders listed in parallel while browsing sub-folders. Microsoft "
+            "throttles per app registration, so lower this (1-2) if the tenant "
+            "reports HTTP 429 / 'rate limit' errors; raise it only for small, "
+            "fast libraries. Full-library indexing uses Graph's delta feed and "
+            "is not affected."
         ),
         json_schema_extra={"ui:type": "number"},
     )
@@ -2452,6 +3431,17 @@ class GoogleDriveCredentials(BaseModel):
     )
 
 
+class GoogleDriveServiceAccountCredentials(BaseModel):
+    """Shared access through one Google service account. Everyone on the
+    connection sees the files shared with the service account's email."""
+    service_account_json: str = Field(
+        ...,
+        title="Service Account JSON",
+        description="The service account's JSON key. Share Drive folders (or add it to a Shared Drive) using its client_email.",
+        json_schema_extra={"ui:type": "textarea"}
+    )
+
+
 class GoogleDriveConfig(BaseModel):
     """Google Drive needs no admin-side configuration — each user's OAuth
     token determines what files are visible."""
@@ -2540,8 +3530,8 @@ class NetworkDirConfig(BaseModel):
             "agent lists/reads live every time (freshest, best for volatile or "
             "huge dirs). 'metadata' → cache the file list on a schedule "
             "(fast listing, no content search). 'content' → also extract "
-            "keywords from PDF/Word/PowerPoint/Excel/CSV so the agent can find "
-            "files by topic. Reads are always live regardless."
+            "keywords from PDF/Word/PowerPoint/Excel/CSV/email (.eml/.msg) so "
+            "the agent can find files by topic. Reads are always live regardless."
         ),
         json_schema_extra={
             "ui:type": "select",
@@ -2858,7 +3848,8 @@ class QlikSenseOnPremCertCredentials(BaseModel):
         title="Root CA Certificate (root.pem)",
         description=(
             "Paste the full contents of root.pem. Qlik signs its service certificates with its "
-            "own root, so this is what makes 'Verify SSL' work on a default install."
+            "own root, so this is what makes 'Verify SSL' work on a default install. Ignored "
+            "when 'Verify SSL' is off."
         ),
         json_schema_extra={"ui:type": "textarea"},
     )
@@ -2869,7 +3860,9 @@ class QlikSenseOnPremCertCredentials(BaseModel):
             "Directory of the account Qlik should act as, e.g. an AD domain name. "
             "Defaults to INTERNAL."
         ),
-        json_schema_extra={"ui:type": "string"},
+        # Under "Require user authentication" the admin can bind this to a
+        # member attribute instead (services/member_identity.py).
+        json_schema_extra={"ui:type": "string", "ui:memberBindable": True},
     )
     user_id: Optional[str] = Field(
         None,
@@ -2879,41 +3872,14 @@ class QlikSenseOnPremCertCredentials(BaseModel):
             "which sees the whole site. Set it to a real user to have Qlik apply that user's "
             "app permissions and Section Access rules."
         ),
-        json_schema_extra={"ui:type": "string"},
-    )
-
-
-class QlikSenseOnPremUserIdentityCredentials(BaseModel):
-    """Per-user identity for a connection that requires user authentication.
-
-    Deliberately holds NO certificate material: the admin's client certificate
-    stays on the connection's system credentials, and this identity is merged
-    over it at query time (the variant is marked ``overlay`` in the registry).
-    The user only states who Qlik should evaluate their queries as — Qlik then
-    applies that account's stream access and Section Access rules.
-    """
-
-    user_directory: str = Field(
-        ...,
-        title="User Directory",
-        description=(
-            "Your Qlik user directory, e.g. your AD domain name — the part before the "
-            "backslash in DOMAIN\\user in the Qlik hub."
-        ),
-        json_schema_extra={"ui:type": "string"},
-    )
-    user_id: str = Field(
-        ...,
-        title="User ID",
-        description="Your Qlik user id — queries run with your stream access and Section Access rules.",
-        json_schema_extra={"ui:type": "string"},
+        json_schema_extra={"ui:type": "string", "ui:memberBindable": True},
     )
 
 
 class QlikSenseOnPremConfig(BaseModel):
     """Connection form for QSEoW — deliberately small, like the Power BI and
     BigQuery forms. Crawl-behavior knobs (impersonate_app_owner,
-    include_master_items, include_lineage, max_apps, max_concurrency,
+    include_master_items, include_lineage, max_apps,
     timeout_sec) stay client constructor defaults rather than form fields:
     they tune discovery internals, not connection identity."""
 
@@ -2931,7 +3897,8 @@ class QlikSenseOnPremConfig(BaseModel):
         title="Verify SSL",
         description=(
             "Verify the server's TLS certificate. A default install uses self-signed service "
-            "certificates, so this needs root.pem pasted in the credentials section."
+            "certificates, so this needs root.pem pasted in the credentials section. When off, "
+            "the certificate is not checked, even if root.pem is pasted."
         ),
         json_schema_extra={"ui:type": "boolean"},
     )
@@ -2940,6 +3907,20 @@ class QlikSenseOnPremConfig(BaseModel):
         title="Stream Filter",
         description="Optional comma-separated stream names or IDs. Empty crawls all visible streams.",
         json_schema_extra={"ui:type": "string"},
+    )
+    app_filter: Optional[str] = Field(
+        None,
+        title="App Filter",
+        description="Optional comma-separated app names or IDs, within the selected streams. Empty includes all matching apps. Use IDs for names containing commas.",
+        json_schema_extra={"ui:type": "string", "ui:titleKey": "data.qlikOnPrem.appFilterTitle",
+                           "ui:descriptionKey": "data.qlikOnPrem.appFilterDescription"},
+    )
+    max_concurrency: int = Field(
+        4, ge=1, le=4,
+        title="Concurrent Apps",
+        description="Maximum apps opened at once during indexing (1–4). Choose 1 for large apps or limited memory. Apps load on demand; preload tasks are not required.",
+        json_schema_extra={"ui:type": "select", "ui:options": [1, 2, 3, 4], "ui:titleKey": "data.qlikOnPrem.concurrencyTitle",
+                           "ui:descriptionKey": "data.qlikOnPrem.concurrencyDescription"},
     )
     published_only: bool = Field(
         True,
@@ -3201,6 +4182,145 @@ class InforOlapConfig(BaseModel):
     )
 
 
+# Infor EPM — Application Engine REST API (IFS / OAuth2 via ION API Gateway)
+class InforEpmIonCredentials(BaseModel):
+    gateway_token_url: str = Field(
+        ...,
+        title="ION Token URL",
+        description="OAuth token URL formed from the pu and ot values in the .ionapi credentials file.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    gateway_client_id: str = Field(
+        ...,
+        title="ION Client ID",
+        description="Client ID (ci) from the backend-service .ionapi credentials file.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    gateway_client_secret: str = Field(
+        ...,
+        title="ION Client Secret",
+        description="Client secret (cs) from the backend-service .ionapi credentials file.",
+        json_schema_extra={"ui:type": "password"},
+    )
+    gateway_scope: str = Field(
+        "",
+        title="ION OAuth Scope",
+        description="Optional space-separated OAuth scopes assigned to the authorized application.",
+        json_schema_extra={"ui:type": "string"},
+    )
+
+
+class InforEpmServiceAccountCredentials(InforEpmIonCredentials):
+    gateway_service_account_key: str = Field(
+        ...,
+        min_length=1,
+        title="Service Account Key",
+        description="Service account access key for ION password-grant authentication.",
+        json_schema_extra={"ui:type": "password"},
+    )
+    gateway_service_account_secret: str = Field(
+        ...,
+        min_length=1,
+        title="Service Account Secret",
+        description="Service account secret for ION password-grant authentication.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class InforEpmTokenCredentials(BaseModel):
+    bearer_token: str = Field(
+        ...,
+        title="Bearer Token",
+        description=(
+            "A pre-issued gateway access token (e.g. copied from the ION API Swagger page). "
+            "Tokens expire — use this for testing only; production connections should use ION API Gateway credentials."
+        ),
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class InforEpmConfig(BaseModel):
+    api_url: str = Field(
+        ...,
+        title="Application Engine API URL",
+        description=(
+            "Base URL of the Application Engine REST service as shown in the ION API Swagger — "
+            "everything before the process name (e.g. https://<gateway>/<tenant>/.../api/rest/<Service>/v1). "
+            "Processes are called as <URL>/<ProcessName>[/async] and results fetched from <URL>/getasyncresult."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    olap_database: str = Field(
+        ...,
+        title="OLAP Database",
+        description="Name of the OLAP data connection / database, passed to every BOW process as OLAPName.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    max_rows: int = Field(
+        5000,
+        ge=1,
+        le=1000000,
+        title="Max rows per query",
+        description="Cell cap passed to BOW_ExecuteMdx as rowLimit; results beyond it are truncated.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    timeout_sec: int = Field(
+        120,
+        ge=1,
+        le=1800,
+        title="Query timeout (sec)",
+        description="Maximum time to wait for a process call (including async polling).",
+        json_schema_extra={"ui:type": "number"},
+    )
+    async_mode: bool = Field(
+        True,
+        title="Asynchronous execution",
+        description="Call processes via /async and poll getasyncresult (recommended). Disable to call processes synchronously.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the gateway's TLS certificate.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    cube_list_process: str = Field(
+        "BOW_GetCubeList",
+        title="Cube list process",
+        description="Application Engine process returning the cube names (one per line).",
+        json_schema_extra={"ui:type": "string"},
+    )
+    cube_schema_process: str = Field(
+        "BOW_GetCubeSchema",
+        title="Cube schema process",
+        description="Application Engine process returning a cube's <BOWSchema> XML (dimensions, hierarchies, element samples).",
+        json_schema_extra={"ui:type": "string"},
+    )
+    mdx_process: str = Field(
+        "BOW_ExecuteMdx",
+        title="MDX process",
+        description="Application Engine process executing an MDX statement and returning one cell per line.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    measure_dimension_pattern: str = Field(
+        "measure",
+        title="Measure dimension pattern",
+        description=(
+            "Dimensions whose name contains this text (case-insensitive) are treated as the cube's measures "
+            "dimension when the OLAP model does not flag one (ODBO type 2). Their elements become measure columns."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    poll_interval_sec: int = Field(
+        1,
+        ge=1,
+        le=30,
+        title="Poll interval (sec)",
+        description="Delay between getasyncresult polls in asynchronous mode.",
+        json_schema_extra={"ui:type": "number"},
+    )
+
+
 # Microsoft Analysis Services (SSAS — Multidimensional & Tabular, via XMLA)
 class AnalysisServicesCredentials(BaseModel):
     username: str = Field(
@@ -3325,7 +4445,11 @@ class MCPConfig(BaseModel):
             "Inject the user's identity into a metadata object on every tool call. "
             "Shape: {argument_key='custom_metadata', fields:[{name, source, mode, on_missing}]}. "
             "mode 'locked' hides the field from the model and always overrides; "
-            "'ai' surfaces it as a default the model may set."
+            "'ai' surfaces it as a default the model may set. Optional "
+            "dynamic_params_enabled + dynamic_params {key: default}: allow-list of "
+            "per-question values the caller sends as prompt.metadata; a listed key "
+            "takes the sent value, else its default (null = omit); unlisted keys are "
+            "dropped; a field of the same name wins."
         ),
         json_schema_extra={"ui:type": "json"}
     )
@@ -3377,6 +4501,22 @@ class MCPBearerCredentials(BaseModel):
     )
 
 
+class MCPBasicCredentials(BaseModel):
+    """HTTP Basic credentials, e.g. an Atlassian account email + API token."""
+    username: str = Field(
+        ...,
+        title="Email / username",
+        description="Account email or username (sent as the Basic auth user)",
+        json_schema_extra={"ui:type": "string"},
+    )
+    password: str = Field(
+        ...,
+        title="API token",
+        description="API token or password (sent as the Basic auth password)",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
 class MCPOAuthAppCredentials(BaseModel):
     """Pre-configured OAuth client for an MCP server.
 
@@ -3391,6 +4531,11 @@ class MCPOAuthAppCredentials(BaseModel):
         description="OAuth authorization endpoint (e.g. https://idp.example.com/oauth/authorize)",
         json_schema_extra={"ui:type": "string"}
     )
+
+    @field_validator("authorize_url")
+    @classmethod
+    def _authorize_url_is_http(cls, v):
+        return _require_http_url(v, "authorize_url")
     token_url: str = Field(
         ...,
         title="Token URL",
@@ -3531,6 +4676,7 @@ class CustomAPIOAuthAppCredentials(MCPOAuthAppCredentials):
     pass
 
 
+<<<<<<< HEAD
 # Tally
 class TallyConfig(BaseModel):
     host: str = Field("localhost", title="Host", description="Tally server hostname or IP", json_schema_extra={"ui:type": "string"})
@@ -3552,7 +4698,188 @@ class ZohoBooksConfig(BaseModel):
     region: str = Field("com", title="Region", description="Zoho region: com, eu, in, com.au, jp", json_schema_extra={"ui:type": "string"})
 class ZohoBooksCredentials(BaseModel):
     access_token: str = Field(..., title="Access Token", description="Zoho OAuth2 access token", json_schema_extra={"ui:type": "password"})
+=======
+class NetAppOntapCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="ONTAP account with HTTP application access and read-only diagnostic permissions.")
+    password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class NetAppOntapConfig(BaseModel):
+    url: str = Field(..., title="Cluster management URL", description="Reachable ONTAP management origin, for example https://cluster.example:443. Targets ONTAP 9.14.1.")
+    ca_certificate: Optional[str] = Field(None, title="Trusted CA certificate", description="Optional PEM CA certificate for the cluster. Certificate verification is always enabled.", json_schema_extra={"ui:type": "textarea"})
+    timeout: int = Field(30, ge=1, le=120, title="Request timeout (seconds)")
+    max_rows: int = Field(10000, ge=1, le=100000, title="Maximum complete result rows", description="Queries exceeding this ceiling fail explicitly; they never return silently truncated evidence.")
+    allow_http: bool = Field(False, title="Allow HTTP for a simulator", description="Only enable for an isolated simulated API. Real clusters should use HTTPS.")
+
+
+class BrocadeCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="A switch account with read access to the required fabrics.", json_schema_extra={"ui:type": "string"})
+    password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class BrocadeConfig(BaseModel):
+    url: str = Field(..., title="Switch URL", description="HTTPS management address of the Brocade switch.", json_schema_extra={"ui:type": "string"})
+    vf_ids: str = Field("", title="Fabric IDs", description="Optional comma-separated fabric IDs to restrict queries. Each logical-switch query must specify a fabric ID.", json_schema_extra={"ui:type": "string"})
+    include_advanced: bool = Field(False, title="Include advanced diagnostic tables", description="The default catalog contains 12 primary investigation tables.")
+    allow_http: bool = Field(False, title="Allow HTTP for a local simulator", description="Only loopback addresses are accepted over HTTP.")
+    login_scheme: Literal["Basic", "Custom_Basic"] = Field("Custom_Basic", title="Login scheme", description="Use Custom_Basic or Basic, as supported by your switch.")
+
+
+class F5BigIpCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="BIG-IP account with a read-only role (Guest or Auditor). Remote-auth (LDAP/RADIUS/TACACS) users are supported through token login.")
+    password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class F5BigIpConfig(BaseModel):
+    url: str = Field(..., title="Management URL", description="BIG-IP management origin, for example https://bigip.example:443. Uses iControl REST under /mgmt.")
+    login_provider: str = Field("tmos", title="Login provider", description="iControl REST loginProviderName used for token login. Keep tmos unless your remote-auth provider differs.")
+    ca_certificate: Optional[str] = Field(None, title="Trusted CA certificate", description="Optional PEM CA certificate for the appliance. Certificate verification is always enabled.", json_schema_extra={"ui:type": "textarea"})
+    timeout: int = Field(30, ge=1, le=120, title="Request timeout (seconds)")
+    max_rows: int = Field(10000, ge=1, le=100000, title="Maximum complete result rows", description="Queries exceeding this ceiling fail explicitly; they never return silently truncated evidence.")
+    allow_http: bool = Field(False, title="Allow HTTP for a simulator", description="Only enable for an isolated simulated API. Real appliances should use HTTPS.")
+
+
+class CheckPointUserPassCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="Management administrator with a Read Only permission profile. Sessions are opened read-only and never publish.")
+    password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class CheckPointApiKeyCredentials(BaseModel):
+    api_key: str = Field(..., title="API key", description="API key of a read-only administrator (required for Smart-1 Cloud).", json_schema_extra={"ui:type": "password"})
+
+
+class CheckPointConfig(BaseModel):
+    url: str = Field(..., title="Management URL", description="Security Management Server origin (https://mgmt.example:443, optionally ending in /web_api) or the Smart-1 Cloud Web-API URL (https://<tenant>.maas.checkpoint.com/<context>/web_api).")
+    domain: Optional[str] = Field(None, title="Domain", description="Multi-Domain Server domain name to log in to. Leave empty for a single-domain Security Management Server.")
+    api_version: Optional[str] = Field(None, title="API version", description="Optional Management API version to pin, for example 1.9.1. Empty uses the server default.")
+    ca_certificate: Optional[str] = Field(None, title="Trusted CA certificate", description="Optional PEM CA certificate for the management server. Certificate verification is always enabled.", json_schema_extra={"ui:type": "textarea"})
+    timeout: int = Field(30, ge=1, le=120, title="Request timeout (seconds)")
+    max_rows: int = Field(10000, ge=1, le=100000, title="Maximum complete result rows", description="Queries exceeding this ceiling fail explicitly; they never return silently truncated evidence.")
+    allow_http: bool = Field(False, title="Allow HTTP for a simulator", description="Only enable for an isolated simulated API. Real servers should use HTTPS.")
+
+
+class DellOmeCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="OpenManage Enterprise account with the Viewer role.")
+    password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class DellOmeConfig(BaseModel):
+    url: str = Field(..., title="Appliance URL", description="OpenManage Enterprise (or OME-Modular) origin, for example https://ome.example:443.")
+    ca_certificate: Optional[str] = Field(None, title="Trusted CA certificate", description="Optional PEM CA certificate for the appliance. Certificate verification is always enabled.", json_schema_extra={"ui:type": "textarea"})
+    timeout: int = Field(30, ge=1, le=120, title="Request timeout (seconds)")
+    max_rows: int = Field(10000, ge=1, le=100000, title="Maximum complete result rows", description="Queries exceeding this ceiling fail explicitly; they never return silently truncated evidence.")
+    allow_http: bool = Field(False, title="Allow HTTP for a simulator", description="Only enable for an isolated simulated API. Real appliances should use HTTPS.")
+
+
+class HpeOneViewCredentials(BaseModel):
+    username: str = Field(..., title="Username", description="OneView account with the Read only role.")
+    password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
+
+
+class HpeOneViewConfig(BaseModel):
+    url: str = Field(..., title="Appliance URL", description="OneView or Synergy Composer origin, for example https://oneview.example:443.")
+    auth_login_domain: str = Field("local", title="Authentication directory", description="authLoginDomain sent at login: local for appliance accounts, or the configured directory name.")
+    api_version: Optional[int] = Field(None, title="X-API-Version", description="Optional API version to pin. Empty negotiates the appliance's current version from GET /rest/version (clamped to the connector's supported range 1200–7200).")
+    ca_certificate: Optional[str] = Field(None, title="Trusted CA certificate", description="Optional PEM CA certificate for the appliance. Certificate verification is always enabled.", json_schema_extra={"ui:type": "textarea"})
+    timeout: int = Field(30, ge=1, le=120, title="Request timeout (seconds)")
+    max_rows: int = Field(10000, ge=1, le=100000, title="Maximum complete result rows", description="Queries exceeding this ceiling fail explicitly; they never return silently truncated evidence.")
+    allow_http: bool = Field(False, title="Allow HTTP for a simulator", description="Only enable for an isolated simulated API. Real appliances should use HTTPS.")
+
+
+class GitRepoConfig(BaseModel):
+    """One repository, read-only: the agent lists, searches and reads its files.
+
+    Shared by the GitHub / GitLab / Bitbucket code connections. The repo is
+    cloned lazily into a local cache and refreshed when stale; nothing in it
+    is ever executed (see app.services.repo_cache).
+    """
+    repo: str = Field(
+        ...,
+        title="Repository",
+        description="owner/name (GitHub), group/project (GitLab) or workspace/repo (Bitbucket). A full https URL also works.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    branch: Optional[str] = Field(
+        None,
+        title="Branch",
+        description="Branch to read. Leave empty for the repository's default branch.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    host: Optional[str] = Field(
+        None,
+        title="Server (self-hosted)",
+        description="Only for GitHub Enterprise Server or self-managed GitLab, e.g. git.company.com. Leave empty for the cloud service.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    include_globs: Optional[str] = Field(
+        None,
+        title="Limit to paths",
+        description="Optional comma-separated globs (e.g. src/**, docs/**/*.md). Empty = whole repository.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    allow_secret_files: bool = Field(
+        False,
+        title="Allow secret-looking files",
+        description="Off by default: files like .env, *.pem, *.key and id_rsa are hidden from the agent.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    max_file_mb: int = Field(
+        5,
+        title="Max File Size (MB)",
+        description="Skip files larger than this when reading or searching.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    index_mode: str = Field(
+        "metadata",
+        title="Indexing",
+        description="'metadata' caches the file list for fast search; 'none' always lists live.",
+        json_schema_extra={"ui:type": "string", "ui:hidden": True},
+    )
+
+
+class GitTokenCredentials(BaseModel):
+    token: str = Field(
+        ...,
+        title="Access token",
+        description="A token with read access to the repository's contents.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class BitbucketTokenCredentials(BaseModel):
+    username: Optional[str] = Field(
+        None,
+        title="Username",
+        description="Leave empty for an Atlassian API token (x-bitbucket-api-token-auth); use 'x-token-auth' for a repository access token.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    token: str = Field(
+        ...,
+        title="API token",
+        description="Atlassian API token with the read:repository:bitbucket scope, or a repository access token.",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class GitPublicCredentials(BaseModel):
+    """Public repository: no credentials."""
+    class Config:
+        extra = "allow"
+
+
+>>>>>>> v0.0.613
 __all__ = [
+    "GitRepoConfig",
+    "GitTokenCredentials",
+    "BitbucketTokenCredentials",
+    "GitPublicCredentials",
+    "SpectrumConfig",
+    "SpectrumUserPassCredentials",
+    "SpectrumTokenCredentials",
+    "BrocadeConfig",
+    "BrocadeCredentials",
+    "NetAppOntapConfig",
+    "NetAppOntapCredentials",
     # Configs
     "PostgreSQLConfig",
     "SQLiteConfig",
@@ -3658,10 +4985,15 @@ __all__ = [
     "PriorityErpPatCredentials",
     "PriorityErpBasicCredentials",
     "PriorityErpConfig",
+    # Microsoft Configuration Manager
+    "MecmNtlmCredentials",
+    "MecmKerberosCredentials",
+    "MecmConfig",
     # MCP
     "MCPConfig",
     "MCPNoAuthCredentials",
     "MCPBearerCredentials",
+    "MCPBasicCredentials",
     "MCPOAuthAppCredentials",
     # Custom API
     "CustomAPIConfig",

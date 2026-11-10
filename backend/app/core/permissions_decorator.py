@@ -1,3 +1,4 @@
+from app.errors import AppError, ErrorCode
 import logging as _logging
 from sqlalchemy import select
 from sqlalchemy.orm import lazyload
@@ -13,17 +14,31 @@ from app.core.permission_resolver import resolve_permissions, principal_belongs_
 _perm_logger = _logging.getLogger(__name__)
 
 
-async def _audit_access_denied(db, user, organization, permission: str, endpoint: str) -> None:
-    """Fire-and-forget audit log for permission denials."""
+async def _audit_access_denied(db, user, organization, permission: str, endpoint: str,
+                               reason: str = "missing_permission", resource_type=None, resource_id=None) -> None:
+    """Fire-and-forget audit log for permission denials.
+
+    Source context (ip, user agent, request id, session id) comes from the
+    ambient audit context the HTTP middleware bound. The attempted resource
+    is named when the route identifies one; whether it exists is not
+    revealed to the client and is not inferred here.
+    """
     try:
         from app.ee.audit.service import audit_service
+        perm = permission if isinstance(permission, str) else ",".join(str(p) for p in (permission or ()))
         await audit_service.log(
             db=db,
             organization_id=str(organization.id) if organization else None,
             action="access.denied",
             user_id=str(user.id) if user else None,
-            resource_type="permission",
-            details={"permission": permission, "endpoint": endpoint},
+            resource_type=resource_type or "permission",
+            resource_id=str(resource_id) if resource_id else None,
+            details={"permission": perm, "endpoint": endpoint, "reason": reason,
+                     "resource_type": resource_type, "resource_id": str(resource_id) if resource_id else None},
+            outcome="denied",
+            failure_reason=reason,
+            actor=user,
+            service_account=bool(getattr(user, "is_service_account", False)),
         )
     except Exception:
         _perm_logger.debug("_audit_access_denied failed", exc_info=True)
@@ -91,8 +106,18 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
             # Check that the principal belongs to the organization. Humans bind
             # via a Membership; service accounts bind via a ServiceAccount row.
             if not await principal_belongs_to_org(db, user, organization.id):
-                await _audit_access_denied(db, user, organization, permission, func.__name__)
+                await _audit_access_denied(db, user, organization, permission, func.__name__, "not_a_member",
+                                           getattr(model, "__tablename__", None) if model else None, object_id)
                 raise HTTPException(status_code=403, detail="User is not a member of this organization")
+
+            from app.services.bow_source_access import guard_route
+            try:
+                await guard_route(db, user, kwargs, organization)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    await _audit_access_denied(db, user, organization, permission, func.__name__, "source_access",
+                                               getattr(model, "__tablename__", None) if model else None, object_id)
+                raise
 
             # If model is provided and object_id exists and is not None and is a valid UUID-like string, verify object belongs to organization
             obj = None
@@ -172,6 +197,12 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
                             pass  # Org admin / project collaborator viewing: skip the ownership gate
                         elif allow_public and vis_obj is not None and hasattr(vis_obj, 'artifact_visibility'):
                             vis = getattr(vis_obj, 'artifact_visibility', 'none') or 'none'
+                            if vis != 'none':
+                                # Phase 9: a dashboard took over the link; its own
+                                # sharing decides, on /d.
+                                from app.services.dashboard_legacy import is_link_taken_over
+                                if await is_link_taken_over(db, vis_obj.id):
+                                    vis = 'none'
                             if vis in ('public', 'internal'):
                                 pass  # Allow org members to access
                             elif vis == 'shared':
@@ -185,22 +216,34 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
                                 )
                                 share_result = await db.execute(share_stmt)
                                 if not share_result.scalar_one_or_none() and not is_owner:
-                                    await _audit_access_denied(db, user, organization, permission, func.__name__)
+                                    await _audit_access_denied(db, user, organization, permission, func.__name__, "not_owner", model.__tablename__, object_id)
                                     raise HTTPException(status_code=403, detail="Only the owner can perform this action")
                             elif not is_owner:
-                                await _audit_access_denied(db, user, organization, permission, func.__name__)
+                                await _audit_access_denied(db, user, organization, permission, func.__name__, "not_owner", model.__tablename__, object_id)
                                 raise HTTPException(status_code=403, detail="Only the owner can perform this action")
                         elif allow_public and hasattr(obj, 'status') and obj.status == 'published':
                             pass  # Legacy fallback for non-report models
                         elif not is_owner:
-                            await _audit_access_denied(db, user, organization, permission, func.__name__)
+                            await _audit_access_denied(db, user, organization, permission, func.__name__, "not_owner", model.__tablename__, object_id)
                             raise HTTPException(status_code=403, detail="Only the owner can perform this action")
                     else:
                         raise HTTPException(status_code=500, detail="Object does not support ownership checks")
 
+            from app.services.connected_application_service import agent_ceiling
+            if permission == "manage_settings" and await agent_ceiling(db, str(organization.id)) is not None:
+                raise AppError.forbidden(ErrorCode.APPLICATION_MANAGEMENT_FORBIDDEN, "Manage applications directly in BOW")
+
             # Check role-based permission via RBAC resolver
             # `permission` may be a single string or a list/tuple (ANY-of semantics)
             resolved = await resolve_permissions(db, str(user.id), str(organization.id))
+
+            # Publish this request's code-visibility decision for the sync
+            # serializers (see app/core/code_visibility.py). Every RBAC-gated
+            # route passes through here, so step payloads, tool results and
+            # stream events are all covered without a per-call-site check.
+            from app.core.code_visibility import set_code_visibility, can_view_code
+            set_code_visibility(can_view_code(resolved))
+
             if isinstance(permission, (list, tuple, set)):
                 has_role_permission = any(resolved.has_org_permission(p) for p in permission)
             else:
@@ -243,7 +286,8 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
                     # the route body via check_resource_permissions.
                     if any(resolved.has_any_resource_permission(p) for p in perms_to_check):
                         return await func(*args, **kwargs)
-                await _audit_access_denied(db, user, organization, permission, func.__name__)
+                await _audit_access_denied(db, user, organization, permission, func.__name__, "missing_permission",
+                                           getattr(model, "__tablename__", None) if model else None, object_id)
                 _perm = permission if isinstance(permission, str) else "/".join(permission)
                 raise HTTPException(
                     status_code=403,
@@ -313,8 +357,15 @@ def requires_resource_permission(resource_type: str, permission: str):
 
             # Org membership check (Membership for humans, ServiceAccount for SAs)
             if not await principal_belongs_to_org(db, user, organization.id):
-                await _audit_access_denied(db, user, organization, permission, func.__name__)
+                await _audit_access_denied(db, user, organization, permission, func.__name__, "not_a_member",
+                                           getattr(model, "__tablename__", None) if model else None, object_id)
                 raise HTTPException(status_code=403, detail="User is not a member of this organization")
+
+            if resource_type == "data_source":
+                from app.services.connected_application_service import agent_ceiling
+                ceiling = await agent_ceiling(db, str(organization.id))
+                if ceiling is not None and str(all_args.get(_RESOURCE_PARAM_MAP[resource_type])) not in ceiling:
+                    raise AppError.forbidden(ErrorCode.APPLICATION_AGENT_FORBIDDEN, "Application has no access to this agent")
 
             resolved = await resolve_permissions(db, str(user.id), str(organization.id))
 
@@ -330,7 +381,7 @@ def requires_resource_permission(resource_type: str, permission: str):
             param_name = _RESOURCE_PARAM_MAP[resource_type]
             resource_id = all_args.get(param_name)
             if not resource_id:
-                await _audit_access_denied(db, user, organization, permission, func.__name__)
+                await _audit_access_denied(db, user, organization, permission, func.__name__, "missing_resource_id", resource_type, None)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Missing {param_name} in route for resource permission check",
@@ -349,7 +400,7 @@ def requires_resource_permission(resource_type: str, permission: str):
                 if ds_obj is not None and getattr(ds_obj, "is_public", False) and str(ds_obj.organization_id) == str(organization.id):
                     return await func(*args, **kwargs)
 
-            await _audit_access_denied(db, user, organization, permission, func.__name__)
+            await _audit_access_denied(db, user, organization, permission, func.__name__, "missing_permission", resource_type, resource_id)
             raise HTTPException(status_code=403, detail="Access denied to this resource")
 
         return wrapper
@@ -363,6 +414,8 @@ async def check_resource_permissions(
     resource_type: str,
     resource_ids: list[str],
     permission: str,
+    *,
+    name_resource: bool = True,
 ) -> None:
     """
     Imperative resource-permission check for cases where resource IDs come
@@ -379,9 +432,19 @@ async def check_resource_permissions(
 
     Raises HTTPException 403 if the user lacks the permission on ANY of
     the listed resources. Fails the whole batch on the first miss.
+
+    ``name_resource=False`` keeps the 403 generic. Use it when the caller
+    did not pick the ids (e.g. agents a build snapshot touches): naming them
+    would disclose agents the caller cannot see.
     """
     if not resource_ids:
         return
+
+    if resource_type == "data_source":
+        from app.services.connected_application_service import agent_ceiling
+        ceiling = await agent_ceiling(db, org_id)
+        if ceiling is not None and any(str(rid) not in ceiling for rid in resource_ids):
+            raise AppError.forbidden(ErrorCode.APPLICATION_AGENT_FORBIDDEN, "Application has no access to this agent")
 
     resolved = await resolve_permissions(db, user_id, org_id)
 
@@ -396,6 +459,8 @@ async def check_resource_permissions(
     # Tier 3: per-resource grant check (admin implications handled in resolver)
     for rid in resource_ids:
         if not resolved.has_resource_permission(resource_type, str(rid), permission):
+            if not name_resource:
+                raise HTTPException(status_code=403, detail="Access denied to this resource")
             # Name the resource: "Access denied to data_source 3f2c…" tells the
             # user nothing actionable. Best-effort — a lookup failure falls
             # back to the id rather than masking the 403.

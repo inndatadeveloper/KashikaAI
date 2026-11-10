@@ -22,6 +22,7 @@ from sqlalchemy import select, exists
 from app.core.telemetry import telemetry
 from app.services.file_preview import generate_file_preview
 from app.data_sources.clients._file_source_common import storage_safe_name
+from app.services import storage
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,23 @@ def is_agent_owned_file(file, inherited_ids: set) -> bool:
     return str(getattr(file, 'id', '')) in inherited_ids or kind != 'upload'
 
 
+async def _persist_or_fail(file_location: str, content_type: Optional[str]) -> None:
+    """Upload a freshly written file to the object store (no-op on local disk).
+
+    A file only this pod holds would vanish for every other replica, so a
+    failed upload fails the request instead of creating a dangling row.
+    """
+    try:
+        await storage.apersist(file_location, content_type)
+    except storage.StorageError as e:
+        logger.error("File storage upload failed for %s: %s", file_location, e)
+        try:
+            os.remove(file_location)
+        except OSError:
+            pass
+        raise HTTPException(status_code=503, detail="File storage is unavailable; the file was not saved.")
+
+
 class FileService:
     def __init__(self):
         pass
@@ -70,7 +88,10 @@ class FileService:
         # client's Content-Disposition header decoded to, and a name carrying
         # lone surrogates is unstorable in a UTF-8 column — the INSERT below
         # would fail mid-flush and take the request's session with it.
-        filename = storage_safe_name(file.filename or "")
+        # Reduce it to its last path component too: the name is client-chosen,
+        # and a `../` or `\\` in it would walk the write out of uploads/files
+        # (os.makedirs below happily creates the `<uuid>_..` stepping stone).
+        filename = os.path.basename(storage_safe_name(file.filename or "").replace("\\", "/")) or "upload"
         unique_filename = f"{uuid.uuid4()}_{filename}"
         file_location = f"uploads/files/{unique_filename}"
 
@@ -84,6 +105,7 @@ class FileService:
         async with aiofiles.open(file_location, "wb") as buffer:
             content = await file.read()
             await buffer.write(content)
+        await _persist_or_fail(file_location, file.content_type)
 
         # Create the database entry
         db_file = File(
@@ -187,6 +209,7 @@ class FileService:
 
         async with aiofiles.open(file_location, "wb") as buffer:
             await buffer.write(content)
+        await _persist_or_fail(file_location, content_type)
 
         db_file = File(
             filename=safe_name,
@@ -232,25 +255,21 @@ class FileService:
         return db_file
     
     async def remove_file_from_report(self, db: AsyncSession, file_id: str, report_id: str, organization: Organization, current_user: User):
-        stmt = select(Report).filter(Report.id == report_id)
+        stmt = select(Report).filter(Report.id == report_id, Report.organization_id == organization.id)
         result = await db.execute(stmt)
         report = result.scalar_one_or_none()
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
 
-        stmt = select(File).filter(File.id == file_id)
-        result = await db.execute(stmt)
-        file = result.scalar_one_or_none()
-        if not file:
-            raise HTTPException(status_code=404, detail="File not found")
-
+        # Only the association is looked up: whether some file with this id
+        # exists elsewhere (another report/org) must not change the answer.
         stmt = select(report_file_association).filter_by(
             report_id=report_id, file_id=file_id
         )
         result = await db.execute(stmt)
         association = result.first()
         if not association:
-            raise HTTPException(status_code=404, detail="File is not associated with this report")
+            raise HTTPException(status_code=404, detail="File not found")
 
         await db.execute(
             report_file_association.delete().where(
@@ -262,8 +281,15 @@ class FileService:
 
         return True
         
-    async def get_files(self, db: AsyncSession, organization: Organization):
+    async def get_files(self, db: AsyncSession, organization: Organization, current_user: User):
+        """Files the user may list: their own uploads plus the libraries of
+        agents and projects they can see (every file, for a full admin)."""
+        from app.services.file_access_service import visible_files_clause
+
         stmt = select(File).filter(File.organization_id == organization.id)
+        scope = await visible_files_clause(db, current_user, organization)
+        if scope is not None:
+            stmt = stmt.filter(scope)
         result = await db.execute(stmt)
         files = result.scalars().all()
 
@@ -279,13 +305,21 @@ class FileService:
 
         return files
 
-    async def get_files_by_report(self, db: AsyncSession, report_id: str, organization: Organization):
-        from app.models.report_data_source_association import report_data_source_association
+    async def get_files_by_report(self, db: AsyncSession, report_id: str, organization: Organization, current_user: User):
+        from sqlalchemy.orm import lazyload
 
-        stmt = select(Report).filter(Report.id == report_id)
+        from app.models.report_data_source_association import report_data_source_association
+        from app.services.file_access_service import user_can_view_report
+
+        stmt = select(Report).options(lazyload("*")).filter(
+            Report.id == report_id, Report.organization_id == organization.id,
+        )
         result = await db.execute(stmt)
         report = result.scalar_one_or_none()
-        if not report:
+        # A report's files are its conversation's attachments, so they follow
+        # the conversation's sharing. 404 rather than 403 so private report
+        # ids don't leak.
+        if not report or not await user_can_view_report(db, current_user, organization, report):
             raise HTTPException(status_code=404, detail="Report not found")
 
         # Query files with completion_id from the association table
@@ -400,6 +434,7 @@ class FileService:
             DeprecationWarning,
             stacklevel=2
         )
+        await storage.aensure_local(file.path)
         
         from openpyxl import load_workbook
         from openpyxl.utils.exceptions import InvalidFileException
@@ -475,6 +510,7 @@ class FileService:
             DeprecationWarning,
             stacklevel=2
         )
+        await storage.aensure_local(file.path)
         
         import tiktoken
         from app.ai.agents.doc.doc import DocAgent

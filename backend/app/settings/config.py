@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     PROJECT_VERSION: str = open("../VERSION").read().strip()
     API_PREFIX: str = "/api"
     DEBUG: bool = True
+    # Starlette's HTML traceback page is never served unless this is explicitly
+    # enabled (env DEBUG_TRACEBACKS=true) on a DEBUG deployment. Local-dev only.
+    DEBUG_TRACEBACKS: bool = False
     TESTING: bool = False
     TEST_DATABASE_URL: str = "sqlite:///db/test_{}.db".format(os.getpid())
     ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
@@ -69,17 +72,11 @@ class Settings(BaseSettings):
                 env_value = os.environ.get(env_var_name)
                 if env_value is not None:
                     return env_value
-                # If env var is not set and this is encryption key, generate one
-                if env_var_name == "BOW_ENCRYPTION_KEY":
-                    from .bow_config import generate_fernet_key, mark_encryption_key_ephemeral
-                    # Invented here, so it changes on the next restart. Flagged
-                    # so payload encryption stays off rather than writing data
-                    # that this process alone can read.
-                    mark_encryption_key_ephemeral()
-                    new_key = generate_fernet_key()
-                    os.environ["BOW_ENCRYPTION_KEY"] = new_key  # Save for future use
-                    return new_key
-                return None  # Env var not set — return None instead of raw placeholder
+                # Env var not set — return None instead of the raw placeholder.
+                # (BowConfig.validate_encryption_key handles a missing
+                # BOW_ENCRYPTION_KEY: env var, else generate with a warning and
+                # the ephemeral flag that keeps payload encryption off.)
+                return None
             return config
 
         # Inline path-traversal guard at the sink (Snyk python/PT). Reject

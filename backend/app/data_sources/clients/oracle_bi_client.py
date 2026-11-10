@@ -1,7 +1,9 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items
 from app.data_sources.clients.base import DataSourceClient
 from app.ai.prompt_formatters import Table, TableColumn, ServiceFormatter
 from typing import List, Dict, Optional
 import requests
+from app.core.egress import pinned_session
 import pandas as pd
 from defusedxml import ElementTree as ET
 from xml.etree.ElementTree import Element
@@ -67,7 +69,7 @@ class OracleBIClient(DataSourceClient):
             raise RuntimeError("username and password are required")
 
         if self._http is None:
-            self._http = requests.Session()
+            self._http = pinned_session()
         body = (
             f"<v12:logon>"
             f"<v12:name>{xml_escape(self.username)}</v12:name>"
@@ -181,10 +183,11 @@ class OracleBIClient(DataSourceClient):
             "tables": tables,
         }
 
-    def get_schemas(self) -> List[Table]:
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
         """Return one Table per presentation table across all subject areas."""
         tables: List[Table] = []
-        for sa_name in self._list_subject_area_names():
+        for sa_name in discovery_items(self._list_subject_area_names(), 'subject_areas', label=str):
             desc = self._describe_subject_area(sa_name)
             if not desc:
                 continue
@@ -468,7 +471,7 @@ df = client.execute_query('''
         SOAP faults.
         """
         if not self._http:
-            self._http = requests.Session()
+            self._http = pinned_session()
 
         url = f"{self.host}/analytics-ws/saw.dll?SoapImpl={service}"
         envelope = (

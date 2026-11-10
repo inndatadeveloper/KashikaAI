@@ -6,6 +6,7 @@ import time as _time
 from contextlib import nullcontext
 from typing import AsyncIterator, Dict, Any, Type, Optional, List, Union
 from pydantic import BaseModel
+from app.services.artifact_payload import partial_rows_note
 from app.core.otel import get_tracer
 from app.ee.audit.tool_audit import log_tool_audit, _truncate_queries
 
@@ -37,6 +38,7 @@ from app.ai.tools.schemas import (
 )
 from app.ai.agents.coder.coder import Coder
 from app.ai.code_execution.code_execution import StreamingCodeExecutor
+from app.ai.tools.data_notices import attach_data_notices
 from app.ai.data_preview import build_data_preview, clamp_stats, gate_stats_for_privacy
 from app.ai.llm import LLM
 from app.ai.llm.types import Message, TextDeltaEvent
@@ -577,8 +579,9 @@ def build_view_from_data_model(
             legend=LegendOptions(show=bool(has_multiple_series)),
             defaultFilters=default_filters,
         )
-        # Slightly different axis defaults for time series vs categorical
-        view.axisX = AxisOptions(rotate=45, interval=0)
+        # Leave the category labels to the renderer, which thins them as
+        # categories grow. Stamping interval=0 forced every label onto the axis.
+        view.axisX = AxisOptions(rotate=None, interval=None)
         view.axisY = AxisOptions(show=True, rotate=0, interval=0)
         return ViewSchema(view=view)
 
@@ -740,6 +743,49 @@ def build_view_from_data_model(
     return None
 
 
+def sandbox_helpers_directive(lists_sink, browser, sb) -> str:
+    """Coder prompt text for the helpers this run actually has. Only enabled
+    helpers are described (as load_step is), so the coder never reaches for
+    one that would be None."""
+    parts = []
+    if lists_sink is not None:
+        names = "; ".join(
+            f"{l['slug']!r} (name {l['name']!r}, key {l['key']!r}, fields {', '.join(map(str, l['fields']))})"
+            for l in lists_sink.names()
+        )
+        parts.append(
+            "AGENT LISTS FROM CODE: add a `lists` parameter to generate_df to save rows to these Agent Lists: "
+            f"{names}. Call `lists.submit('<slug>', records)` where records is a list of dicts keyed by "
+            "field name (plain values; for an evidence-backed value use "
+            "{'value': v, 'status': 'found', 'evidence': [{'quote': exact_text_from_the_page, 'ref': page_url}]}). "
+            "Submit as you go (e.g. per page of results). Invalid values raise immediately; rows are saved only "
+            f"after the run succeeds, at most {sb.max_list_rows} rows per run. submit returns counts, not rows. "
+            "Still return a DataFrame of what you submitted (it is the step's result). "
+            "Only submit when the user asked to fill or update the list."
+        )
+    if browser is not None:
+        parts.append(
+            "BROWSER FROM CODE: add a `browser` parameter to generate_df for pages that need JavaScript or "
+            "clicking (pagination buttons, 'load more', tabs, filters). It drives one headless page: "
+            "browser.goto(url) -> {url, status}; browser.click(selector); browser.fill(selector, text); "
+            "browser.press(key, selector=None); browser.select(selector, value); browser.scroll(pixels=2000); "
+            "browser.wait_for(selector, timeout=15); browser.text(selector=None) -> str; "
+            "browser.html(selector=None) -> str; browser.url() -> str; "
+            "browser.query_all(selector, attrs=None, fields=None) -> one dict per matching element: "
+            "{'text': ..., <attr>: ...} for attrs (hrefs are absolute), plus per-item fields read INSIDE each element: "
+            "{'name': 'css'} = text of the first match, 'css@href' = an attribute, ['css'] = list of every match's text. "
+            "Extract records with ONE query_all per page, e.g. "
+            "browser.query_all('.item', fields={'title': '.title', 'url': 'a@href', 'tags': ['.tag']}). "
+            "Selectors are CSS or Playwright text selectors (\"text=Next\"). A missing element raises after the "
+            "timeout: check with query_all before clicking an optional control. "
+            f"Only URLs allowed by the browser connection open; at most {sb.max_pages} page loads per run. "
+            + ("" if sb.allow_mutating_requests else
+               "Form submissions (POST/PUT/DELETE) are blocked: the browser can only read. ")
+            + "Prefer `http` (no browser) for plain HTML pages; it is much faster."
+        )
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
 class CreateDataTool(Tool):
     # --- Visualization inference (post-execution) ---------------------------------------------
     @staticmethod
@@ -805,7 +851,8 @@ class CreateDataTool(Tool):
         # regardless of which model the planner/codegen used. Falls back to the
         # main model when no small model is set.
         viz_model = runtime_ctx.get("small_model") or runtime_ctx.get("model")
-        llm = LLM(viz_model, usage_session_maker=async_session_maker, usage_context=usage_ctx)
+        llm = LLM(viz_model, usage_session_maker=async_session_maker, usage_context=usage_ctx,
+                  reasoning_effort=runtime_ctx.get("reasoning_effort"))
         profile = self._build_viz_profile(formatted, allow_llm_see_data)
 
         # Fetch visualization-specific instructions
@@ -813,12 +860,26 @@ class CreateDataTool(Tool):
         context_hub = runtime_ctx.get("context_hub")
         if context_hub and getattr(context_hub, "instruction_builder", None):
             try:
-                viz_section = await context_hub.instruction_builder.build(categories=["visualizations", "visualization", "general"])
+                # The instruction builder reads the agent's shared session;
+                # serialize with parallel siblings (a collision used to drop
+                # the visualization instructions silently).
+                _lock = runtime_ctx.get("tool_db_lock")
+                async with (_lock if _lock is not None else nullcontext()):
+                    viz_section = await context_hub.instruction_builder.build(
+                        categories=["visualizations", "visualization", "general"],
+                    )
+                # On demand (org setting) smart rules aren't inlined and this
+                # step can't read the catalog, so it gets what the agent read.
+                # Off: nothing is recorded, so this adds nothing.
+                viz_section.read_items = list(getattr(context_hub, "read_instruction_items", {}).values())
                 viz_instructions = viz_section.render() or ""
             except Exception:
                 viz_instructions = ""
 
-        allowed_types = list(ALLOWED_VIZ_TYPES)
+        # sorted(), not list(): ALLOWED_VIZ_TYPES is a set literal, so list() order
+        # varies between processes (PYTHONHASHSEED). That line now lives in the cached
+        # system prefix, and an unstable order would invalidate it on every restart.
+        allowed_types = sorted(ALLOWED_VIZ_TYPES)
 
         # Build column names list for reference
         column_names = [c.get("name", "") for c in profile.get("columns", [])]
@@ -833,16 +894,15 @@ ORGANIZATION VISUALIZATION INSTRUCTIONS:
 
 """
         
-        prompt = f"""Role: visualization planner. Analyze the data profile and choose the best visualization type.
+        # Same split as the coder: the role, the org visualization instructions and
+        # the rules/examples block are identical for every create_data call, so they
+        # go in `system` where inference_stream_v2 puts a cache breakpoint. Only the
+        # columns, conversation context, user prompt and data profile vary per call.
+        # NOTE: this whole prompt is ~3k tokens, which is below Claude Haiku 4.5's
+        # 4096-token minimum cacheable prefix — on a Haiku small-model this split is
+        # correct but caches nothing. It pays off on Sonnet (1024) and Opus (512).
+        viz_system = f"""Role: visualization planner. Analyze the data profile and choose the best visualization type.
 {instructions_block}
-Use the exact column names from the data. Available columns are: {column_names}
-
-Context: {messages_context or "None"}
-User prompt: {user_prompt or "None"}
-
-Data profile:
-{json.dumps(profile, ensure_ascii=False, indent=2)}
-
 ═══════════════════════════════════════════════════════════════════════════════
 RULES FOR METRIC_CARD (KPI display)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1021,7 +1081,15 @@ Return only valid JSON:
 
 Include "group_by" when the data has multiple rows per x-axis category that should be shown as separate colored series.
 Include "aggregation" on each series entry when rows are granular.
-Include "filters" only when narrowing the data to a specific slice.
+Include "filters" only when narrowing the data to a specific slice."""
+
+        prompt = f"""Use the exact column names from the data. Available columns are: {column_names}
+
+Context: {messages_context or "None"}
+User prompt: {user_prompt or "None"}
+
+Data profile:
+{json.dumps(profile, ensure_ascii=False, indent=2)}
 
 Reminder: use exact column names from: {column_names}
 Do not use generic placeholders like "value" unless that is the actual column name."""
@@ -1032,6 +1100,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
             chunks: list[str] = []
             async for evt in llm.inference_stream_v2(
                 messages=[Message(role="user", content=prompt)],
+                system=viz_system,
                 usage_scope="create_data.viz_infer",
             ):
                 if isinstance(evt, TextDeltaEvent):
@@ -1165,13 +1234,62 @@ Do not use generic placeholders like "value" unless that is the actual column na
             return _schemas_section_obj.render() if _schemas_section_obj else ""
 
     @staticmethod
+    def _resolve_group_from_static(static_schemas, ds_id: Optional[str], name_patterns: List[str]):
+        """Resolve one tables_by_source group from the in-memory schema context.
+
+        Mirrors the schema builder's own name filter (``re.search`` per
+        pattern) and grouping. Returns the resolved group(s), or None when any
+        requested table has no match there — the caller then builds from the
+        DB, since the static context is top-k capped.
+        """
+        import re
+        sections = list(getattr(static_schemas, "data_sources", None) or [])
+        if not sections:
+            return None
+        try:
+            compiled = [re.compile(p) for p in name_patterns]
+        except re.error:
+            return None
+        matched_by_ds: Dict[str, List[str]] = {}
+        pattern_hit = [False] * len(compiled)
+        for ds in sections:
+            ds_info = getattr(ds, "info", None)
+            sec_id = str(getattr(ds_info, "id", "") or "") if ds_info else ""
+            if ds_id and sec_id != ds_id:
+                continue
+            for t in (getattr(ds, "tables", None) or []):
+                name = getattr(t, "name", None) or ""
+                hits = [i for i, rp in enumerate(compiled) if rp.search(name)]
+                if not hits:
+                    continue
+                for i in hits:
+                    pattern_hit[i] = True
+                matched_by_ds.setdefault(sec_id or "__all__", []).append(name)
+        if not all(pattern_hit):
+            return None
+        if ds_id:
+            return [{"data_source_id": ds_id, "tables": matched_by_ds.get(ds_id, [])}]
+        return [
+            {"data_source_id": (None if k == "__all__" else k), "tables": v}
+            for k, v in matched_by_ds.items() if v
+        ]
+
+    @staticmethod
     async def _resolve_active_tables(
         tables_by_source: List[Any],
         schema_builder,
         data_sources: Optional[List[Any]] = None,
         db_lock: Optional["asyncio.Lock"] = None,
+        static_schemas: Any = None,
     ) -> tuple[List[Dict[str, Any]], List[str]]:
         """Resolve table patterns to active tables only.
+
+        static_schemas: the run's already-built schema context
+        (``context_view.static.schemas`` — same builder, user and active-only
+        filter). A group whose every requested table is found there resolves
+        in memory; otherwise it falls back to a schema build, as before. The
+        static context is top-k capped, which is why a miss falls back rather
+        than meaning "not found".
 
         Args:
             tables_by_source: List of TablesBySource with table names/patterns
@@ -1228,6 +1346,11 @@ Do not use generic placeholders like "value" unless that is the actual column na
                     name_patterns.append(f"(?i)(?:^|[./]){esc}$")
 
                 if not name_patterns:
+                    continue
+
+                static_hit = CreateDataTool._resolve_group_from_static(static_schemas, ds_id, name_patterns)
+                if static_hit is not None:
+                    resolved.extend(static_hit)
                     continue
 
                 # Resolve via schema_builder (only returns active tables)
@@ -1295,6 +1418,68 @@ Do not use generic placeholders like "value" unless that is the actual column na
             return resolved, warnings
 
     @staticmethod
+    def build_execution_failure_observation(code_errors, query_timings) -> dict:
+        """Build the planner result for a failed data query."""
+        error_observation = {
+            "summary": "Create data failed",
+            "error": {
+                "type": "execution_failure",
+                "message": "execution failed (validation or execution error)",
+            },
+        }
+        summary = CreateDataTool._summarize_errors(code_errors)
+        # Merge summary fields without clobbering error.type
+        if summary.get("retry_summary"):
+            error_observation["retry_summary"] = summary["retry_summary"]
+        if summary.get("error_message"):
+            error_observation["error"]["message"] = summary["error_message"]
+        if summary.get("error_detail"):
+            error_observation["error"]["detail"] = summary["error_detail"]
+
+        # Surface the DB-level error and failing SQL — these come from the
+        # QueryCapturingClientWrapper and are much more actionable for the
+        # planner than the Python-level "Execution error: ..." string.
+        try:
+            failed_timings = [t for t in (query_timings or []) if t.get("error")]
+            if failed_timings:
+                # A caught refusal must survive later queries in the same
+                # attempt, including a fallback that fails differently.
+                last_failed = next(
+                    (t for t in reversed(failed_timings) if t.get("terminal")),
+                    failed_timings[-1],
+                )
+                error_observation["error"]["db_message"] = (
+                    last_failed.get("error_message") or last_failed.get("error")
+                )
+                if last_failed.get("error_type") == "table_access_denied":
+                    # The code attempt is terminal, not the conversation.
+                    # Let the planner explain in the user's language and
+                    # finish independent work; never publish a raw diagnostic.
+                    error_observation["error"]["type"] = "table_access_denied"
+                    error_observation["error"]["message"] = error_observation["error"]["db_message"]
+                    error_observation["retry_guidance"] = (
+                        "This query was refused by the agent's table selection. "
+                        "Do not retry the denied table through different SQL syntax. "
+                        "Check the active catalog before choosing an enabled alternative; "
+                        "instructions mentioning a table do not enable it. "
+                        "Explain any remaining limitation in the user's language and "
+                        "continue independent permitted parts of the task."
+                    )
+                elif last_failed.get("terminal"):
+                    error_observation["error"]["type"] = "infrastructure_failure"
+                    error_observation["terminal_execution_error"] = True
+                    error_observation["analysis_complete"] = True
+                    error_observation["final_answer"] = last_failed.get("error")
+
+                if last_failed.get("sql"):
+                    error_observation["error"]["failed_sql"] = last_failed["sql"]
+        except Exception:
+            # Never let observation assembly mask the primary failure.
+            pass
+
+        return error_observation
+
+    @staticmethod
     def _summarize_errors(errors) -> dict:
         """Summarize retry errors for the planner observation.
 
@@ -1327,6 +1512,85 @@ Do not use generic placeholders like "value" unless that is the actual column na
             payload["error_message"] = summary_line or detail[:300]
         return payload
 
+    async def _build_sandbox_helpers(self, runtime_ctx: Dict[str, Any], organization_settings):
+        """`lists` / `browser` for this run's generated code, per the org's
+        Sandbox settings, plus the prompt text that documents them. Returns
+        (None, "") when neither applies. Re-runs of the saved code build theirs
+        with the same build_sandbox_helpers (their `lists` saves nothing)."""
+        from app.ai.code_execution.sandbox_helpers import build_sandbox_helpers, sandbox_settings
+        sb = sandbox_settings(organization_settings)
+        if not (sb.lists or sb.browser):
+            return None, ""
+        lists_sink = None
+        if sb.lists and runtime_ctx.get("list_writes_allowed"):
+            try:
+                from app.services.agent_lists.sandbox_sink import SandboxListSink, load_sandbox_lists
+                async with async_session_maker() as _db:
+                    _lists = await load_sandbox_lists(
+                        _db, runtime_ctx.get("report"), runtime_ctx.get("user"), runtime_ctx.get("organization"),
+                        platform_context=runtime_ctx.get("platform_context"),
+                    )
+                if _lists:
+                    lists_sink = SandboxListSink(lists=_lists, max_rows=sb.max_list_rows)
+            except Exception as e:
+                logger.warning("create_data: sandbox lists unavailable: %s", e)
+        # The same builder every re-run of this code uses (Publish, refresh).
+        helpers = build_sandbox_helpers(
+            organization_settings, getattr(runtime_ctx.get("report"), "data_sources", None),
+            rerun=False, lists_sink=lists_sink,
+        )
+        if helpers is None:
+            return None, ""
+        return helpers, sandbox_helpers_directive(helpers.lists, helpers.browser, sb)
+
+    async def _commit_sandbox_helpers(self, helpers, runtime_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Save queued list rows and summarize what the code did (counts only)."""
+        if helpers is None:
+            return {}
+        activity: Dict[str, Any] = dict(helpers.summary())
+        sink = helpers.lists
+        if sink is None:
+            return activity
+        pending = sink.take()
+        queued = sum(len(v) for v in pending.values())
+        if not queued:
+            return activity
+        activity["list_rows_queued"] = queued
+        try:
+            from app.services.agent_lists.sandbox_sink import commit_sandbox_submissions
+            # Same discipline as the other writes in this tool: serialize with
+            # parallel siblings and end the agent session's open transaction
+            # first. On SQLite (single writer) an open write there would
+            # otherwise hold the lock past busy_timeout ("database is locked").
+            _lock = runtime_ctx.get("tool_db_lock")
+            _writer = runtime_ctx.get("db")
+            async with (_lock if _lock is not None else nullcontext()):
+                if _writer is not None:
+                    await _writer.commit()
+                async with async_session_maker() as _db:
+                    res = await commit_sandbox_submissions(
+                        _db, pending,
+                        report=runtime_ctx.get("report"), user=runtime_ctx.get("user"),
+                        organization=runtime_ctx.get("organization"),
+                        tool_execution_id=runtime_ctx.get("tool_call_id"),
+                        extra_sources=helpers.page_texts.to_sources(),
+                        platform_context=runtime_ctx.get("platform_context"),
+                    )
+        except Exception as e:
+            logger.exception("create_data: saving list rows from code failed")
+            activity["lists"] = {"saved": False, "error": f"{type(e).__name__}: {e}"[:300]}
+            return activity
+        activity["lists"] = {
+            "inserted": res["inserted"], "updated": res["updated"], "unchanged": res["unchanged"],
+            "rejected": res["rejected"],
+            "per_list": [
+                {k: v for k, v in e.items() if k != "list_id"} for e in res["lists"]
+            ],
+        }
+        if res["errors"]:
+            activity["lists"]["errors"] = res["errors"][:12]
+        return activity
+
     @property
     def metadata(self) -> ToolMetadata:
         return ToolMetadata(
@@ -1341,7 +1605,10 @@ Do not use generic placeholders like "value" unless that is the actual column na
             idempotent=False,
             required_permissions=[],
             tags=["data", "code", "execution"],
-            allowed_modes=["chat", "training"],
+            # Child profiles decide whether tracked queries are permitted.
+            # Keep the tool eligible before that profile filter runs, so
+            # validation and bulk list writes remain available to children.
+            allowed_modes=["chat", "training", "subagent"],
         )
 
     @property
@@ -1360,6 +1627,10 @@ Do not use generic placeholders like "value" unless that is the actual column na
 
     async def _run_stream_traced(self, run_span, tool_input: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> AsyncIterator[ToolEvent]:
         data = CreateDataInput(**tool_input)
+        if not data.user_prompt:
+            # The model no longer restates the question; the turn's own message is it.
+            from app.ai.tools.implementations._memory_common import user_message
+            data.user_prompt = user_message(runtime_ctx) or data.interpreted_prompt
         yield ToolStartEvent(type="tool.start", payload={"title": data.title})
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "init"})
 
@@ -1490,19 +1761,29 @@ Do not use generic placeholders like "value" unless that is the actual column na
                     data.tables_by_source,
                     context_hub.schema_builder,
                     db_lock=runtime_ctx.get("tool_db_lock"),
+                    static_schemas=getattr(getattr(context_view, "static", None), "schemas", None),
                 )
         
+        if any(str(g.data_source_id) == "builtin:bow" for g in (data.tables_by_source or [])) and "bow" not in runtime_ctx.get("ds_clients", {}):
+            yield ToolErrorEvent(type="tool.error", payload={"error": "BOW data requires authorized training mode", "code": "FORBIDDEN"})
+            return
+
         # Check if we have any data sources (tables or files)
         total_resolved = sum(len(g.get("tables", [])) for g in resolved_tables)
 
-        # When `enable_web_fetch` is on, the sandbox exposes `http` to the
-        # coder — a URL-fetch task is a valid "no tables, no files" case.
+        # Sandbox helpers the org allows (Sandbox settings). Web fetch or a
+        # browser in code makes a URL task a valid "no tables, no files" case.
+        sandbox_helpers, helpers_directive = await self._build_sandbox_helpers(runtime_ctx, organization_settings)
         web_fetch_enabled = False
         try:
-            _ef = organization_settings.get_config("enable_web_fetch") if organization_settings else None
-            web_fetch_enabled = bool(getattr(_ef, "value", False))
+            from app.ai.code_execution.sandbox_helpers import sandbox_settings as _sb_settings
+            from app.schemas.report_api_settings import report_disabled_tools
+            web_fetch_enabled = _sb_settings(organization_settings).web_fetch and (
+                "web_fetch" not in report_disabled_tools(runtime_ctx.get("report"))
+            )
         except Exception:
             web_fetch_enabled = False
+        web_fetch_enabled = web_fetch_enabled or bool(sandbox_helpers is not None and sandbox_helpers.browser is not None)
 
         if total_resolved == 0 and not has_files and not web_fetch_enabled:
             # No tables resolved AND no files available - fail. Distinguish the
@@ -1684,6 +1965,9 @@ Do not use generic placeholders like "value" unless that is the actual column na
             else None
         )
         coder = Coder(
+            reasoning_effort=runtime_ctx.get("reasoning_effort"),
+            reasoning_callback=runtime_ctx.get("reasoning_callback"),
+            read_session_maker=runtime_ctx.get("read_session_maker"),
             model=runtime_ctx.get("model"),
             organization_settings=organization_settings,
             context_hub=context_hub,
@@ -1695,6 +1979,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
             logger=None,
             context_hub=context_hub,
             usage_context=usage_ctx,
+            sandbox_helpers=sandbox_helpers,
         )
 
         # Declared parameters: resolve creator-default values (the creation run
@@ -1745,18 +2030,32 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 "predicate (build the SQL conditionally or use a `(:name IS NULL OR col = :name)` pattern; "
                 "when you pass params to execute_query, include every placeholder used in that SQL).\n"
                 "3. A list-typed parameter renders as an IN list: use `col IN :name`.\n"
+                "   Neo4j (Cypher) is the exception: write `$name` (and `x IN $name` for a list), "
+                "never `:name`, and pass the same params={...}; Neo4j binds them itself.\n"
                 "4. identity-source parameters carry the viewing user's identity — always "
                 "apply them as filters so each viewer sees only their rows.\n"
-                "5. Every declared parameter above MUST be read from `params` in the code."
+                "5. Every declared parameter above MUST be read from `params` in the code.\n"
+                "6. date_range is None or {'from': ISO_value, 'to': ISO_value}; either bound may be absent. "
+                "NEVER read start/end or index it as a list. Calendar dates are YYYY-MM-DD. "
+                "For calendar-day filters add the injectable `calendar_date_bounds` argument to generate_df, "
+                "then start, stop = calendar_date_bounds(params['declared_name']). It returns an inclusive "
+                "start and EXCLUSIVE next-day stop, independently None for open bounds. "
+                "Bind (:start IS NULL OR column >= :start) AND (:stop IS NULL OR column < :stop). "
+                "Use the actual column type and dialect's casts if needed; do not truncate timestamp precision. "
+                "This helper does NOT convert timezones: for timezone-aware columns convert each local midnight "
+                "using the known reporting/source timezone (next calendar day, not +24 hours); never guess UTC. "
+                "Exact timestamp ranges must bypass the calendar helper, read from/to independently, "
+                "preserve offsets and document boundary semantics. Do not mix calendar dates and timestamps. "
+                "If a source stores text dates, use its known storage format, not locale guessing."
             )
 
         # Build typed context via helper (use resolved active tables, not original patterns)
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "building_context"})
         codegen_context = await build_codegen_context(
             runtime_ctx=runtime_ctx,
-            user_prompt=(data.user_prompt or data.interpreted_prompt or "") + source_directive + params_directive,
+            user_prompt=(data.user_prompt or data.interpreted_prompt or "") + source_directive + params_directive + helpers_directive,
             interpreted_prompt=(
-                ((data.interpreted_prompt or "") + source_directive + params_directive)
+                ((data.interpreted_prompt or "") + source_directive + params_directive + helpers_directive)
                 if data.interpreted_prompt else None
             ),
             schemas_excerpt=(schemas_excerpt or ""),
@@ -1774,6 +2073,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
         executed_queries = []
         query_timings = []
         codegen_ms = None
+        codegen_reasoning_ms = None
         execution_ms = None
 
         # Resolver for load_step()/load_entity() calls the generated code may
@@ -1790,6 +2090,23 @@ Do not use generic placeholders like "value" unless that is the actual column na
             step_max_age_seconds=_ls_max_age,
         )
 
+        async def _resolve_loadables(step_refs, entity_refs):
+            # The resolver reads (and via protect_report may commit) on the
+            # agent's shared session: serialize with parallel siblings.
+            _lock = runtime_ctx.get("tool_db_lock")
+            async with (_lock if _lock is not None else nullcontext()):
+                return await _loadables_resolver.resolve(step_refs, entity_refs)
+
+        # Schema/context reads can autoflush the in-memory event sequence. Do
+        # not hold that write transaction throughout the coder's LLM request.
+        _writer_db = runtime_ctx.get("db") or (context_hub.db if context_hub else None)
+        if _writer_db is not None:
+            if runtime_ctx.get("tool_db_lock") is not None:
+                async with runtime_ctx["tool_db_lock"]:
+                    await _writer_db.commit()
+            else:
+                await _writer_db.commit()
+
         with tracer.start_as_current_span("create_data.codegen_and_execute") as codegen_span:
             async for e in streamer.generate_and_execute_stream_v2(
                 request=CodeGenRequest(context=codegen_context),
@@ -1798,8 +2115,9 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 code_context_builder=None,
                 code_generator_fn=coder.generate_code,
                 sigkill_event=runtime_ctx.get("sigkill_event"),
-                loadable_resolver_fn=_loadables_resolver.resolve,
+                loadable_resolver_fn=_resolve_loadables,
                 params=resolved_default_params,
+                param_specs=declared_param_specs,
             ):
                 if e["type"] == "progress":
                     # Map internal stage names to UI-friendly names
@@ -1838,6 +2156,8 @@ Do not use generic placeholders like "value" unless that is the actual column na
                     query_timings = e["payload"].get("query_timings") or []
                     codegen_ms = e["payload"].get("codegen_ms")
                     execution_ms = e["payload"].get("execution_ms")
+                    # Reasoning inside that codegen_ms (last attempt, like it).
+                    codegen_reasoning_ms = getattr(coder, "reasoning_ms", None) or None
             codegen_span.set_attribute("codegen.success", generated_code is not None and exec_df is not None)
             codegen_span.set_attribute("codegen.error_count", len(code_errors))
             codegen_span.set_attribute("codegen.query_count", len(executed_queries))
@@ -1862,40 +2182,14 @@ Do not use generic placeholders like "value" unless that is the actual column na
                     "error_message": _last_err,
                     "data_source_ids": _ds_ids,
                     "tables_requested": _tables,
-                    "executed_queries": _truncate_queries(executed_queries),
+                    "executed_queries": list(executed_queries or []),
                 },
+                outcome="failure",
+                failure_reason="execution_failure",
             )
 
             current_step_id = runtime_ctx.get("current_step_id")
-            error_observation = {
-                "summary": "Create data failed",
-                "error": {
-                    "type": "execution_failure",
-                    "message": "execution failed (validation or execution error)",
-                },
-            }
-            summary = self._summarize_errors(code_errors)
-            # Merge summary fields without clobbering error.type
-            if summary.get("retry_summary"):
-                error_observation["retry_summary"] = summary["retry_summary"]
-            if summary.get("error_message"):
-                error_observation["error"]["message"] = summary["error_message"]
-            if summary.get("error_detail"):
-                error_observation["error"]["detail"] = summary["error_detail"]
-
-            # Surface the DB-level error and failing SQL — these come from the
-            # QueryCapturingClientWrapper and are much more actionable for the
-            # planner than the Python-level "Execution error: ..." string.
-            try:
-                failed_timings = [t for t in (query_timings or []) if t.get("error")]
-                if failed_timings:
-                    last_failed = failed_timings[-1]
-                    error_observation["error"]["db_message"] = last_failed.get("error")
-                    if last_failed.get("sql"):
-                        error_observation["error"]["failed_sql"] = last_failed["sql"]
-            except Exception:
-                # Never let observation assembly mask the primary failure.
-                pass
+            error_observation = self.build_execution_failure_observation(code_errors, query_timings)
 
             if current_step_id:
                 error_observation["step_id"] = current_step_id
@@ -1930,14 +2224,36 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 "tool": "create_data",
                 "data_source_ids": _ds_ids,
                 "tables_accessed": _tables,
-                "executed_queries": _truncate_queries(executed_queries),
+                "executed_queries": list(executed_queries or []),
                 "row_count": len(exec_df) if exec_df is not None else 0,
             },
         )
 
+        # Rows the code queued with `lists.submit` are saved only now, after
+        # the run succeeded; failed attempts already discarded theirs.
+        sandbox_activity = await self._commit_sandbox_helpers(sandbox_helpers, runtime_ctx)
+        if sandbox_activity.get("list_rows_queued"):
+            yield ToolProgressEvent(type="tool.progress", payload={"stage": "saving_list_rows"})
+
         # Success path: format data and privacy-aware preview
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "formatting_widget"})
-        formatted = streamer.format_df_for_widget(exec_df)
+        formatted = await streamer.format_df_for_widget_async(exec_df)
+        response_locale = runtime_ctx.get("response_locale")
+        if response_locale:
+            from app.ai.response_language import localize_column_headers
+            language_llm = LLM(
+                runtime_ctx.get("small_model") or runtime_ctx.get("model"),
+                usage_session_maker=async_session_maker,
+                usage_context=runtime_ctx.get("usage_limit_context"),
+            )
+            async def infer_labels(prompt):
+                chunks = []
+                async for chunk in language_llm.inference_stream(
+                    prompt, usage_scope="response.column_labels", max_output_tokens=1024,
+                ):
+                    chunks.append(chunk)
+                return "".join(chunks)
+            await localize_column_headers(infer_labels, formatted, response_locale)
         info = formatted.get("info", {})
         allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value if organization_settings else True
         data_preview = build_data_preview(formatted, allow_llm_see_data=allow_llm_see_data)
@@ -2041,6 +2357,9 @@ Do not use generic placeholders like "value" unless that is the actual column na
             f"Created data '{data.title}' successfully",
             f"{row_count} rows x {len(column_names)} cols",
         ]
+        kept_note = partial_rows_note(row_count, len(formatted.get("rows", [])))
+        if kept_note:
+            summary_parts.append(kept_note)
         if column_names:
             shown_cols = ", ".join(column_names[:10])
             if len(column_names) > 10:
@@ -2071,10 +2390,15 @@ Do not use generic placeholders like "value" unless that is the actual column na
         # on the output only.
         if executed_queries:
             observation["executed_queries"] = _truncate_queries(executed_queries)
+        # A connector's note on its result (row limit hit, query rewritten),
+        # as a field of its own: in the run log alone the planner skimmed it.
+        attach_data_notices(observation, query_timings)
         if view_payload:
             observation["view"] = view_payload
         if current_step_id:
             observation["step_id"] = current_step_id
+        if sandbox_activity:
+            observation["sandbox_activity"] = sandbox_activity
         run_span.set_attribute("tool.success", True)
         run_span.set_attribute("tool.chart_type", final_dm.get("type", "table"))
         # Keep only declarations the generated code actually consumes — a
@@ -2109,12 +2433,14 @@ Do not use generic placeholders like "value" unless that is the actual column na
                     "executed_queries": executed_queries,
                     "query_timings": query_timings,
                     "codegen_ms": codegen_ms,
+                    "codegen_reasoning_ms": codegen_reasoning_ms,
                     "execution_ms": execution_ms,
                     "parameters": surviving_params,
                     "applied_params": (
                         {k: v for k, v in (resolved_default_params or {}).items()}
                         if surviving_params else None
                     ),
+                    "sandbox_activity": sandbox_activity or None,
                 },
                 "observation": observation,
             },

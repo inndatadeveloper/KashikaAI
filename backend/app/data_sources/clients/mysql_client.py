@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import pandas as pd
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from typing import List, Generator, Optional
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
+from app.data_sources.routines import build_routine_tables, mysql_variants, with_routines
 from app.data_sources.fk_reflection import attach_foreign_keys
 from functools import cached_property
 from urllib.parse import quote_plus
@@ -22,8 +24,11 @@ class MysqlClient(DataSourceClient):
     # of literal dates that go stale when saved code is re-executed.
     relative_date_hint = "Relative dates (MySQL): CURDATE(), CURDATE() - INTERVAL 7 DAY, DATE_FORMAT(CURDATE(), '%Y-%m-01') for month start; the clock is the DB server's."
 
-    def __init__(self, host, port, database, user: Optional[str] = None, password: Optional[str] = None):
+    def __init__(self, host, port, database, user: Optional[str] = None, password: Optional[str] = None,
+                 index_routines: bool = False):
         self.host = host
+        # Opt-in routine indexing (see app.data_sources.routines).
+        self.index_routines = bool(index_routines)
         self.port = port
         self.database = database
         if password not in (None, "") and user in (None, ""):
@@ -49,6 +54,8 @@ class MysqlClient(DataSourceClient):
         try:
             engine = get_engine(self.mysql_uri)
             conn = engine.connect()
+        except IndexingCancelled:
+            raise
         except Exception as e:
             if conn is not None:
                 conn.close()
@@ -81,11 +88,14 @@ class MysqlClient(DataSourceClient):
         """Get tables with graceful fallback if enriched query fails."""
         try:
             return self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             return self._get_tables_basic()
 
     def _get_tables_enriched(self) -> List[Table]:
         """Get tables with column/table comments. May fail on some MySQL versions."""
+        discovery_phase('reading_columns')
         with self.connect() as conn:
             sql = """
                 SELECT
@@ -103,7 +113,7 @@ class MysqlClient(DataSourceClient):
             result = conn.execute(text(sql), {'database': self.database}).fetchall()
 
             tables = {}
-            for row in result:
+            for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                 table_name, column_name, data_type, col_comment, tbl_comment = row
 
                 if table_name not in tables:
@@ -124,6 +134,7 @@ class MysqlClient(DataSourceClient):
 
     def _get_tables_basic(self) -> List[Table]:
         """Get tables without comments (original query - always works)."""
+        discovery_phase('metadata_fallback')
         try:
             with self.connect() as conn:
                 sql = """
@@ -136,7 +147,7 @@ class MysqlClient(DataSourceClient):
                     text(sql), {'database': self.database}).fetchall()
 
                 tables = {}
-                for row in result:
+                for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                     table_name, column_name, data_type = row
 
                     if table_name not in tables:
@@ -146,7 +157,10 @@ class MysqlClient(DataSourceClient):
                         TableColumn(name=column_name, dtype=data_type))
                 self._attach_foreign_keys(conn, tables)
             return list(tables.values())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("SQL catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -170,9 +184,20 @@ class MysqlClient(DataSourceClient):
             key_fn=lambda schema, table: table,
         )
 
-    def get_schemas(self):
-        """Get schemas for all tables in the specified database."""
-        return self.get_tables()
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
+        """Tables and views, then stored procedures and functions (see
+        app.data_sources.routines)."""
+        tables = self.get_tables()
+        return with_routines(tables, lambda: self.get_routines(t.name for t in tables), source="mysql",
+                             client=self, enabled=self.index_routines)
+
+    def get_routines(self, table_names=()) -> List[Table]:
+        """Stored procedures and functions as schema entries. Tables are named
+        bare (one database per connection), so routines are too."""
+        with self.connect() as conn:
+            variants = mysql_variants(conn, self.database)
+        return build_routine_tables(variants, table_names, lambda schema, name: name)
 
     def prompt_schema(self):
         schemas = self.get_schemas()

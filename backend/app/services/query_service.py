@@ -25,6 +25,7 @@ from app.ai.code_execution.query_params import (
 )
 from app.dependencies import async_session_maker
 from app.services.usage_policy_service import UsageLimitContext
+from app.services.row_owner import query_report_id, step_report_id
 
 def _report_execution_loads():
     """Loader options for the report graph a code run needs, eagerly.
@@ -123,6 +124,13 @@ async def resolve_options_source_refs(
         else:
             out.append({**p, "options_source": {**src, "query_id": resolved}})
     return out
+
+
+def _no_access_code(status_reason):
+    """'no_access' / 'credentials_required' when a viewer run's reason is one
+    of the classified causes."""
+    from app.services.access_errors import viewer_error_code
+    return viewer_error_code("error", status_reason)
 
 
 class QueryService:
@@ -240,11 +248,15 @@ class QueryService:
         payload: QueryCreate,
         organization_id: Optional[str],
         user_id: Optional[str],
+        commit: bool = True,
     ) -> Query:
         """Create a Query. If widget_id is not provided, create a widget under the given report_id.
 
         Note: For now, a Query always anchors to a Widget to avoid orphan Steps. If neither
         widget_id nor report_id is provided, this will raise a ValueError.
+
+        commit=False only flushes (no commit, no refresh), for callers that
+        create the query's step/visualization in the same transaction.
         """
         widget_id = payload.widget_id
         report_id = payload.report_id
@@ -254,9 +266,10 @@ class QueryService:
 
         if not widget_id:
             # Validate report exists before creating a widget
-            stmt = select(Report).where(Report.id == str(report_id))
-            report = (await db.execute(stmt)).scalar_one_or_none()
-            if report is None:
+            # Only the id is needed; don't pull Report's selectin graph.
+            stmt = select(Report.id).where(Report.id == str(report_id))
+            found_report_id = (await db.execute(stmt)).scalar_one_or_none()
+            if found_report_id is None:
                 raise ValueError("Report not found for creating widget")
 
             # Create a lightweight widget to anchor steps
@@ -266,14 +279,17 @@ class QueryService:
             w = Widget(
                 title=payload.title,
                 slug=slug,
-                report_id=str(report.id),
+                report_id=str(found_report_id),
                 status="draft",
             )
             db.add(w)
             await db.flush()
             widget_id = str(w.id)
 
+        from app.services.bow_source_access import report_access
+        bow_access = await report_access(db, report_id)
         q = Query(
+            source_refs=[{"id": "builtin:bow", "version": 1}] if bow_access else None,
             title=payload.title,
             description=getattr(payload, "description", None),
             report_id=report_id,
@@ -283,6 +299,9 @@ class QueryService:
             default_step_id=None,
         )
         db.add(q)
+        if not commit:
+            await db.flush()
+            return q
         await db.commit()
         await db.refresh(q)
         return q
@@ -334,7 +353,7 @@ class QueryService:
                 lazyload("*"),
                 selectinload(Step.created_entity).options(lazyload("*")),
             ),
-        ).where(Query.deleted_at.is_(None))
+        ).where(Query.deleted_at.is_(None), Query.artifact_release_id.is_(None))
         if report_id:
             stmt = stmt.where(Query.report_id == str(report_id))
         if organization_id:
@@ -342,13 +361,13 @@ class QueryService:
 
         # If artifact_id provided, filter to only queries used by that artifact
         if artifact_id:
-            from app.models.artifact import Artifact
+            from app.models.artifact import ArtifactVersion
             from app.models.visualization import Visualization
 
             artifact_result = await db.execute(
-                select(Artifact.content).where(
-                    Artifact.id == artifact_id,
-                    Artifact.deleted_at.is_(None)
+                select(ArtifactVersion.content).where(
+                    ArtifactVersion.id == artifact_id,
+                    ArtifactVersion.deleted_at.is_(None)
                 )
             )
             artifact_content = artifact_result.scalar_one_or_none()
@@ -460,8 +479,9 @@ class QueryService:
             step = await step_service.get_step_by_id(db, step_id)
             if step is None:
                 raise ValueError("Step not found")
-            report = step.widget.report if step.widget else None
-            if report is None or str(report.organization_id) != str(organization_id):
+            rid = await step_report_id(db, step)
+            report_org = await db.scalar(select(Report.organization_id).where(Report.id == rid)) if rid else None
+            if report_org is None or str(report_org) != str(organization_id):
                 raise ValueError("Step not found")
         step_schema = await step_service.rerun_step(db, step_id, current_user=current_user)
         return step_schema.model_dump()
@@ -484,6 +504,12 @@ class QueryService:
         q = await self.get_query(db, query_id, organization_id=organization_id)
         if not q:
             raise ValueError("Query not found")
+        # The conversation, through the query's widget as always. Resolved
+        # before anything is written: a query outside any conversation (a
+        # published dashboard's copy) is not a builder target.
+        report_id = await query_report_id(db, q, widget_first=True)
+        if not report_id:
+            raise ValueError("Report not found for step's widget")
 
         run_user_for_params = await db.get(User, user_id) if user_id else None
 
@@ -583,24 +609,21 @@ class QueryService:
 
         # Execute code — load the report graph explicitly (lazy attribute
         # access on widget.report dies in async for freshly created widgets).
-        report_stmt = (
-            select(Report)
-            .options(*_report_execution_loads())
-            .join(Widget, Widget.report_id == Report.id)
-            .where(Widget.id == str(q.widget_id))
-        )
-        report = (await db.execute(report_stmt)).scalar_one_or_none()
+        report = (await db.execute(
+            select(Report).options(*_report_execution_loads()).where(Report.id == report_id)
+        )).scalar_one_or_none()
         if not report:
             raise ValueError("Report not found for step's widget")
 
         # Build ds_clients using construct_clients for multi-connection support.
         # Run as the user who triggered the run so user_required connections use
-        # their credentials (or owner/admin → system-cred fallback).
+        # their credentials (or admin → system-cred fallback).
         from app.services.data_source_service import DataSourceService
         ds_service = DataSourceService()
         run_user = await db.get(User, user_id) if user_id else None
         ds_clients = {}
-        for ds in await self._report_data_sources(db, report, organization_id):
+        run_sources = await self._report_data_sources(db, report, organization_id)
+        for ds in run_sources:
             try:
                 ds_conns = await ds_service.construct_clients(db, ds, current_user=run_user)
                 ds_clients.update(ds_conns)
@@ -620,7 +643,11 @@ class QueryService:
         loadables = await resolve_loadables_for_code(
             db, org, report, run_user, step.code, enable_load_step=_ls_enabled
         )
-        executor = StreamingCodeExecutor(organization_settings=org_settings, usage_context=usage_context)
+        from app.data_sources.clients.bow_client import install_bow_client
+        await install_bow_client(db, org, run_user, report, ds_clients)
+        from app.ai.code_execution.sandbox_helpers import build_sandbox_helpers
+        executor = StreamingCodeExecutor(organization_settings=org_settings, usage_context=usage_context,
+                                         sandbox_helpers=build_sandbox_helpers(org_settings, run_sources, rerun=True))
         try:
             captured_queries: list = []
             exec_df, execution_log, _ = await executor.execute_code_async(
@@ -698,8 +725,13 @@ class QueryService:
         request: QueryRunRequest,
         organization_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        reader_credentials: bool = False,
     ) -> dict:
         """Viewer-execute: run the query's default step code with param values.
+
+        `reader_credentials` (collab01's draft page): always the caller's own
+        credentials, whatever the conversation's sharing mode says -- an
+        editor previewing another editor's version runs it as themselves.
 
         Creates NO new Step. The result is cached per
         (step, viewer, params_fingerprint) on step_user_results, so a repeat
@@ -725,6 +757,11 @@ class QueryService:
             step = res.scalars().first()
         if step is None or not (step.code or "").strip():
             raise ValueError("Query has no runnable step")
+        # Refused before the cached-result shortcut below: a step outside any
+        # conversation (a published dashboard's copy) is not run or served here.
+        step_report = await step_report_id(db, step)
+        if step_report is None:
+            raise ValueError("Report not found for step's widget")
 
         caller = await db.get(User, user_id) if user_id else None
         if caller is None:
@@ -782,7 +819,10 @@ class QueryService:
                 or existing.last_run_at >= freshness_floor
             )
         )
-        if cache_fresh:
+        from app.services.bow_source_access import report_access, assert_read
+        bow_access = await report_access(db, await query_report_id(db, q))
+        await assert_read(db, bow_access, caller)
+        if cache_fresh and not bow_access:
             return {
                 "data": existing.data or {},
                 "applied_params": resolved,
@@ -794,13 +834,9 @@ class QueryService:
         # Execute the default step's code with the resolved values, as the
         # caller (their credentials on user-scoped connections). Load the
         # report graph explicitly — lazy attribute access dies in async.
-        report_stmt = (
-            select(Report)
-            .options(*_report_execution_loads())
-            .join(Widget, Widget.report_id == Report.id)
-            .where(Widget.id == str(step.widget_id))
-        )
-        report = (await db.execute(report_stmt)).scalar_one_or_none()
+        report = (await db.execute(
+            select(Report).options(*_report_execution_loads()).where(Report.id == step_report)
+        )).scalar_one_or_none()
         if report is None:
             raise ValueError("Report not found for step's widget")
 
@@ -810,11 +846,13 @@ class QueryService:
         # relations force viewer credentials; owners always run as themselves.
         credential_user = caller
         identity_mode = report.shared_run_identity if report.shared_run_identity in ('viewer', 'creator') else 'viewer'
-        if identity_mode == 'creator' and str(caller.id) != str(report.user_id):
+        if reader_credentials:
+            identity_mode = 'viewer'
+        if identity_mode == 'creator' and str(caller.id) != str(report.user_id) and not bow_access:
             from app.services.viewer_data_policy import has_rls_relations
             if await has_rls_relations(db, str(report.id)):
                 identity_mode = 'viewer'
-        if identity_mode == 'creator' and str(caller.id) != str(report.user_id):
+        if identity_mode == 'creator' and str(caller.id) != str(report.user_id) and not bow_access:
             from app.models.membership import Membership
             member = (await db.execute(
                 select(Membership).where(
@@ -831,12 +869,20 @@ class QueryService:
         ds_service = DataSourceService()
         ds_clients = {}
         ds_errors = []
-        for ds in await self._report_data_sources(db, report, organization_id):
+        run_sources = await self._report_data_sources(db, report, organization_id)
+        for ds in run_sources:
             try:
-                ds_conns = await ds_service.construct_clients(db, ds, current_user=credential_user)
+                # Each connection builds on its own: a viewer missing one
+                # connection's credential still gets its sibling connections.
+                ds_conns = await ds_service.construct_clients(
+                    db, ds, current_user=credential_user, connection_errors=[],
+                )
                 ds_clients.update(ds_conns)
             except Exception as e:
                 ds_errors.append(str(getattr(e, "detail", None) or e))
+                from app.services.access_errors import needs_credentials
+                if needs_credentials(e):
+                    ds_clients.update(getattr(e, "unavailable_clients", None) or {})
                 continue
         if not ds_clients and ds_errors:
             raise ParamError("; ".join(ds_errors[:2]))
@@ -853,8 +899,12 @@ class QueryService:
         usage_context = self._usage_context(
             organization_id, str(caller.id), source="query_viewer_run", source_ref_id=query_id
         )
+        from app.data_sources.clients.bow_client import install_bow_client
+        await install_bow_client(db, org, caller, report, ds_clients)
+        from app.ai.code_execution.sandbox_helpers import build_sandbox_helpers
         executor = StreamingCodeExecutor(
-            organization_settings=org_settings, usage_context=usage_context
+            organization_settings=org_settings, usage_context=usage_context,
+            sandbox_helpers=build_sandbox_helpers(org_settings, run_sources, rerun=True),
         )
         captured_queries: list = []
         try:
@@ -877,6 +927,14 @@ class QueryService:
             raise
         except Exception as e:
             df, status, status_reason = None, "error", str(e)
+            # Same treatment as the dashboard's viewer run: a per-dataset
+            # refusal becomes "no access", never the provider's raw text.
+            from app.services.access_errors import (CREDENTIALS_REQUIRED_REASON, NO_ACCESS_REASON,
+                                                    is_access_denied, needs_credentials)
+            if is_access_denied(status_reason):
+                status_reason = NO_ACCESS_REASON
+            elif needs_credentials(e):
+                status_reason = CREDENTIALS_REQUIRED_REASON
         finally:
             if usage_context is not None:
                 try:
@@ -894,7 +952,8 @@ class QueryService:
                 report_id=str(report.id), params_fingerprint=fingerprint,
                 status="success", status_reason=None, data=df,
                 applied_params=dict(resolved) if resolved else None,
-                executed_as="viewer", last_run_at=_dt.utcnow(),
+                executed_as="creator" if str(credential_user.id) != str(caller.id) else "viewer",
+                last_run_at=_dt.utcnow(),
             )
             return {
                 "data": df or {},
@@ -909,6 +968,7 @@ class QueryService:
             "cached": False,
             "status": "error",
             "error": status_reason,
+            "error_code": _no_access_code(status_reason),
             "step_id": str(step.id),
         }
 
@@ -1031,7 +1091,7 @@ class QueryService:
         params only — source rows still run with your credentials" note off
         this. Pass one `memo` dict across a whole list to collapse repeat
         report/org lookups."""
-        report_id = getattr(q, "report_id", None)
+        report_id = await query_report_id(db, q)
         if not report_id:
             return schema
         memo = memo if memo is not None else {}
@@ -1085,12 +1145,22 @@ class QueryService:
     ) -> StepSchema:
         """Overlay a non-owner viewer's own step result over the shared
         snapshot, via the single resolve_step_data authority."""
-        if not viewer_user_id or not getattr(q, 'report_id', None):
+        if not viewer_user_id:
+            return schema
+        report_id = await query_report_id(db, q)
+        if report_id is None:
+            # A published dashboard's copy, or an orphan: no conversation whose
+            # policy could grant the snapshot, so nothing is served.
+            schema.viewer_result = None
+            schema.data = {}
+            schema.snapshot_withheld = True
+            schema.applied_params = None
+            schema.code = ""
             return schema
 
         owner_row = (await db.execute(
             select(Report.user_id, Report.shared_run_identity, Report.organization_id)
-            .where(Report.id == str(q.report_id))
+            .where(Report.id == str(report_id))
         )).first()
         if not owner_row or str(owner_row[0]) == str(viewer_user_id):
             return schema
@@ -1099,7 +1169,7 @@ class QueryService:
         # organization_id must travel too: the withholding policy's org-level
         # fallback (DS-less chat reports) keys off it.
         report_ctx = SimpleNamespace(
-            id=str(q.report_id), user_id=str(owner_row[0]), shared_run_identity=owner_row[1],
+            id=str(report_id), user_id=str(owner_row[0]), shared_run_identity=owner_row[1],
             organization_id=str(owner_row[2]) if owner_row[2] else None,
         )
         viewer = SimpleNamespace(id=str(viewer_user_id))
@@ -1134,31 +1204,29 @@ class QueryService:
         # This path needs the widget's report plus its execution inputs. Keep
         # the general query read projection narrow, and opt into only that
         # relationship graph here so async code never falls back to lazy IO.
-        stmt = select(Query).options(
-            lazyload("*"),
-            selectinload(Query.widget).options(
-                lazyload("*"),
-                selectinload(Widget.report).options(*_report_execution_loads()),
-            ),
-        ).where(Query.id == str(query_id))
+        stmt = select(Query).options(lazyload("*")).where(Query.id == str(query_id))
         if organization_id:
             stmt = stmt.where(Query.organization_id == str(organization_id))
         q = (await db.execute(stmt)).scalar_one_or_none()
         if not q:
             raise ValueError("Query not found")
 
-        report = q.widget.report
+        rid = await query_report_id(db, q, widget_first=True)
+        report = (await db.execute(
+            select(Report).options(*_report_execution_loads()).where(Report.id == rid)
+        )).scalar_one_or_none() if rid else None
         if not report:
             raise ValueError("Report not found for query's widget")
 
         # Build ds_clients using construct_clients for multi-connection support.
         # Run as the user who triggered the preview so user_required connections
-        # use their credentials (or owner/admin → system-cred fallback).
+        # use their credentials (or admin → system-cred fallback).
         from app.services.data_source_service import DataSourceService
         ds_service = DataSourceService()
         run_user = await db.get(User, user_id) if user_id else None
         ds_clients = {}
-        for ds in await self._report_data_sources(db, report, organization_id):
+        run_sources = await self._report_data_sources(db, report, organization_id)
+        for ds in run_sources:
             try:
                 ds_conns = await ds_service.construct_clients(db, ds, current_user=run_user)
                 ds_clients.update(ds_conns)
@@ -1171,7 +1239,11 @@ class QueryService:
         from app.models.organization import Organization
         org = await db.get(Organization, str(organization_id or report.organization_id)) if (organization_id or getattr(report, "organization_id", None)) else None
         org_settings = await org.get_settings(db) if org else None
-        executor = StreamingCodeExecutor(organization_settings=org_settings, usage_context=usage_context)
+        from app.data_sources.clients.bow_client import install_bow_client
+        await install_bow_client(db, org, run_user, report, ds_clients)
+        from app.ai.code_execution.sandbox_helpers import build_sandbox_helpers
+        executor = StreamingCodeExecutor(organization_settings=org_settings, usage_context=usage_context,
+                                         sandbox_helpers=build_sandbox_helpers(org_settings, run_sources, rerun=True))
 
         # Params: an explicit declarations list on the request is validated
         # against the code (same rule as a builder save); otherwise the

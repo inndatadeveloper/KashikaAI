@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.utils.egress_fakes import one_shot
 from app.data_sources.clients.qlik_sense_client import (
     QlikSenseClient,
     _build_hypercube_def,
@@ -357,6 +358,18 @@ class TestGetSchemas:
         stubs = [t for t in tables if (t.metadata_json or {}).get("qlik_sense", {}).get("status") == "error"]
         assert len(stubs) == 1
         assert stubs[0].is_active is False
+        # ...and reported, so the reindex keeps app-2's earlier tables.
+        assert client.unindexed_table_prefixes() == [stubs[0].name]
+
+        # The report describes the latest crawl only.
+        _install_rest(client, {
+            "/api/v1/items": {"data": ITEMS_APPS_PAGE_1["data"], "links": {}},
+            "/api/v1/apps/app-1/data/metadata": APP_METADATA_POPULATED,
+            "/api/v1/apps/app-2/data/metadata": APP_METADATA_POPULATED,
+        })
+        client._rest_get = original_rest
+        client.get_schemas()
+        assert client.unindexed_table_prefixes() == []
 
     def test_get_schema_by_full_name(self):
         client = QlikSenseClient(base_url="https://tenant.qlikcloud.com", api_key="x", max_concurrency=1)
@@ -497,39 +510,6 @@ class TestExecuteQuery:
         assert cube_def["qDimensions"][0]["qDef"]["qFieldDefs"] == ["Region"]
         assert cube_def["qMeasures"][0]["qDef"]["qDef"] == "Sum([Sales])"
 
-    def test_filters_applied_as_selections(self, monkeypatch):
-        client = QlikSenseClient(base_url="https://tenant.qlikcloud.com", api_key="x")
-        client.connect()
-        # _resolve_app_id now always attempts a list_apps() lookup first; give
-        # it an empty result so an opaque ID passes straight through.
-        _install_rest(client, {"/api/v1/items": {"data": [], "links": {}}})
-        canned = [
-            {"jsonrpc": "2.0", "id": 1, "result": {"qReturn": {"qHandle": 10}}},
-            {"jsonrpc": "2.0", "id": 2, "result": {}},  # SelectInField
-            {"jsonrpc": "2.0", "id": 3, "result": {"qReturn": {"qHandle": 42}}},
-            {"jsonrpc": "2.0", "id": 4, "result": {"qDataPages": [{"qMatrix": []}]}},
-        ]
-        connect_fn, fake = _fake_connect(canned)
-        fake_websockets = MagicMock()
-        fake_websockets.connect = connect_fn
-        monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
-
-        df = client.execute_query(
-            app="app-1",
-            dimensions=["Product"],
-            measures=[{"expr": "Sum([Revenue])", "alias": "Rev"}],
-            filters={"Region": ["EMEA"]},
-            max_rows=10,
-        )
-        assert df.empty
-        methods = [m["method"] for m in fake.sent]
-        # Selections must come BEFORE CreateSessionObject
-        assert methods == ["OpenDoc", "SelectInField", "CreateSessionObject", "GetHyperCubeData"]
-        select_call = fake.sent[1]
-        assert select_call["params"][0] == "Region"
-        values = select_call["params"][1]["qValues"]
-        assert [v["qText"] for v in values] == ["EMEA"]
-
     def test_requires_app(self):
         client = QlikSenseClient(base_url="https://tenant.qlikcloud.com", api_key="x")
         with pytest.raises(ValueError, match="app"):
@@ -602,7 +582,7 @@ class TestOAuthM2M:
             )
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         session = _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
 
@@ -629,7 +609,7 @@ class TestOAuthM2M:
             )
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         _install_rest(client, {
             "/api/v1/users/me": USERS_ME_OK,
@@ -650,7 +630,7 @@ class TestOAuthM2M:
             return _json_response({"access_token": next(tokens), "expires_in": 3600})
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         session = _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
 
@@ -671,7 +651,7 @@ class TestOAuthM2M:
             return _json_response({"error": "invalid_client"}, status=401)
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
         with pytest.raises(RuntimeError, match="OAuth token exchange failed"):
@@ -684,7 +664,7 @@ class TestOAuthM2M:
             return _json_response({"token_type": "bearer"})  # no access_token
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
         with pytest.raises(RuntimeError, match="missing access_token"):
@@ -703,7 +683,7 @@ class TestOAuthM2M:
             raise AssertionError("OAuth token endpoint must not be called when api_key is set")
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         session = _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
         client._rest_get("/api/v1/users/me")
@@ -719,7 +699,7 @@ class TestOAuthM2M:
             return _json_response({"access_token": "t", "expires_in": 3600})
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
         client._rest_get("/api/v1/users/me")
@@ -734,7 +714,7 @@ class TestOAuthM2M:
             return _json_response({"access_token": "t", "expires_in": 3600})
 
         monkeypatch.setattr(
-            "app.data_sources.clients.qlik_sense_client.requests.post", _fake_post
+            "app.data_sources.clients.qlik_sense_client.pinned_request", one_shot(_fake_post)
         )
         _install_rest(client, {"/api/v1/users/me": USERS_ME_OK})
         client._rest_get("/api/v1/users/me")

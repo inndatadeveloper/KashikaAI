@@ -32,7 +32,7 @@
     <div v-if="!loading && connections.length === 0" class="py-16 text-center border border-dashed border-gray-200 dark:border-gray-700 rounded-lg">
       <UIcon name="i-heroicons-server-stack" class="w-10 h-10 mx-auto text-gray-300 dark:text-gray-600 mb-3" />
       <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">No tool connections yet</p>
-      <p class="text-xs text-gray-400 dark:text-gray-600 mb-4">Connect an MCP server or custom API to give the AI agent access to external tools.</p>
+      <p class="text-xs text-ink-muted mb-4">Connect an MCP server or custom API to give the AI agent access to external tools.</p>
       <div v-if="canUpdate" class="flex items-center justify-center gap-2">
         <UButton color="blue" variant="soft" size="xs" icon="i-heroicons-plus" @click="$emit('add-mcp')">
           Add MCP Server
@@ -56,10 +56,10 @@
         <div class="flex items-center justify-between px-4 py-2.5 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700">
           <div class="flex items-center gap-2">
             <span class="text-sm font-medium text-gray-900 dark:text-white">{{ conn.name }}</span>
-            <span class="text-[9px] px-1.5 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 uppercase font-medium tracking-wide">{{ conn.type === 'custom_api' ? 'API' : 'MCP' }}</span>
+            <span class="text-2xs px-1.5 py-0.5 rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 uppercase font-medium tracking-wide">{{ conn.type === 'remote_ssh' ? 'SSH' : conn.type === 'remote_smb' ? 'SMB' : conn.type === 'custom_api' ? 'API' : 'MCP' }}</span>
           </div>
           <div class="flex items-center gap-1.5">
-            <span class="text-[10px] text-gray-400 dark:text-gray-600 me-1">
+            <span class="text-2xs text-ink-muted me-1">
               {{ getEnabledCount(conn.id) }}/{{ getToolCount(conn.id) }} enabled
             </span>
             <UTooltip v-if="canUpdate" text="Refresh tools">
@@ -69,7 +69,7 @@
                 class="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700 disabled:opacity-50"
               >
                 <Spinner v-if="refreshingConn === conn.id" class="w-3.5 h-3.5" />
-                <UIcon v-else name="heroicons-arrow-path" class="w-3.5 h-3.5 text-gray-400 dark:text-gray-600" />
+                <UIcon v-else name="heroicons-arrow-path" class="w-3.5 h-3.5 text-ink-muted" />
               </button>
             </UTooltip>
             <UTooltip v-if="canUpdate" text="Edit connection">
@@ -77,7 +77,7 @@
                 @click="$emit('edit-connection', conn)"
                 class="p-1 rounded hover:bg-gray-200 dark:hover:bg-gray-700"
               >
-                <UIcon name="heroicons-pencil-square" class="w-3.5 h-3.5 text-gray-400 dark:text-gray-600" />
+                <UIcon name="heroicons-pencil-square" class="w-3.5 h-3.5 text-ink-muted" />
               </button>
             </UTooltip>
             <UTooltip v-if="canUpdate" text="Remove connection">
@@ -85,7 +85,7 @@
                 @click="$emit('delete-connection', conn)"
                 class="p-1 rounded hover:bg-red-50 dark:hover:bg-red-950"
               >
-                <UIcon name="heroicons-trash" class="w-3.5 h-3.5 text-gray-400 dark:text-gray-600 hover:text-red-500" />
+                <UIcon name="heroicons-trash" class="w-3.5 h-3.5 text-ink-muted hover:text-red-500" />
               </button>
             </UTooltip>
           </div>
@@ -117,11 +117,11 @@
             data-testid="tools-select-all"
             @update:model-value="(val: boolean) => toggleSelectAll(conn.id, val)"
           />
-          <span v-if="selectedCount(conn.id) === 0" class="text-[11px] text-gray-400 dark:text-gray-600">
+          <span v-if="selectedCount(conn.id) === 0" class="text-2xs text-ink-muted">
             {{ $t('toolsSelector.selectAll') }}
           </span>
           <template v-else>
-            <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300" data-testid="tools-selected-count">
+            <span class="text-2xs font-medium text-gray-600 dark:text-gray-300" data-testid="tools-selected-count">
               {{ $t('toolsSelector.nSelected', { count: selectedCount(conn.id) }) }}
             </span>
             <template v-if="canUpdate">
@@ -139,18 +139,18 @@
                 @click="bulkSetEnabled(conn.id, false)"
               >{{ $t('toolsSelector.bulkDisable') }}</button>
               <span class="h-3 w-px bg-gray-200 dark:bg-gray-700"></span>
-              <span class="text-[9px] uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.adminPolicy') }}</span>
+              <span class="text-2xs uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.adminPolicy') }}</span>
               <select
                 :value="''"
                 :disabled="bulkBusy"
-                class="text-[10px] border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none focus:border-blue-400 disabled:opacity-50"
+                class="text-2xs border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none focus:border-blue-400 disabled:opacity-50"
                 data-testid="tools-bulk-policy"
                 @change="(e: Event) => bulkSetPolicy(conn.id, (e.target as HTMLSelectElement))"
               >
                 <option value="">{{ $t('toolsSelector.bulkSetPolicy') }}</option>
                 <option value="allow">{{ $t('toolsSelector.policyAllow') }}</option>
                 <option value="ask">{{ $t('toolsSelector.policyAsk') }}</option>
-                <option value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
+                <option v-if="conn.type !== 'remote_ssh'" value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
                 <option value="deny">{{ $t('toolsSelector.policyDeny') }}</option>
               </select>
               <button
@@ -162,11 +162,11 @@
               >{{ $t('toolsSelector.reset') }}</button>
             </template>
             <span class="h-3 w-px bg-gray-200 dark:bg-gray-700"></span>
-            <span class="text-[9px] uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.myPolicy') }}</span>
+            <span class="text-2xs uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.myPolicy') }}</span>
             <select
               :value="''"
               :disabled="bulkBusy"
-              class="text-[10px] border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none focus:border-blue-400 disabled:opacity-50"
+              class="text-2xs border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none focus:border-blue-400 disabled:opacity-50"
               data-testid="tools-bulk-my-policy"
               @change="(e: Event) => bulkSetMyPolicy(conn.id, (e.target as HTMLSelectElement))"
             >
@@ -174,11 +174,11 @@
               <option value="__clear__">{{ $t('toolsSelector.bulkClearMyPolicy') }}</option>
               <option value="allow">{{ $t('toolsSelector.policyAllow') }}</option>
               <option value="ask">{{ $t('toolsSelector.policyAsk') }}</option>
-              <option value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
+              <option v-if="conn.type !== 'remote_ssh'" value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
               <option value="deny">{{ $t('toolsSelector.policyDeny') }}</option>
             </select>
             <button
-              class="ms-auto px-1.5 py-0.5 rounded text-gray-400 dark:text-gray-600 hover:text-gray-600 dark:hover:text-gray-400"
+              class="ms-auto px-1.5 py-0.5 rounded text-ink-muted hover:text-gray-600 dark:hover:text-gray-400"
               data-testid="tools-bulk-clear"
               @click="clearSelection(conn.id)"
             >{{ $t('toolsSelector.clearSelection') }}</button>
@@ -210,25 +210,25 @@
               >
                 <UIcon
                   :name="expandedTools[tool.id] ? 'heroicons-chevron-down' : 'heroicons-chevron-right'"
-                  class="w-3 h-3 text-gray-400 dark:text-gray-600 flex-shrink-0 rtl-flip"
+                  class="w-3 h-3 text-ink-muted flex-shrink-0 rtl-flip"
                 />
-                <code class="text-[13px] text-gray-800 dark:text-gray-200 font-medium whitespace-nowrap">{{ tool.name }}</code>
+                <code class="text-sm text-gray-800 dark:text-gray-200 font-medium whitespace-nowrap">{{ tool.name }}</code>
                 <!-- HTTP identity for custom_api tools: method chip + path -->
                 <span
                   v-if="tool.metadata?.method"
-                  class="text-[9px] px-1 py-0.5 rounded font-semibold tracking-wide"
+                  class="text-2xs px-1 py-0.5 rounded font-semibold tracking-wide"
                   :class="methodChipClass(tool.metadata.method)"
                   data-testid="tool-http-method"
                 >{{ tool.metadata.method }}</span>
                 <code
                   v-if="tool.metadata?.path"
-                  class="text-[10px] text-gray-400 dark:text-gray-600 whitespace-nowrap hidden sm:inline"
+                  class="text-2xs text-ink-muted whitespace-nowrap hidden sm:inline"
                   data-testid="tool-http-path"
                 >{{ tool.metadata.path }}</code>
-                <span v-if="!tool.is_enabled" class="text-[9px] px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-600">off</span>
-                <span v-if="canUpdate && !tool.has_overlay" class="text-[9px] px-1 py-0.5 rounded bg-blue-50 dark:bg-blue-950 text-blue-500" title="Inherits connection default">default</span>
+                <span v-if="!tool.is_enabled" class="text-2xs px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-ink-muted">off</span>
+                <span v-if="canUpdate && !tool.has_overlay" class="text-2xs px-1 py-0.5 rounded bg-blue-50 dark:bg-blue-950 text-blue-500" title="Inherits connection default">default</span>
               </button>
-              <span class="text-[11px] text-gray-400 dark:text-gray-600 truncate min-w-0">{{ tool.description }}</span>
+              <span class="text-2xs text-ink-muted truncate min-w-0">{{ tool.description }}</span>
               <div class="flex items-center gap-2 ms-auto flex-shrink-0">
                 <!-- Enabled: the admin on/off switch for this tool -->
                 <UToggle
@@ -243,90 +243,100 @@
                 />
                 <!-- Admin policy: editable for agent admins, read-only badge otherwise -->
                 <div class="flex items-center gap-1" :title="$t('toolsSelector.adminPolicyTip')">
-                  <span class="text-[9px] uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.adminPolicy') }}</span>
+                  <span class="text-2xs uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.adminPolicy') }}</span>
                   <select
                     v-if="canUpdate"
                     :value="tool.policy"
                     @change="(e: Event) => setToolPolicy(conn.id, tool.id, (e.target as HTMLSelectElement).value)"
-                    class="text-[10px] border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none focus:border-blue-400"
+                    class="text-2xs border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 focus:outline-none focus:border-blue-400"
                   >
                     <option value="allow">{{ $t('toolsSelector.policyAllow') }}</option>
                     <option value="ask">{{ $t('toolsSelector.policyAsk') }}</option>
-                    <option value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
+                    <option v-if="tool.name !== 'execute_shell' || conn.type !== 'remote_ssh'" value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
                     <option value="deny">{{ $t('toolsSelector.policyDeny') }}</option>
                   </select>
                   <span
                     v-else
-                    class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
+                    class="text-2xs px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400"
                     data-testid="admin-policy-readonly"
                   >{{ policyLabel(tool.policy) }}</span>
                 </div>
                 <button
                   v-if="canUpdate && tool.has_overlay"
                   @click="resetTool(conn.id, tool.id)"
-                  class="text-[10px] text-gray-400 dark:text-gray-600 hover:text-gray-600 dark:hover:text-gray-400"
+                  class="text-2xs text-ink-muted hover:text-gray-600 dark:hover:text-gray-400"
                   :title="$t('toolsSelector.resetTip')"
                 >{{ $t('toolsSelector.reset') }}</button>
                 <!-- Per-user policy: every member controls their own -->
                 <div v-if="tool.policy !== 'deny'" class="flex items-center gap-1" :title="$t('toolsSelector.myPolicyTip')">
-                  <span class="text-[9px] uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.myPolicy') }}</span>
+                  <span class="text-2xs uppercase tracking-wide text-gray-300 dark:text-gray-600">{{ $t('toolsSelector.myPolicy') }}</span>
                   <select
                     :value="tool.user_policy || ''"
                     @change="(e: Event) => setMyPolicy(conn.id, tool.id, (e.target as HTMLSelectElement).value)"
-                    class="text-[10px] border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 focus:outline-none focus:border-blue-400"
+                    class="text-2xs border border-gray-200 dark:border-gray-700 rounded px-1 py-0.5 bg-white dark:bg-gray-900 focus:outline-none focus:border-blue-400"
                     :class="tool.user_policy ? 'text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-800' : 'text-gray-600 dark:text-gray-400'"
                     data-testid="my-policy-select"
                   >
                     <option value="">{{ $t('toolsSelector.policyInherit', { policy: policyLabel(tool.policy) }) }}</option>
                     <option value="allow">{{ $t('toolsSelector.policyAllow') }}</option>
                     <option value="ask">{{ $t('toolsSelector.policyAsk') }}</option>
-                    <option value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
+                    <option v-if="tool.name !== 'execute_shell' || conn.type !== 'remote_ssh'" value="auto">{{ $t('toolsSelector.policyAuto') }}</option>
                     <option value="deny">{{ $t('toolsSelector.policyDeny') }}</option>
                   </select>
                 </div>
               </div>
             </div>
 
+            <UButton v-if="conn.type === 'remote_ssh' && tool.name === 'execute_shell'" size="xs" variant="ghost" @click="editShellRules(tool.id)">{{ t('tools.remoteShell.mine') }}</UButton>
             <!-- Expanded -->
             <div v-if="expandedTools[tool.id]" class="mt-2 ms-9 space-y-2">
               <div v-if="tool.metadata?.method" class="flex items-center gap-1.5 text-xs">
                 <span
-                  class="text-[9px] px-1 py-0.5 rounded font-semibold tracking-wide"
+                  class="text-2xs px-1 py-0.5 rounded font-semibold tracking-wide"
                   :class="methodChipClass(tool.metadata.method)"
                 >{{ tool.metadata.method }}</span>
-                <code class="text-[11px] text-gray-500 dark:text-gray-400">{{ tool.metadata.path }}</code>
+                <code class="text-2xs text-gray-500 dark:text-gray-400">{{ tool.metadata.path }}</code>
               </div>
               <p v-if="tool.description" class="text-xs text-gray-500 dark:text-gray-400">{{ tool.description }}</p>
               <div v-if="tool.input_schema?.properties" class="text-xs">
-                <div class="text-[10px] text-gray-400 dark:text-gray-600 uppercase font-medium mb-1">Parameters</div>
+                <div class="text-2xs text-ink-muted uppercase font-medium mb-1">Parameters</div>
                 <div class="grid gap-1">
                   <div
                     v-for="(prop, pname) in tool.input_schema.properties"
                     :key="pname"
                     class="flex items-baseline gap-2 text-xs"
                   >
-                    <code class="text-[11px] text-blue-700 bg-blue-50 dark:bg-blue-950 px-1 py-0.5 rounded">{{ pname }}</code>
-                    <span class="text-gray-400 dark:text-gray-600">{{ prop.type || 'any' }}</span>
-                    <span v-if="(tool.input_schema.required || []).includes(pname)" class="text-[9px] text-red-400">required</span>
+                    <code class="text-2xs text-blue-700 bg-blue-50 dark:bg-blue-950 px-1 py-0.5 rounded">{{ pname }}</code>
+                    <span class="text-ink-muted">{{ prop.type || 'any' }}</span>
+                    <span v-if="(tool.input_schema.required || []).includes(pname)" class="text-2xs text-red-400">required</span>
                     <span v-if="prop.description" class="text-gray-500 dark:text-gray-400 truncate">— {{ prop.description }}</span>
                   </div>
                 </div>
               </div>
-              <details v-if="tool.input_schema" class="text-[10px] text-gray-400 dark:text-gray-600">
+              <details v-if="tool.input_schema" class="text-2xs text-ink-muted">
                 <summary class="cursor-pointer hover:text-gray-600 dark:hover:text-gray-400">Raw schema</summary>
-                <pre class="mt-1 bg-gray-50 dark:bg-gray-900 rounded p-2 text-[10px] font-mono text-gray-500 dark:text-gray-400 overflow-x-auto max-h-32 overflow-y-auto">{{ JSON.stringify(tool.input_schema, null, 2) }}</pre>
+                <pre class="mt-1 bg-gray-50 dark:bg-gray-900 rounded p-2 text-2xs font-mono text-gray-500 dark:text-gray-400 overflow-x-auto max-h-32 overflow-y-auto">{{ JSON.stringify(tool.input_schema, null, 2) }}</pre>
               </details>
             </div>
           </li>
         </ul>
 
         <!-- Empty tools -->
-        <div v-else class="px-4 py-6 text-xs text-gray-400 dark:text-gray-600 text-center">
+        <div v-else class="px-4 py-6 text-xs text-ink-muted text-center">
           {{ searchQuery ? 'No matching tools' : 'No tools discovered yet.' }}
           <button v-if="!searchQuery && canUpdate" @click="refreshTools(conn.id)" class="text-blue-500 hover:underline ms-1">Refresh</button>
         </div>
       </div>
     </div>
+    <UModal v-model="rulesOpen">
+      <div class="p-5 space-y-3">
+        <h3 class="text-sm font-semibold text-ink">{{ t('tools.remoteShell.mine') }}</h3>
+        <p class="text-xs text-ink-muted">{{ t('tools.remoteShell.override') }}</p>
+        <UTextarea dir="ltr" v-model="rulesText" :rows="12" :aria-label="t('tools.remoteShell.mine')" class="font-mono" />
+        <p v-if="rulesError" class="text-xs text-red-600">{{ rulesError }}</p>
+        <UButton :loading="rulesSaving" @click="saveShellRules">{{ t('tools.remoteShell.save') }}</UButton>
+      </div>
+    </UModal>
   </div>
 </template>
 
@@ -346,6 +356,32 @@ defineEmits(['add-mcp', 'add-custom-api', 'edit-connection', 'delete-connection'
 
 const toast = useToast()
 const { t } = useI18n()
+
+const rulesOpen = ref(false)
+const rulesText = ref('[]')
+const rulesToolId = ref('')
+const rulesError = ref('')
+const rulesSaving = ref(false)
+async function editShellRules(toolId: string) {
+  const response = await useMyFetch(`/data_sources/${props.dsId}/tools/${toolId}/my_shell_rules`)
+  if (response.error.value) { toast.add({ title: t('tools.remoteShell.failed'), color: 'red' }); return }
+  rulesToolId.value = toolId
+  rulesText.value = JSON.stringify(response.data.value || [], null, 2)
+  rulesError.value = ''
+  rulesOpen.value = true
+}
+async function saveShellRules() {
+  rulesSaving.value = true
+  rulesError.value = ''
+  try {
+    const rules = JSON.parse(rulesText.value)
+    if (!Array.isArray(rules)) throw new Error('array')
+    const response = await useMyFetch(`/data_sources/${props.dsId}/tools/${rulesToolId.value}/my_shell_rules`, { method: 'PUT', body: rules })
+    if (response.error.value) throw response.error.value
+    rulesOpen.value = false
+  } catch { rulesError.value = t('tools.remoteShell.failed') }
+  finally { rulesSaving.value = false }
+}
 
 const loading = ref(false)
 const refreshingConn = ref<string | null>(null)

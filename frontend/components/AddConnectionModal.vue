@@ -9,7 +9,7 @@
       <div v-if="step === 'select'">
         <div class="flex items-center justify-between mb-4">
           <h3 class="text-lg font-semibold">{{ $t('data.addConnection') }}</h3>
-          <button @click="isOpen = false" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-400">
+          <button :aria-label="$t('common.close')" @click="isOpen = false" class="text-ink-muted hover:text-gray-600 dark:hover:text-gray-400">
             <UIcon name="heroicons-x-mark" class="w-5 h-5" />
           </button>
         </div>
@@ -45,7 +45,7 @@
 
         <!-- Loading state -->
         <div v-if="loadingDataSources" class="flex items-center justify-center py-12">
-          <Spinner class="h-4 w-4 text-gray-400" />
+          <Spinner class="h-4 w-4 text-ink-muted" />
         </div>
 
         <!-- Scrollable region: data sources grouped by category. MCP-backed
@@ -53,7 +53,7 @@
              "MCP" badge rather than a transport-named section. -->
         <div v-else class="max-h-[320px] overflow-y-auto -mx-1 px-1">
           <div v-for="group in groupedCategories" :key="group.key" class="mb-5">
-            <div v-if="activeCategory === 'all'" class="text-xs font-medium text-gray-400 mb-2">{{ $t(group.label) }}</div>
+            <div v-if="activeCategory === 'all'" class="text-xs font-medium text-ink-muted mb-2">{{ $t(group.label) }}</div>
             <div class="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-5 gap-3">
               <button
                 v-for="tile in group.tiles"
@@ -72,17 +72,17 @@
                   <div class="p-1 relative">
                     <DataSourceIcon class="h-6" :type="tile.iconType" :connector-key="tile.connectorKey" />
                     <div v-if="tile.locked" class="absolute -top-1 -end-1">
-                      <svg class="h-3 w-3 text-gray-400" fill="currentColor" viewBox="0 0 20 20">
+                      <svg class="h-3 w-3 text-ink-muted" fill="currentColor" viewBox="0 0 20 20">
                         <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd" />
                       </svg>
                     </div>
                   </div>
                   <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ tile.title }}</div>
                   <div v-if="tile.isMcp || tile.locked" class="mt-1 flex items-center justify-center gap-1">
-                    <span v-if="tile.isMcp" class="text-[9px] font-medium uppercase tracking-wide text-blue-600 bg-blue-100 dark:bg-blue-950 px-1.5 py-0.5 rounded">
+                    <span v-if="tile.isMcp" class="text-2xs font-medium uppercase tracking-wide text-blue-600 bg-blue-100 dark:bg-blue-950 px-1.5 py-0.5 rounded">
                       {{ $t('data.mcpBadge') }}
                     </span>
-                    <span v-if="tile.locked" class="text-[9px] font-medium uppercase tracking-wide text-purple-600 bg-purple-100 dark:bg-purple-950 px-1.5 py-0.5 rounded">
+                    <span v-if="tile.locked" class="text-2xs font-medium uppercase tracking-wide text-purple-600 bg-purple-100 dark:bg-purple-950 px-1.5 py-0.5 rounded">
                       {{ $t('data.enterprise') }}
                     </span>
                   </div>
@@ -106,7 +106,7 @@
         >
           <!-- Custom Connectors (left) -->
           <div v-if="customEntries.length > 0">
-            <div class="text-xs font-medium text-gray-400 mb-2">{{ $t('data.customSection') }}</div>
+            <div class="text-xs font-medium text-ink-muted mb-2">{{ $t('data.customSection') }}</div>
             <div class="flex flex-wrap gap-2">
               <button
                 v-for="entry in customEntries"
@@ -124,7 +124,7 @@
 
           <!-- Sample databases (right) -->
           <div v-if="uninstalledDemos.length > 0" class="ms-auto text-end">
-            <div class="text-xs font-medium text-gray-400 mb-2">{{ $t('data.sampleSection') }}</div>
+            <div class="text-xs font-medium text-ink-muted mb-2">{{ $t('data.sampleSection') }}</div>
             <div class="flex flex-wrap gap-2 justify-end">
               <button
                 v-for="demo in uninstalledDemos"
@@ -136,7 +136,7 @@
                 <Spinner v-if="installingDemo === demo.id" class="h-3 w-3" />
                 <DataSourceIcon v-else class="h-4" :type="demo.type" />
                 {{ demo.name }}
-                <span class="text-[9px] font-medium uppercase tracking-wide text-purple-600 bg-purple-100 dark:bg-purple-950 px-1 py-0.5 rounded">{{ $t('data.sampleTag') }}</span>
+                <span class="text-2xs font-medium uppercase tracking-wide text-purple-600 bg-purple-100 dark:bg-purple-950 px-1 py-0.5 rounded">{{ $t('data.sampleTag') }}</span>
               </button>
             </div>
           </div>
@@ -146,115 +146,106 @@
       <!-- Step 2: Connection form. Capture-phase input/change listeners mark
            the form dirty so closing the modal asks for confirmation. -->
       <div
-        v-else-if="step === 'form'"
+        v-else-if="step !== 'select'"
+        class="flex flex-col max-h-[calc(100dvh-5rem)]"
         @input.capture="formDirty = true"
         @change.capture="formDirty = true"
       >
-        <div class="flex items-center gap-2 mb-4">
-          <button type="button" @click="backToSelect" class="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300">
+        <div class="flex items-center gap-2 mb-4 shrink-0">
+          <button :aria-label="$t('common.back')" v-if="!createdConnection" :disabled="formState.busy" type="button" @click="backToSelect" class="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300">
             <UIcon name="heroicons-chevron-left" class="w-5 h-5" />
           </button>
           <DataSourceIcon :type="selectedDataSource?.type" :connector-key="selectedDataSource?.connector_key" class="h-5" />
           <h3 class="text-lg font-semibold">{{ selectedDataSource?.title }}</h3>
-          <button @click="isOpen = false" class="ms-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-400">
+          <button :aria-label="$t('common.close')" @click="isOpen = false" class="ms-auto text-ink-muted hover:text-gray-600 dark:hover:text-gray-400">
             <UIcon name="heroicons-x-mark" class="w-5 h-5" />
           </button>
         </div>
 
-        <MCPConnectionForm
-          v-if="selectedDataSource?.type === 'mcp'"
-          :prefill="mcpPrefill"
-          @saved="handleToolProviderSaved"
-          @cancel="backToSelect"
-        />
-        <CustomAPIConnectionForm
-          v-else-if="selectedDataSource?.type === 'custom_api'"
-          :prefill="customApiPrefill"
-          @saved="handleToolProviderSaved"
-          @cancel="backToSelect"
-        />
-        <BrowserConnectionForm
-          v-else-if="selectedDataSource?.type === 'browser'"
-          @saved="handleToolProviderSaved"
-          @cancel="backToSelect"
-        />
-        <IntegrationConnectionForm
-          v-else-if="isGenericIntegration(selectedDataSource?.type)"
-          :integration-type="selectedDataSource?.type"
-          :integration-title="selectedDataSource?.title"
-          @saved="handleToolProviderSaved"
-          @cancel="backToSelect"
-        />
-        <ConnectForm
-          v-else
-          @success="handleConnectionSuccess"
-          :initialType="selectedDataSource?.type"
-          :initialName="selectedDataSource?.title"
-          :allowNameEdit="true"
-          :forceShowSystemCredentials="true"
-          :showRequireUserAuthToggle="true"
-          :initialRequireUserAuth="false"
-          :showTestButton="true"
-          :showLLMToggle="false"
-          :hideHeader="true"
-          mode="create_connection_only"
-        />
-      </div>
-
-      <!-- Step 3: Indexing progress -->
-      <div v-else-if="step === 'indexing'">
-        <div class="flex items-center gap-2 mb-4">
-          <DataSourceIcon :type="selectedDataSource?.type" class="h-5" />
-          <h3 class="text-lg font-semibold">{{ createdConnection?.name || selectedDataSource?.title }}</h3>
-          <span
-            v-if="indexingState?.status === 'completed'"
-            class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border bg-green-50 dark:bg-green-950 text-green-700 border-green-200"
-          >
-            <UIcon name="heroicons-check-circle" class="w-3.5 h-3.5" />
-            {{ $t('data.connected') }}
-          </span>
-          <span
-            v-else-if="indexingState?.status === 'failed'"
-            class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border bg-red-50 dark:bg-red-950 text-red-700 border-red-200"
-          >
-            <UIcon name="heroicons-exclamation-triangle" class="w-3.5 h-3.5" />
-            {{ $t('data.failed') }}
-          </span>
-          <span
-            v-else
-            class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded border bg-blue-50 dark:bg-blue-950 text-blue-700 border-blue-200"
-          >
-            <Spinner class="w-3 h-3" />
-            {{ $t('data.indexing') }}
-          </span>
+        <!-- Tool-provider forms scroll inside the modal; without this a tall
+             form (e.g. MCP with Advanced open) spills past the bottom. -->
+        <div v-if="isToolProviderForm" class="min-h-0 overflow-y-auto -mx-1 px-1" data-test="tool-form-scroll">
+          <MCPConnectionForm
+            v-if="selectedDataSource?.type === 'mcp'"
+            :prefill="mcpPrefill"
+            @saved="handleToolProviderSaved"
+            @cancel="backToSelect"
+          />
+          <CustomAPIConnectionForm
+            v-else-if="selectedDataSource?.type === 'custom_api'"
+            :prefill="customApiPrefill"
+            @saved="handleToolProviderSaved"
+            @cancel="backToSelect"
+          />
+          <BrowserConnectionForm
+            v-else-if="selectedDataSource?.type === 'browser'"
+            @saved="handleToolProviderSaved"
+            @cancel="backToSelect"
+          />
+          <IntegrationConnectionForm
+            v-else-if="isGenericIntegration(selectedDataSource?.type)"
+            :integration-type="selectedDataSource?.type"
+            :integration-title="selectedDataSource?.title"
+            @saved="handleToolProviderSaved"
+            @cancel="backToSelect"
+          />
         </div>
-
-        <div class="border border-gray-100 dark:border-gray-800 rounded-lg p-4 bg-gray-50 dark:bg-gray-900">
-          <div class="text-xs uppercase tracking-wide text-gray-400 mb-2">{{ $t('data.schemaDiscovery') }}</div>
-          <ConnectionIndexingProgress :indexing="indexingState" :show-logs="true" />
-        </div>
-
-        <div class="flex items-center justify-end gap-2 mt-4">
-          <UButton
-            v-if="indexingState?.status === 'failed'"
-            color="amber"
-            variant="soft"
-            size="sm"
-            :loading="retrying"
-            @click="retryIndexing"
-          >
-            <UIcon name="heroicons-arrow-path" class="w-4 h-4 me-1" />
-            {{ $t('data.retry') }}
-          </UButton>
-          <UButton
-            color="blue"
-            size="sm"
-            :disabled="!isIndexingTerminal"
-            @click="finishConnect"
-          >
-            {{ $t('data.connect') }}
-          </UButton>
-        </div>
+        <template v-else>
+          <div class="md:grid min-h-0 overflow-y-auto md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)] -mx-5 border-t border-gray-100 dark:border-gray-800">
+            <div class="min-w-0 px-6 py-6 md:px-8 md:max-h-[65vh] md:overflow-y-auto">
+              <fieldset :disabled="formState.busy || retrying || (!!createdConnection && indexingState?.status !== 'failed')" class="min-w-0">
+                <ConnectForm
+                  ref="connectionForm"
+                  embedded
+                  :read-only="!!createdConnection && indexingState?.status !== 'failed'"
+                  @state="formState = $event"
+                  @success="handleConnectionSuccess"
+                  :initialType="selectedDataSource?.type"
+                  :initialName="selectedDataSource?.title"
+                  :connectionId="createdConnection?.id"
+                  :mode="createdConnection ? 'edit' : 'create_connection_only'"
+                  :allowNameEdit="true"
+                  :forceShowSystemCredentials="true"
+                  :showRequireUserAuthToggle="true"
+                  :initialRequireUserAuth="false"
+                  :showLLMToggle="false"
+                  :hideHeader="true"
+                />
+              </fieldset>
+            </div>
+            <aside class="min-w-0 border-t md:border-t-0 md:border-s border-gray-100 dark:border-gray-800 px-6 py-6 md:px-8 bg-gray-50/50 dark:bg-gray-950/30" aria-live="polite" aria-atomic="false">
+              <h4 class="text-sm font-medium text-gray-900 dark:text-gray-100 mb-2">{{ $t('data.setupStatus') }}</h4>
+              <p v-if="!createdConnection && !formState.busy && !formState.error" class="text-sm leading-6 text-gray-500 dark:text-gray-400 mb-7">{{ $t('data.setupReadyHint') }}</p>
+              <ol class="space-y-5 my-6">
+                <li class="flex items-center gap-3 text-sm">
+                  <UIcon :name="createdConnection ? 'i-heroicons-check-circle' : formState.busy ? 'i-heroicons-arrow-path' : 'i-heroicons-circle-stack'" class="w-5 h-5 flex-none" :class="createdConnection ? 'text-green-600' : formState.busy ? 'animate-spin text-gray-600' : 'text-ink-muted'" />
+                  <span>{{ createdConnection ? $t('data.setupSaved') : $t('data.setupConnection') }}</span>
+                </li>
+                <li class="flex items-center gap-3 text-sm" :class="!createdConnection ? 'text-ink-muted' : ''">
+                  <UIcon :name="indexingState?.status === 'completed' ? 'i-heroicons-check-circle' : indexingState?.status === 'failed' ? 'i-heroicons-exclamation-circle' : 'i-heroicons-table-cells'" class="w-5 h-5 flex-none" :class="indexingState?.status === 'completed' ? 'text-green-600' : indexingState?.status === 'failed' ? 'text-red-600' : 'text-ink-muted'" />
+                  <span>{{ selectedDataSource?.data_shape === 'tools' ? $t('data.toolsLabel') : $t('data.schemaDiscovery') }}</span>
+                </li>
+              </ol>
+              <p v-if="formState.busy" class="text-sm text-gray-500 mb-4">{{ $t('data.setupConnecting') }}</p>
+              <div v-if="formState.error" role="alert" class="text-sm text-red-600 break-words whitespace-pre-wrap mb-4">{{ formState.error }}</div>
+              <p v-if="createdConnection && indexingState?.status === 'failed'" class="text-sm text-gray-500 mb-3">{{ $t('data.setupSavedDiscoveryFailed') }}</p>
+              <div v-if="formState.warning" role="status" class="text-sm text-amber-700 dark:text-amber-400 break-words whitespace-pre-wrap mb-4">{{ formState.warning }}</div>
+              <p v-if="retestResult" role="status" class="text-sm whitespace-pre-wrap break-words mb-4" :class="retestResult.success ? 'text-green-600' : 'text-red-600'">{{ retestResult.message }}</p>
+              <ConnectionIndexingProgress v-if="createdConnection" :indexing="indexingState" :show-logs="true" />
+              <ConnectionScheduleSettings v-if="createdConnection" :connection="createdConnection" />
+            </aside>
+          </div>
+          <div class="flex shrink-0 justify-end gap-3 border-t border-gray-100 dark:border-gray-800 pt-4">
+            <button v-if="createdConnection && indexingState?.status === 'completed'" type="button" class="border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 text-xs font-medium py-1.5 px-3 rounded hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50 flex items-center gap-2" :disabled="retesting" @click="testAgain">
+              <Spinner v-if="retesting" class="w-4 h-4" />
+              {{ retesting ? $t('data.testing') : $t('data.testAgain') }}
+            </button>
+            <button type="button" class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium py-1.5 px-3 rounded disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2" :disabled="formState.busy || retrying || (!!createdConnection && !isIndexingTerminal)" @click="primaryAction">
+              <Spinner v-if="formState.busy || retrying || (!!createdConnection && !isIndexingTerminal)" class="w-4 h-4" />
+              {{ formState.busy ? $t('data.setupConnecting') : createdConnection && !isIndexingTerminal ? $t('data.indexing') : indexingState?.status === 'failed' ? $t('data.retry') : createdConnection ? $t('data.setupDone') : $t('data.connect') }}
+            </button>
+          </div>
+        </template>
       </div>
 
     </div>
@@ -309,7 +300,7 @@ const emit = defineEmits<{
 const isOpen = computed({
   get: () => props.modelValue,
   set: (value) => {
-    if (!value && step.value === 'form' && formDirty.value) {
+    if (!value && step.value !== 'select' && formDirty.value) {
       showDiscardConfirm.value = true
       return
     }
@@ -344,13 +335,49 @@ const mcpPrefill = ref<any | null>(null)
 const customApiPrefill = ref<any | null>(null)
 const installingDemo = ref<string | null>(null)
 const createdConnection = ref<any | null>(null)
+const createdEmitted = ref(false)
+function notifyCreated() {
+  if (createdConnection.value && !createdEmitted.value) {
+    createdEmitted.value = true
+    emit('created', createdConnection.value)
+  }
+}
 const indexingState = ref<ConnectionIndexing | null>(null)
 const retrying = ref(false)
+const retesting = ref(false)
+const retestResult = ref<{ success: boolean; message: string } | null>(null)
+let retestSession = 0
+async function testAgain() {
+  const id = createdConnection.value?.id
+  if (!id || retesting.value) return
+  const session = ++retestSession
+  retesting.value = true
+  retestResult.value = null
+  try {
+    const { data, error } = await useMyFetch(`/connections/${id}/test`, { method: 'POST' })
+    if (session !== retestSession) return
+    const result = data.value as any
+    retestResult.value = {
+      success: !error.value && !!result?.success,
+      message: result?.message || t(error.value ? 'data.requestFailed' : result?.success ? 'data.connectionSuccessful' : 'data.connectionFailed'),
+    }
+  } catch {
+    if (session === retestSession) retestResult.value = { success: false, message: t('data.requestFailed') }
+  } finally {
+    if (session === retestSession) retesting.value = false
+  }
+}
+const connectionForm = ref<InstanceType<typeof ConnectForm> | null>(null)
+const formState = ref({ busy: false, error: '', warning: '' })
+function primaryAction() {
+  if (createdConnection.value && indexingState.value?.status !== 'failed') finishConnect()
+  else connectionForm.value?.connect()
+}
 // True once the user typed/changed anything in the step-2 connection form.
 // Prefills alone don't mark dirty — only real user input does.
 const formDirty = ref(false)
 const showDiscardConfirm = ref(false)
-let pollTimer: ReturnType<typeof setInterval> | null = null
+let pollTimer: ReturnType<typeof setTimeout> | null = null
 const POLL_INTERVAL_MS = 2000
 
 const isIndexingTerminal = computed(() =>
@@ -519,6 +546,10 @@ function uiFormFor(type: string | undefined): string {
 function isGenericIntegration(type: string | undefined): boolean {
   return uiFormFor(type) === 'integration'
 }
+const isToolProviderForm = computed(() => {
+  const t = selectedDataSource.value?.type
+  return t === 'mcp' || t === 'custom_api' || t === 'browser' || isGenericIntegration(t)
+})
 
 // Connections that should skip the schema-indexing step on save. Anything
 // without an admin-side catalog (tool providers + per-user catalogs).
@@ -542,9 +573,9 @@ function selectCatalogEntry(entry: any) {
   // Catalog auth → MCP form auth_type. In the catalog, auth="oauth" means
   // per-user OAuth via Dynamic Client Registration (no admin setup) — the form
   // calls that "dcr". oauth_app needs an admin-registered client; bearer is a
-  // per-user token.
+  // token; basic is an email/username + API token (e.g. Bitbucket).
   const isDcr = entry.auth === 'oauth'
-  const authType = isDcr ? 'dcr' : (entry.auth === 'oauth_app' ? 'oauth_app' : 'bearer')
+  const authType = isDcr ? 'dcr' : (['oauth_app', 'basic'].includes(entry.auth) ? entry.auth : 'bearer')
   selectedDataSource.value = {
     type: 'mcp',
     title: entry.title,
@@ -596,7 +627,7 @@ function handleToolProviderSaved(connection: any) {
     icon: 'i-heroicons-check-circle',
     color: 'green',
   })
-  emit('created', connection)
+  notifyCreated()
   closeModal()
 }
 
@@ -615,8 +646,15 @@ function handleConnectionSuccess(connection: any) {
     handleToolProviderSaved(connection)
     return
   }
+  if (createdConnection.value) {
+    formDirty.value = false
+    createdConnection.value = connection
+    retryIndexing()
+    return
+  }
+  formDirty.value = false
   // Stash the created connection and switch to the indexing step. We do NOT
-  // close the modal — the user watches indexing run, then clicks Connect.
+  // close the modal — the form stays mounted while discovery runs.
   createdConnection.value = connection
   // Some create endpoints inline a starter `indexing` payload; otherwise
   // we fetch on first poll.
@@ -625,64 +663,58 @@ function handleConnectionSuccess(connection: any) {
   startPolling()
 }
 
-async function fetchIndexing() {
-  const id = createdConnection.value?.id
-  if (!id) return
-  try {
-    const { data } = await useMyFetch(`/connections/${id}/indexing`, { method: 'GET' })
-    if ((data as any).value) {
-      indexingState.value = (data as any).value as ConnectionIndexing
-    }
-  } catch {
-    // Transient — keep polling
-  }
-}
-
+let pollGeneration = 0
 function startPolling() {
   stopPolling()
-  // Initial fetch — if the create response didn't include indexing.
-  fetchIndexing().then(() => {
-    if (isIndexingActive(indexingState.value)) {
-      pollTimer = setInterval(() => {
-        if (!isIndexingActive(indexingState.value)) {
-          stopPolling()
-          return
-        }
-        fetchIndexing()
-      }, POLL_INTERVAL_MS)
+  const generation = pollGeneration
+  const id = createdConnection.value?.id
+  if (!id) return
+  const poll = async () => {
+    try {
+      const { data } = await useMyFetch(`/connections/${id}/indexing`, { method: 'GET' })
+      if (generation !== pollGeneration || !isOpen.value) return
+      if (data.value) indexingState.value = data.value as ConnectionIndexing
+    } catch { /* Keep the last known state and retry transient failures. */ }
+    if (generation === pollGeneration && isOpen.value && (!indexingState.value || isIndexingActive(indexingState.value))) {
+      pollTimer = setTimeout(poll, POLL_INTERVAL_MS)
     }
-  })
+  }
+  poll()
 }
 
 function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
+  pollGeneration++
+  if (pollTimer) clearTimeout(pollTimer)
+  pollTimer = null
 }
 
 async function retryIndexing() {
   const id = createdConnection.value?.id
   if (!id || retrying.value) return
   retrying.value = true
+  stopPolling()
+  formState.value.error = ''
   try {
-    const { data } = await useMyFetch(`/connections/${id}/reindex`, { method: 'POST' })
+    const { data, error } = await useMyFetch(`/connections/${id}/reindex`, { method: 'POST' })
+    if (error.value) throw error.value
     const result = (data as any).value
     if (result?.indexing) {
       indexingState.value = result.indexing as ConnectionIndexing
     }
     startPolling()
+  } catch (error: any) {
+    formState.value.error = error?.data?.detail || t('data.requestFailed')
   } finally {
     retrying.value = false
   }
 }
 
 function finishConnect() {
-  // The Connect button is enabled only at terminal state. Emit `created`
+  // Done is enabled only at terminal state. Emit `created`
   // here (not on initial success) so the parent only refreshes once
   // schema is in place.
   if (createdConnection.value) {
-    emit('created', createdConnection.value)
+    notifyCreated()
     if (indexingState.value?.status === 'completed') {
       toast.add({
         title: t('data.connectionCreated'),
@@ -696,6 +728,10 @@ function finishConnect() {
 }
 
 function reset() {
+  retestSession++
+  retesting.value = false
+  retestResult.value = null
+  formState.value = { busy: false, error: '', warning: '' }
   step.value = 'select'
   searchQuery.value = ''
   activeCategory.value = 'all'
@@ -703,6 +739,7 @@ function reset() {
   mcpPrefill.value = null
   customApiPrefill.value = null
   createdConnection.value = null
+  createdEmitted.value = false
   indexingState.value = null
   retrying.value = false
   formDirty.value = false
@@ -711,7 +748,14 @@ function reset() {
 }
 
 onBeforeUnmount(() => stopPolling())
-watch(isOpen, (val) => { if (!val) stopPolling() })
+watch(isOpen, (val) => {
+  if (!val) {
+    stopPolling()
+    // X/Escape can close a saved connection while discovery continues.
+    // Refresh the caller once, just as Done does.
+    notifyCreated()
+  }
+})
 
 // Reset state when modal opens
 watch(isOpen, async (val) => {

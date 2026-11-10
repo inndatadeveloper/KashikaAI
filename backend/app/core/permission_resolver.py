@@ -8,7 +8,7 @@ The resolver is cached per-request on request.state to avoid repeated queries.
 """
 import logging
 from dataclasses import dataclass, field
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 
@@ -37,6 +37,27 @@ ORG_PERM_IMPLIES_RESOURCE: dict[str, dict[str, set[str]]] = {
     # *other people's* agents stays an explicit, opt-in per-connection grant.
     "manage_connections":  {"connection": {"manage_connection", "create_data_sources"}},
 }
+
+# Org-level permissions that imply OTHER org-level permissions. Expanded once,
+# where the resolved set is built, so route checks, whoami and the frontend
+# permission store all see the same closure — rather than every call site having
+# to remember the pair.
+ORG_PERM_IMPLIES_ORG: dict[str, set[str]] = {
+    # Editing and executing code you are not allowed to read is not a coherent
+    # state, so the edit permission carries the read permission with it.
+    "run_custom_code": {"view_code"},
+    # The org connection admin can create connections too.
+    "manage_connections": {"create_connections"},
+}
+
+
+def expand_org_permissions(org_permissions: set) -> set:
+    """Close an org-permission set over ORG_PERM_IMPLIES_ORG (one level)."""
+    for held, implied in ORG_PERM_IMPLIES_ORG.items():
+        if held in org_permissions:
+            org_permissions.update(implied)
+    return org_permissions
+
 
 # A `manage` grant on a data source is the agent-owner/manager tier: it is a
 # superset that implies the specific management permissions enforced across the
@@ -154,24 +175,54 @@ async def principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> bool:
 
     if getattr(user, "is_service_account", False):
         from app.models.service_account import ServiceAccount
+        # Existence check (not scalar_one_or_none): same duplicate-tolerance as the
+        # membership branch below, so two rows for the same (user, org) can never
+        # turn this binding check into a MultipleResultsFound 500.
         result = await db.execute(
-            select(ServiceAccount).where(
+            select(ServiceAccount.id).where(
                 ServiceAccount.user_id == str(user.id),
                 ServiceAccount.organization_id == str(org_id),
                 ServiceAccount.disabled_at.is_(None),
                 ServiceAccount.deleted_at.is_(None),
-            )
+            ).limit(1)
         )
-        return result.scalar_one_or_none() is not None
+        return result.first() is not None
 
+    # Existence check, NOT scalar_one_or_none(): a user with two live membership
+    # rows for the same org (a duplicate that provisioning paths could create —
+    # see claim_pending_invite) would make scalar_one_or_none() raise
+    # MultipleResultsFound, which 500s get_current_organization and every
+    # org-scoped route that depends on it (the model list, completion, ...),
+    # presenting to the user as "no available models" / unable to query. The
+    # binding question only needs "does at least one row exist", so limit(1).
     result = await db.execute(
-        select(Membership).where(
+        select(Membership.id).where(
             Membership.user_id == str(user.id),
             Membership.organization_id == str(org_id),
             Membership.deleted_at.is_(None),
-        )
+        ).limit(1)
     )
-    return result.scalar_one_or_none() is not None
+    return result.first() is not None
+
+
+async def principal_can_act_in_org(db: AsyncSession, user, org_id: str) -> bool:
+    """Whether background work may still run AS ``user`` in ``org_id``.
+
+    Use this from deferred jobs (scheduled prompts, agent wake-ups), which run
+    long after any request authenticated the user. It needs two things:
+
+    - The org binding (``principal_belongs_to_org``). Covers removal from
+      the members list and directory syncs.
+    - An active login, for humans. SCIM DELETE deprovisions by setting
+      ``is_active=False`` and keeps the membership row, so the binding alone
+      misses it. Service accounts are inactive by construction, so for them
+      the ``ServiceAccount`` binding (which honours ``disabled_at``) decides.
+    """
+    if user is None:
+        return False
+    if not getattr(user, "is_service_account", False) and not getattr(user, "is_active", False):
+        return False
+    return await principal_belongs_to_org(db, user, org_id)
 
 
 async def assert_principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> None:
@@ -229,6 +280,244 @@ async def ensure_system_role_assignment(
     ))
 
 
+async def materialize_pending_rbac(
+    db: AsyncSession, membership, user_id: str
+) -> None:
+    """Rewrite an invite's pending (membership-keyed) RBAC onto the registered user.
+
+    An org admin can pre-assign roles, groups and usage policies to an invite
+    before the user registers. Those are stored keyed on the invite's
+    ``Membership.id`` (``RoleAssignment``/``UsagePolicyAssignment`` with
+    ``principal_type='membership'``, ``GroupMembership`` with ``membership_id``).
+    When the invite is claimed we convert them to the user-keyed equivalents,
+    de-duplicating against anything the user already has, so the resolver (which
+    only knows 'user'/'group') sees the intended permissions immediately.
+
+    Used by both invite-acceptance (``_attach_open_memberships``) and the
+    provisioning paths (``claim_pending_invite``). Does NOT commit — the caller
+    commits. Never raises: a missing pending-RBAC table (pre-migration) or a
+    transient conflict must not block login/provisioning.
+    """
+    from app.models.role_assignment import RoleAssignment
+    from app.models.usage_policy import UsagePolicyAssignment
+
+    org_id = membership.organization_id
+    # Flush the CALLER's own pending writes (invite claim, OAuth link, ...) to the
+    # OUTER transaction first. With autoflush on, the first query inside the
+    # savepoint below would otherwise pull those writes into the savepoint and
+    # discard them on a swallowed rollback. Not wrapped in try: a caller-write
+    # failure is the caller's to surface, not ours to swallow.
+    await db.flush()
+    try:
+        # SAVEPOINT: on any failure (pending-RBAC tables absent pre-migration, or a
+        # concurrent duplicate-RBAC conflict on flush) only the conversions below
+        # roll back — the outer transaction stays clean so the caller's immediate
+        # commit (SCIM/OIDC claim paths) doesn't hit PendingRollbackError.
+        async with db.begin_nested():
+            # Role assignments: membership principal → user principal
+            ra_result = await db.execute(
+                select(RoleAssignment).where(
+                    RoleAssignment.organization_id == org_id,
+                    RoleAssignment.principal_type == "membership",
+                    RoleAssignment.principal_id == membership.id,
+                    RoleAssignment.deleted_at.is_(None),
+                )
+            )
+            for assignment in ra_result.scalars().all():
+                existing = await db.execute(
+                    select(RoleAssignment).where(
+                        RoleAssignment.organization_id == org_id,
+                        RoleAssignment.role_id == assignment.role_id,
+                        RoleAssignment.principal_type == "user",
+                        RoleAssignment.principal_id == user_id,
+                        RoleAssignment.deleted_at.is_(None),
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    await db.delete(assignment)
+                else:
+                    assignment.principal_type = "user"
+                    assignment.principal_id = user_id
+
+            # Group memberships: membership-keyed → user-keyed
+            gm_result = await db.execute(
+                select(GroupMembership).where(
+                    GroupMembership.membership_id == membership.id,
+                    GroupMembership.deleted_at.is_(None),
+                )
+            )
+            for gm in gm_result.scalars().all():
+                existing = await db.execute(
+                    select(GroupMembership).where(
+                        GroupMembership.group_id == gm.group_id,
+                        GroupMembership.user_id == user_id,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    await db.delete(gm)
+                else:
+                    gm.user_id = user_id
+                    gm.membership_id = None
+
+            # Usage-policy (quota) assignments: membership principal → user principal
+            upa_result = await db.execute(
+                select(UsagePolicyAssignment).where(
+                    UsagePolicyAssignment.organization_id == org_id,
+                    UsagePolicyAssignment.principal_type == "membership",
+                    UsagePolicyAssignment.principal_id == membership.id,
+                    UsagePolicyAssignment.deleted_at.is_(None),
+                )
+            )
+            for upa in upa_result.scalars().all():
+                existing = await db.execute(
+                    select(UsagePolicyAssignment).where(
+                        UsagePolicyAssignment.organization_id == org_id,
+                        UsagePolicyAssignment.policy_id == upa.policy_id,
+                        UsagePolicyAssignment.principal_type == "user",
+                        UsagePolicyAssignment.principal_id == user_id,
+                        UsagePolicyAssignment.deleted_at.is_(None),
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    await db.delete(upa)
+                else:
+                    upa.principal_type = "user"
+                    upa.principal_id = user_id
+            await db.flush()
+    except Exception:
+        # Never block the caller if pending-RBAC tables aren't present
+        # (pre-migration) or a conversion hits a transient conflict.
+        pass
+
+
+async def insert_membership_if_absent(db: AsyncSession, membership):
+    """Insert ``membership`` unless a live row for its (user_id, organization_id)
+    already exists. Returns ``(row, created)``.
+
+    Race-safe against the partial unique index ``uq_memberships_one_live_per_user_org``:
+    a concurrent insert that loses the race raises IntegrityError, which is caught
+    inside a SAVEPOINT (so the outer transaction — e.g. an LDAP batch — is not
+    poisoned and a login is not 500'd) and the already-present row is returned.
+
+    This is the single membership-insert primitive; every path that creates a
+    ``user_id``-keyed membership routes through it so none hits an unguarded
+    IntegrityError. Pending invites (``user_id`` NULL) are not constrained by the
+    index, so for them the insert simply succeeds. The returned row is always
+    present (never ``None``): if the conflict has no surviving live row to return
+    (the winner was deleted in the same window — pathological), the original error
+    is re-raised rather than handing the caller a ``None`` to dereference. Does
+    NOT commit.
+    """
+    from app.models.membership import Membership
+    from sqlalchemy.exc import IntegrityError
+
+    # Flush the caller's unrelated pending state FIRST, in the outer transaction,
+    # before the savepoint. ``begin_nested()`` pre-flushes the whole session when
+    # it opens: were ``membership`` already ``add``ed at that point, the
+    # conflicting INSERT would run in the OUTER transaction and a lost race would
+    # roll the whole thing back (and ``expunge`` below would then fire on a dead
+    # session). So ``add`` + flush the membership strictly INSIDE the savepoint,
+    # where only it rolls back on conflict.
+    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(membership)
+            await db.flush([membership])
+        return membership, True
+    except IntegrityError:
+        # The savepoint rollback already auto-expunges a pending object that was
+        # ``add``ed inside it; only expunge explicitly if it somehow survived
+        # (expunging a detached instance would itself raise).
+        if membership in db:
+            db.expunge(membership)
+        if membership.user_id is None:
+            raise
+        existing = (await db.execute(
+            select(Membership).where(
+                Membership.user_id == membership.user_id,
+                Membership.organization_id == membership.organization_id,
+                Membership.deleted_at.is_(None),
+            ).limit(1)
+        )).scalars().first()
+        if existing is None:
+            raise
+        return existing, False
+
+
+async def claim_pending_invite(db: AsyncSession, user, org_id: str):
+    """Attach an open email invite to ``user`` instead of creating a second row.
+
+    An invite is a ``Membership`` row with ``user_id IS NULL`` and ``email`` set.
+    The invite-acceptance path (``_attach_open_memberships``) claims these by
+    email on register/login. Provisioning paths (SCIM/OIDC/LDAP) that only looked
+    up a ``user_id``-keyed row never saw the leftover invite, so they created a
+    SECOND membership and the later acceptance claimed the invite too — two live
+    rows for the same (user, org), which is exactly what breaks
+    ``principal_belongs_to_org``. Those paths call this first.
+
+    Returns the claimed ``Membership`` (with its role assignment ensured and
+    pending RBAC materialized), or ``None`` when there is no open invite to claim.
+    Expiry is intentionally ignored — this mirrors ``_attach_open_memberships``,
+    which claims invites regardless of ``invite_expires_at``. Does NOT commit.
+
+    An invite is always admin intent, so ``directory_provider`` is deliberately
+    left as-is (NULL for a hand-issued invite): stamping it would make an
+    admin-granted membership eligible for directory cleanup (``_cleanup_org_memberships``
+    deletes by ``directory_provider``). Multiple open invites for one email are
+    allowed, so the most-privileged (then oldest) is claimed deterministically —
+    the same ordering the dedup migration uses — instead of an arbitrary row.
+    """
+    from app.models.membership import Membership
+    from sqlalchemy import case
+
+    email = (getattr(user, "email", None) or "").strip().lower()
+    if not email:
+        return None
+    role_rank = case((Membership.role == "admin", 0), (Membership.role == "member", 1), else_=2)
+    invite = (await db.execute(
+        select(Membership).where(
+            func.lower(Membership.email) == email,
+            Membership.organization_id == str(org_id),
+            Membership.user_id.is_(None),
+            Membership.deleted_at.is_(None),
+        ).order_by(role_rank, Membership.created_at.asc(), Membership.id.asc()).limit(1)
+    )).scalars().first()
+    if invite is None:
+        return None
+
+    # SAVEPOINT around the claim: between the caller's existence check and here, a
+    # concurrent path may have created the live (user, org) membership that the
+    # partial unique index now bars. Losing that race must not poison the outer
+    # transaction (LDAP's batch) or 500 the login (OIDC). On conflict, drop the
+    # rolled-back claim and report "nothing claimed" — the caller's create path
+    # (itself savepoint-guarded) then treats the user as already a member.
+    #
+    # Flush the caller's unrelated pending state FIRST, in the outer transaction,
+    # then stamp the claim attributes INSIDE the savepoint: ``begin_nested()``
+    # pre-flushes the session on open, so a claim written before the savepoint
+    # would hit the index in the OUTER transaction and roll the whole thing back.
+    from sqlalchemy.exc import IntegrityError
+    await db.flush()
+    try:
+        async with db.begin_nested():
+            invite.user_id = user.id
+            invite.email = None
+            invite.invite_token = None
+            await db.flush([invite])
+    except IntegrityError:
+        # Savepoint rolled back the claim; the invite (a persistent row) stays in
+        # the session with its attributes restored. Detach it so the caller's
+        # create path re-queries cleanly; guard in case it was already expunged.
+        if invite in db:
+            db.expunge(invite)
+        return None
+    await materialize_pending_rbac(db, invite, str(user.id))
+    await ensure_system_role_assignment(
+        db, str(org_id), str(user.id), invite.role or "member"
+    )
+    return invite
+
+
 async def resolve_permissions(
     db: AsyncSession, user_id: str, org_id: str
 ) -> ResolvedPermissions:
@@ -282,7 +571,11 @@ async def _resolve_permissions_inner(
     """Inner implementation of permission resolution."""
     # 1. Get user's group IDs in this org
     group_stmt = (
-        select(GroupMembership.group_id)
+        select(
+            GroupMembership.group_id,
+            Group.default_llm_model_id,
+            Group.small_default_llm_model_id,
+        )
         .join(Group, Group.id == GroupMembership.group_id)
         .where(
             GroupMembership.user_id == user_id,
@@ -290,7 +583,11 @@ async def _resolve_permissions_inner(
         )
     )
     group_result = await db.execute(group_stmt)
-    group_ids = [row[0] for row in group_result.all()]
+    group_rows = group_result.all()
+    group_ids = [row[0] for row in group_rows]
+    group_default_model_ids = _group_default_model_ids(
+        (row[1], row[2]) for row in group_rows
+    )
 
     # 2. Build principal matching condition (user directly OR via groups)
     principal_conditions = [
@@ -448,11 +745,27 @@ async def _resolve_permissions_inner(
     for ds_id in await _owned_data_source_ids(db, user_id, org_id):
         resource_permissions.setdefault(("data_source", ds_id), set()).add("manage")
 
+    # A group's default / small-default model is usable by its members, even
+    # when the model is restricted — setting a group default implies access.
+    for model_id in group_default_model_ids:
+        resource_permissions.setdefault(("llm_model", model_id), set()).add("use")
+
     return ResolvedPermissions(
-        org_permissions=org_permissions,
+        org_permissions=expand_org_permissions(org_permissions),
         resource_permissions=resource_permissions,
         role_names=role_names,
     )
+
+
+def _group_default_model_ids(pairs) -> set:
+    """Model ids set as default/small default on any of the given groups."""
+    out = set()
+    for default_id, small_id in pairs:
+        if default_id:
+            out.add(str(default_id))
+        if small_id:
+            out.add(str(small_id))
+    return out
 
 
 async def _owned_data_source_ids(
@@ -524,15 +837,18 @@ async def resolve_permissions_bulk(
     try:
         # 1. Group memberships across all requested orgs (1 query).
         group_rows = (await db.execute(
-            select(Group.organization_id, GroupMembership.group_id)
+            select(Group.organization_id, GroupMembership.group_id,
+                   Group.default_llm_model_id, Group.small_default_llm_model_id)
             .join(Group, Group.id == GroupMembership.group_id)
             .where(GroupMembership.user_id == user_id,
                    Group.organization_id.in_(org_ids))
         )).all()
         groups_by_org: dict[str, list] = {}
+        group_defaults_by_org: dict[str, list] = {}
         all_group_ids: list = []
-        for org_id, group_id in group_rows:
+        for org_id, group_id, default_id, small_id in group_rows:
             groups_by_org.setdefault(org_id, []).append(group_id)
+            group_defaults_by_org.setdefault(org_id, []).append((default_id, small_id))
             all_group_ids.append(group_id)
 
         # 2. Role assignments + role data (1 query). Mirrors the per-org filter:
@@ -641,8 +957,10 @@ async def resolve_permissions_bulk(
                 res_perms.setdefault(("data_source", ds_id), set()).add("manage")
             for ds_id in owned_by_org.get(org_id, []):
                 res_perms.setdefault(("data_source", ds_id), set()).add("manage")
+            for model_id in _group_default_model_ids(group_defaults_by_org.get(org_id, [])):
+                res_perms.setdefault(("llm_model", model_id), set()).add("use")
             result[org_id] = ResolvedPermissions(
-                org_permissions=org_perms[org_id],
+                org_permissions=expand_org_permissions(org_perms[org_id]),
                 resource_permissions=res_perms,
                 role_names=role_names_by_org[org_id],
             )
@@ -790,9 +1108,10 @@ async def get_accessible_model_ids(
 
     - is_admin=True means the user has full_admin_access; callers should not
       filter (every model is accessible).
-    - model_ids are LLMModel ids granted directly, via group, or via role.
-      Unrestricted models and org defaults are NOT included here — callers
-      handle those via ``user_can_use_model`` / the restriction flag.
+    - model_ids are LLMModel ids granted directly, via group, or via role,
+      plus the defaults of the user's groups (a group default implies `use`).
+      Unrestricted models are NOT included here — callers handle those via
+      ``user_can_use_model`` / the restriction flag.
     """
     resolved = await resolve_permissions(db, str(user_id), str(org_id))
     if FULL_ADMIN in resolved.org_permissions:
@@ -808,18 +1127,36 @@ async def user_can_use_model(
 ) -> bool:
     """Capability check for a single LLM model.
 
-    Order: feature off (fail open) → unrestricted → org default/small-default
-    (always available) → full admin → explicit `use` grant.
+    Order: feature off (fail open) → unrestricted → full admin → `use`
+    grant (direct, group, role, or one of the user's group defaults).
+    A restricted org default is restricted like any other model.
     """
     if not llm_access_control_active():
         return True
-    if not getattr(model, "is_restricted", False):
-        return True
-    # Org default + small default are always available to every member (D3).
-    if getattr(model, "is_default", False) or getattr(model, "is_small_default", False):
+    if model_open_to_all(model):
         return True
     is_admin, granted = await get_accessible_model_ids(db, user_id, org_id)
     return is_admin or str(model.id) in set(granted)
+
+
+def model_open_to_all(model) -> bool:
+    """Usable by every member: the model is not restricted.
+
+    Org defaults used to be always open (design D3). That was lifted so a
+    restricted org default can be kept from some groups, who then fall back
+    to their own group default (see LLMService.get_default_model).
+    """
+    return not getattr(model, "is_restricted", False)
+
+
+async def filter_models_user_can_use(db: AsyncSession, user_id: str, org_id: str, models) -> list:
+    """`user_can_use_model` over many models, resolving permissions once."""
+    models = list(models)
+    if not llm_access_control_active() or all(model_open_to_all(m) for m in models):
+        return models
+    is_admin, granted = await get_accessible_model_ids(db, user_id, org_id)
+    granted_set = set(granted)
+    return [m for m in models if is_admin or model_open_to_all(m) or str(m.id) in granted_set]
 
 
 async def get_ds_ids_with_permission(
@@ -829,9 +1166,11 @@ async def get_ds_ids_with_permission(
 
     is_full_admin=True means the caller should skip all DS-level filtering.
     """
+    from app.services.connected_application_service import agent_ceiling
+    ceiling = await agent_ceiling(db, org_id)
     resolved = await resolve_permissions(db, str(user_id), str(org_id))
     if resolved.has_org_permission(permission):
-        return True, []
+        return (True, []) if ceiling is None else (False, list(ceiling))
     # Resolve through has_resource_permission rather than testing membership of
     # the raw grant set: an agent's owner/manager holds `manage`, which IMPLIES
     # manage_instructions / manage_evals / create_entities on that agent
@@ -844,7 +1183,7 @@ async def get_ds_ids_with_permission(
         if rtype == "data_source"
         and resolved.has_resource_permission("data_source", rid, permission)
     ]
-    return False, matching
+    return False, matching if ceiling is None else [i for i in matching if i in ceiling]
 
 
 async def get_user_ids_with_permission(
@@ -888,6 +1227,11 @@ async def user_can_access_data_source(
     db: AsyncSession, user_id: str, org_id: str, ds, ds_id: str = None,
 ) -> bool:
     """Check if a user can access a single data source (public bypass + grants/memberships)."""
+    from app.services.connected_application_service import agent_ceiling
+    ceiling = await agent_ceiling(db, org_id)
+    target = str(ds_id) if ds_id is not None else (str(ds.id) if ds is not None else None)
+    if ceiling is not None and target not in ceiling:
+        return False
     if ds is not None and getattr(ds, 'is_public', False):
         return True
     is_admin, accessible = await get_accessible_data_source_ids(db, user_id, org_id)

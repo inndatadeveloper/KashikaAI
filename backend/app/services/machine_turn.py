@@ -37,13 +37,46 @@ async def run_machine_turn(
     details: Optional[str] = None,
     meta: Optional[dict] = None,
     mode: Optional[str] = None,
-) -> None:
+    on_event=None,
+    parent_completion_id: Optional[str] = None,
+    original_request: Optional[str] = None,
+    platform=None,
+    platform_context=None,
+):
     """Post a visible machine event on ``report`` and run the agent on
     ``instruction`` as a hidden trigger. Blocks until the agent turn ends;
-    the event entry's status mirrors the outcome."""
-    from app.schemas.completion_schema import PromptSchema
-    from app.schemas.completion_v2_schema import CompletionCreate
+    the event entry's status mirrors the outcome. Returns the event entry.
+
+    ``on_event(event)`` (optional) is called with the event entry as soon as
+    it is committed — before the agent runs — so a caller can link to it even
+    if the run raises."""
+    from app.schemas.completion_v2_schema import CompletionCreate, PromptSchema
     from app.services.completion_service import CompletionService
+
+    from app.services.response_language_context import machine_response_context
+    language_context = await machine_response_context(
+        session, str(report.id), parent_completion_id=parent_completion_id,
+        original_request=original_request,
+    )
+
+    # Resolve legacy origins before creating the visible reply so its first
+    # persisted/broadcast state already has the right direction.
+    service = CompletionService()
+    from app.ai.response_language import resolve_response_locale, SUPPORTED_LOCALES
+    if language_context.get("response_locale") not in SUPPORTED_LOCALES:
+        from app.dependencies import _locale_from_org
+        await session.refresh(organization, ["settings"])
+        fallback = _locale_from_org(organization) or "en"
+        async def infer(prompt):
+            from app.ai.agents.reporter.reporter import Reporter
+            model = await service.llm_service.get_default_model(session, organization, user, is_small=True)
+            if model is None:
+                return ""
+            return await Reporter(model).infer_response_language(prompt)
+        language_context["response_locale"] = await resolve_response_locale(
+            infer, "", fallback=fallback, trigger_source=trigger_source,
+            original_request=language_context.get("response_original_request"),
+        )
 
     last = (
         await session.execute(
@@ -60,6 +93,7 @@ async def run_machine_turn(
         # so the frontend can render a locale-aware label instead.
         prompt={
             "content": summary,
+            "response_locale": language_context["response_locale"],
             "summary": summary,
             **({"details": details} if details else {}),
             **({"meta": meta} if meta else {}),
@@ -80,13 +114,18 @@ async def run_machine_turn(
     session.add(event)
     await session.commit()
     await session.refresh(event)
+    if on_event is not None:
+        try:
+            on_event(event)
+        except Exception:
+            pass
 
     try:
-        await CompletionService().create_completion(
+        await service.create_completion(
             db=session,
             report_id=str(report.id),
             completion_data=CompletionCreate(
-                prompt=PromptSchema(content=instruction, mode=mode)
+                prompt=PromptSchema(content=instruction, mode=mode, platform=platform, platform_context=platform_context, **language_context)
             ),
             current_user=user,
             organization=organization,
@@ -95,6 +134,7 @@ async def run_machine_turn(
         )
         event.status = "success"
         await session.commit()
+        return event
     except Exception as e:
         logger.error(f"machine turn ({trigger_source}) on report {report.id} failed: {e}")
         try:

@@ -1,6 +1,6 @@
 <template>
   <div class="p-1">
-    <div v-if="loading" class="py-10 text-center text-gray-400 text-sm">Loading…</div>
+    <div v-if="loading" class="py-10 text-center text-ink-muted text-sm">Loading…</div>
 
     <template v-else>
       <!-- File connections → scope view (one card per file connection) -->
@@ -15,13 +15,6 @@
 
       <!-- One selection and graph across table connections, including onboarding. -->
       <div v-if="tableConnections.length" class="mb-6">
-        <div class="flex flex-wrap gap-x-4 gap-y-2 mb-2 px-1">
-          <div v-for="conn in tableConnections" :key="conn.id" class="flex items-center gap-2">
-            <DataSourceIcon :type="conn.type" class="w-4 h-4" />
-            <span class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ conn.name }}</span>
-            <span class="text-[10px] uppercase tracking-wide text-gray-400 dark:text-gray-500">{{ conn.type }}</span>
-          </div>
-        </div>
         <TablesSelector
           ref="tablesRef"
           :ds-id="dsId"
@@ -32,7 +25,7 @@
           :show-save="false"
           :show-header="false"
           :show-stats="true"
-          :item-noun="nounFor(tableConnections.length === 1 ? shapeOf(tableConnections[0]) : 'tables')" />
+          :item-noun="tableNoun" />
       </div>
 
       <!-- Tool / MCP connections → the tools picker (per-connection internally) -->
@@ -64,10 +57,10 @@
 </template>
 
 <script setup lang="ts">
-import DataSourceIcon from '@/components/DataSourceIcon.vue'
 import TablesSelector from '@/components/datasources/TablesSelector.vue'
 import ToolsSelector from '@/components/datasources/ToolsSelector.vue'
 import FileSourceScope from '@/components/datasources/FileSourceScope.vue'
+import { nounFor } from '@/composables/useCatalogCount'
 
 const props = withDefaults(defineProps<{
   dsId: string
@@ -86,7 +79,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits(['saved', 'add-mcp', 'add-custom-api', 'edit-connection', 'delete-connection'])
 
 const shapeOf = (c: any) => props.registryByType[c.type]?.data_shape
-  || (c.type === 'mcp' || c.type === 'custom_api' ? 'tools' : 'tables')
+  || (['mcp', 'custom_api', 'remote_ssh', 'remote_smb'].includes(c.type) ? 'tools' : 'tables')
 
 const fileConnections = computed(() => (props.connections || []).filter((c) => shapeOf(c) === 'files'))
 const toolConnections = computed(() => (props.connections || []).filter((c) => shapeOf(c) === 'tools'))
@@ -94,10 +87,12 @@ const tableConnections = computed(() => (props.connections || []).filter((c) => 
   const s = shapeOf(c); return s !== 'files' && s !== 'tools'
 }))
 
-function nounFor(shape: string | undefined) {
-  if (shape === 'objects') return { sing: 'collection', plural: 'collections' }
-  return { sing: 'table', plural: 'tables' }
-}
+// One table-shaped connection keeps its own noun (Neo4j: node and
+// relationship types; MongoDB: collections); several fall back to tables.
+const tableNoun = computed(() => {
+  const only = tableConnections.value.length === 1 ? tableConnections.value[0] : null
+  return nounFor(only ? shapeOf(only) : 'tables', only ? props.registryByType[only.type]?.catalog_nouns : null)
+})
 
 const tablesRef = ref<InstanceType<typeof TablesSelector> | null>(null)
 

@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from datetime import datetime
 from typing import Optional
 
 from fastapi import HTTPException
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.data_sources.clients.progress import IndexingCancelled
@@ -83,6 +84,31 @@ def _start_background_loop() -> asyncio.AbstractEventLoop:
     return loop
 
 
+#: How many indexing runs may crawl a source at once.
+#: Creating connections in bulk (an import, a scripted rollout) dispatched one
+#: job per connection with nothing holding them back, so 100 new SharePoint
+#: connections opened 100 simultaneous Graph crawls — enough to saturate the
+#: loop and the outbound pool, and to slow down unrelated requests (including
+#: an in-flight login) for minutes. Jobs still start immediately; they just
+#: queue on this gate instead of all crawling at once.
+#: Override with BOW_INDEXING_CONCURRENCY.
+_INDEXING_CONCURRENCY = max(1, int(os.environ.get("BOW_INDEXING_CONCURRENCY", "4")))
+_indexing_gate: "asyncio.Semaphore | None" = None
+_indexing_gate_lock = threading.Lock()
+
+
+def _get_indexing_gate() -> asyncio.Semaphore:
+    """The concurrency gate, created on first use.
+
+    Only ever awaited from the background loop, so a single instance is safe.
+    """
+    global _indexing_gate
+    with _indexing_gate_lock:
+        if _indexing_gate is None:
+            _indexing_gate = asyncio.Semaphore(_INDEXING_CONCURRENCY)
+        return _indexing_gate
+
+
 def _get_background_loop() -> asyncio.AbstractEventLoop:
     global _background_loop
     with _background_loop_lock:
@@ -96,22 +122,29 @@ def shutdown_background_loop(timeout: float = 5.0) -> None:
     a leaked indexing job from holding a Postgres `idle in transaction` lock
     across test boundaries (which blocks the per-test schema reset).
     """
-    global _background_loop
+    global _background_loop, _indexing_gate
     with _background_loop_lock:
         loop = _background_loop
+        # The gate belongs to the loop it was created on; drop it alongside so
+        # the next loop builds a fresh one.
+        with _indexing_gate_lock:
+            _indexing_gate = None
         if loop is None or loop.is_closed():
             _background_loop = None
             return
 
     async def _cancel_all() -> None:
-        tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        # `all_tasks` includes this coroutine's own task. Cancelling it and then
+        # awaiting `shield(self)` can never complete, so every shutdown that
+        # reached it burned the full `timeout` — ~5s of teardown per e2e test
+        # that kicked off an indexing run. Exclude ourselves and wait for the
+        # rest concurrently (one deadline for all, not one per task).
+        me = asyncio.current_task()
+        tasks = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not me]
         for t in tasks:
             t.cancel()
-        for t in tasks:
-            try:
-                await asyncio.wait_for(asyncio.shield(t), timeout=timeout)
-            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                pass
+        if tasks:
+            await asyncio.wait(tasks, timeout=timeout)
 
     try:
         fut = asyncio.run_coroutine_threadsafe(_cancel_all(), loop)
@@ -130,6 +163,124 @@ _PROGRESS_FLUSH_SECONDS = 0.25
 
 # Per-run event log cap. Keep enough to be useful, drop oldest beyond.
 _EVENT_LOG_MAX = 200
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Liveness. A run lives only in the process that started it, so a restart,
+# deploy or OOM kill mid-run left its row `running` forever: every reindex
+# returned that dead row as "in flight", the scheduled sweeper was blocked, and
+# the UI showed a job that would never finish. The runner now touches
+# `updated_at` every `_HEARTBEAT_SECONDS` (while queued on the gate, too); a
+# non-terminal row silent for `_STALE_AFTER_SECONDS` has no runner anywhere and
+# is failed the next time anyone reads it. Staleness is judged by the heartbeat
+# rather than "everything active at boot", so one pod restarting never fails a
+# run that is alive on another pod.
+_HEARTBEAT_SECONDS = 30.0
+_STALE_AFTER_SECONDS = _env_seconds("BOW_INDEXING_STALE_AFTER_S", 600)
+
+# Stage timeouts. Discovery runs blocking client calls in a worker thread with
+# no timeout of their own, so one hung catalog query held its gate slot — and,
+# with `_INDEXING_CONCURRENCY` of them, every other connection's indexing —
+# indefinitely.
+#
+# Discovery is stopped when the source reports NO PROGRESS for
+# `_IDLE_TIMEOUT_SECONDS`, not when it has merely run long: a fixed total
+# ceiling is simultaneously too long for a 2-minute SQL crawl that hung (the
+# user waits the whole ceiling) and too short for a healthy multi-hour Power BI
+# or SharePoint tenant walk (killed mid-way, and again on every retry). The
+# total ceiling stays only as a last-resort bound.
+#
+# Warm keeps a total ceiling only — a single large QVD→Parquet convert can be
+# legitimately quiet for a long time — and a warm timeout is non-fatal (the
+# catalog is already indexed; the scheduled warmup retries).
+_IDLE_TIMEOUT_SECONDS = _env_seconds("BOW_INDEXING_IDLE_TIMEOUT_S", 900)
+_DISCOVERY_TIMEOUT_SECONDS = _env_seconds("BOW_INDEXING_TIMEOUT_S", 14400)
+_WARM_TIMEOUT_SECONDS = _env_seconds("BOW_INDEXING_WARM_TIMEOUT_S", 7200)
+
+
+def _rss_mb() -> Optional[int]:
+    """Resident memory of this process in MB, or None where /proc is missing.
+
+    Recorded on the run's event log so a worker killed for memory mid-run
+    leaves its last reading behind, visible without cluster access.
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _rss_note() -> str:
+    rss = _rss_mb()
+    return f"rss {rss:,} MB" if rss is not None else "rss unknown"
+
+
+class IndexingStageTimeout(Exception):
+    """A stage of an indexing run ran out of time — in total, or (``idle``)
+    without reporting any progress."""
+
+    def __init__(self, stage: str, seconds: float, *, idle: bool = False,
+                 last_phase: str | None = None):
+        self.stage = stage
+        self.seconds = seconds
+        self.idle = idle
+        minutes = max(1, round(seconds / 60))
+        if idle:
+            where = f" (last stage: {last_phase})" if last_phase else ""
+            message = f"{stage} made no progress for {minutes} minute(s){where} and was stopped"
+        else:
+            message = f"{stage} did not finish within {minutes} minute(s) and was stopped"
+        super().__init__(message)
+
+
+async def _with_stage_timeout(
+    coro,
+    seconds: float,
+    stage: str,
+    *,
+    idle_seconds: float | None = None,
+    last_activity=None,
+    last_phase=None,
+):
+    """Await `coro`, stopping it after `seconds` in total or — when
+    `idle_seconds` is given — once `last_activity()` (a `time.perf_counter()`
+    reading) is older than `idle_seconds`.
+
+    Only these deadlines become `IndexingStageTimeout`; a TimeoutError raised by
+    the work itself (a driver's own socket timeout) propagates unchanged.
+    """
+    task = asyncio.ensure_future(coro)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    poll = min(1.0, idle_seconds / 4) if idle_seconds else None
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise IndexingStageTimeout(stage, seconds)
+            done, _ = await asyncio.wait(
+                {task}, timeout=min(remaining, poll) if poll else remaining
+            )
+            if done:
+                return task.result()
+            if idle_seconds and time.perf_counter() - last_activity() >= idle_seconds:
+                raise IndexingStageTimeout(
+                    stage, idle_seconds, idle=True,
+                    last_phase=last_phase() if last_phase else None,
+                )
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.wait({task})
 
 
 def _human_bytes(n: int) -> str:
@@ -174,8 +325,11 @@ class ConnectionIndexingService:
             )
             .order_by(desc(ConnectionIndexing.created_at))
             .limit(1)
+            .execution_options(populate_existing=True)
         )
-        return result.scalar_one_or_none()
+        row = result.scalar_one_or_none()
+        await self._reap_if_stale(db, row)
+        return row
 
     async def get_active(
         self,
@@ -196,8 +350,66 @@ class ConnectionIndexingService:
             )
             .order_by(desc(ConnectionIndexing.created_at))
             .limit(1)
+            # Re-read the heartbeat: callers poll this on one session
+            # (`wait_for_active`), and an identity-map copy of `updated_at`
+            # would make a live run look stale.
+            .execution_options(populate_existing=True)
         )
-        return result.scalar_one_or_none()
+        row = result.scalar_one_or_none()
+        if await self._reap_if_stale(db, row):
+            return None
+        return row
+
+    async def _reap_if_stale(
+        self, db: AsyncSession, row: Optional[ConnectionIndexing]
+    ) -> bool:
+        """Fail a non-terminal row whose runner stopped heartbeating.
+
+        Returns True when the row was reaped. See `_STALE_AFTER_SECONDS`.
+        """
+        if row is None or row.is_terminal():
+            return False
+        last_seen = row.updated_at or row.created_at
+        if last_seen is None:
+            return False
+        silent_s = (datetime.utcnow() - last_seen).total_seconds()
+        if silent_s < _STALE_AFTER_SECONDS:
+            return False
+        row.status = ConnectionIndexingStatus.FAILED.value
+        row.finished_at = datetime.utcnow()
+        # `updated_at` is touched by every write the runner makes (heartbeat,
+        # progress, events), so this is silence from the whole runner, not
+        # missing progress.
+        row.error = (
+            f"Indexing stopped reporting for {round(silent_s / 60)} minute(s) — "
+            "the server running it most likely restarted or ran out of memory. "
+            "Reindex to start it again."
+        )
+        await db.commit()
+        # Should a slow-but-alive runner exist in this process after all, stop
+        # it at its next checkpoint rather than let it race a fresh run.
+        #
+        # This leaves a known defect in place: such a runner stops `cancelled`
+        # after committing the catalog but before syncing agents (P2.2 in
+        # docs/mssql-indexing-stale-reap-analysis.md). Removing the signal
+        # fixes that, but a reaped-yet-live runner then continues through warm
+        # and agent sync while `get_active` reports nothing active, so a
+        # replacement run admitted by `start()` can overlap it inside one
+        # worker and commit a stale catalog over the newer one. Deferred until
+        # a two-run test establishes what that overlap actually does.
+        with _cancel_lock:
+            ev = _cancel_events.get(str(row.id))
+        if ev is not None:
+            ev.set()
+        logger.warning(
+            "indexing.reaped_stale",
+            extra={
+                "connection_id": str(row.connection_id),
+                "indexing_id": str(row.id),
+                "silent_s": round(silent_s),
+            },
+        )
+        return True
 
     async def request_cancel(
         self,
@@ -263,6 +475,7 @@ class ConnectionIndexingService:
         *,
         user_id: Optional[str] = None,
         kick_off: bool = True,
+        force_refresh: bool = False,
     ) -> ConnectionIndexing:
         """Create a pending indexing row and (unless already in-flight) kick off
         the background runner. Idempotent — returns the active row if one
@@ -271,7 +484,9 @@ class ConnectionIndexingService:
         `user_id` selects the scope: omit it for the org-shared catalog run, pass
         a user for a per-user catalog sync (OneDrive / personal Drive after that
         user signs in). The two scopes are independent, so a user signing in
-        never blocks — or is blocked by — the shared run.
+        never blocks — or is blocked by — the shared run. `force_refresh` is
+        set for an explicit personal refresh; routine OAuth sign-in can reuse
+        known model definitions. The option is persisted for the worker.
         """
         existing = await self.get_active(db, str(connection.id), user_id=user_id)
         if existing is not None:
@@ -284,6 +499,7 @@ class ConnectionIndexingService:
             phase=None,
             progress_done=0,
             progress_total=0,
+            stats_json={"force_schema_refresh": True} if force_refresh else None,
         )
         db.add(row)
         await db.commit()
@@ -296,6 +512,71 @@ class ConnectionIndexingService:
         return row
 
     async def _run(self, indexing_id: str) -> None:
+        """Gate wrapper around `_run_inner`.
+
+        Runs queue on `_get_indexing_gate()` so a bulk dispatch (N connections
+        created at once) crawls a few sources at a time instead of all N. The
+        row stays PENDING while queued, which is what the UI already renders.
+        """
+        heartbeat = asyncio.create_task(self._heartbeat(indexing_id))
+        try:
+            async with _get_indexing_gate():
+                await self._run_inner(indexing_id)
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+
+    async def _heartbeat(self, indexing_id: str) -> None:
+        """Touch the row's `updated_at` while the run is queued or running, so
+        `_reap_if_stale` can tell a live run from one whose process died. Runs
+        on the loop, not the worker thread, so a blocking client call cannot
+        starve it. Stops on its own once the row turns terminal."""
+        from app.settings.database import create_async_database_engine_for_indexing
+
+        engine = create_async_database_engine_for_indexing()
+        failing = False
+        try:
+            while True:
+                await asyncio.sleep(_HEARTBEAT_SECONDS)
+                try:
+                    async with AsyncSession(engine) as hb_db:
+                        result = await hb_db.execute(
+                            update(ConnectionIndexing)
+                            .where(
+                                ConnectionIndexing.id == indexing_id,
+                                ConnectionIndexing.status.in_([
+                                    ConnectionIndexingStatus.PENDING.value,
+                                    ConnectionIndexingStatus.RUNNING.value,
+                                ]),
+                            )
+                            .values(updated_at=datetime.utcnow())
+                        )
+                        await hb_db.commit()
+                    if result.rowcount == 0:
+                        return
+                    if failing:
+                        failing = False
+                        logger.warning("indexing.heartbeat_recovered", extra={"indexing_id": indexing_id})
+                except Exception:
+                    # A run whose heartbeat cannot be written is reaped after
+                    # the stale window, so the first failure of a streak must
+                    # be visible at default log levels.
+                    if failing:
+                        logger.debug("indexing.heartbeat_failed", exc_info=True)
+                    else:
+                        failing = True
+                        logger.warning(
+                            "indexing.heartbeat_failed",
+                            extra={"indexing_id": indexing_id},
+                            exc_info=True,
+                        )
+        finally:
+            await engine.dispose()
+
+    async def _run_inner(self, indexing_id: str) -> None:
         """Runner that opens a fresh session and executes `refresh_schema` (SQL connections)
         or `refresh_tools` (MCP/custom_api connections).
 
@@ -327,6 +608,12 @@ class ConnectionIndexingService:
         def _new_session():
             return session_factory()
 
+        # `events_json` is read, extended and written back by two writers on
+        # separate sessions: `_append_event` and the progress `_flush`. Run
+        # concurrently, the later commit drops the other's entries, so both
+        # hold this lock around their read-modify-write.
+        events_lock = asyncio.Lock()
+
         async def _append_event(level: str, phase: str | None, message: str,
                                 done: int = 0, total: int = 0) -> None:
             """Append a single entry to the indexing row's events_json.
@@ -335,7 +622,7 @@ class ConnectionIndexingService:
             are capped at `_EVENT_LOG_MAX` (oldest dropped).
             """
             try:
-                async with _new_session() as ev_db:
+                async with events_lock, _new_session() as ev_db:
                     fresh = await ev_db.get(ConnectionIndexing, indexing_id)
                     if fresh is None:
                         return
@@ -361,14 +648,27 @@ class ConnectionIndexingService:
                 if row is None:
                     logger.warning("indexing.run.missing", extra={"indexing_id": indexing_id})
                     return
+                if row.is_terminal():
+                    # Cancelled (or reaped) while queued on the gate — flipping
+                    # it back to running would start work nobody wants.
+                    return
                 row.status = ConnectionIndexingStatus.RUNNING.value
                 row.started_at = datetime.utcnow()
+                row.last_activity_at = row.started_at
                 await db.commit()
 
-                await _append_event("info", None, "Indexing started")
+                # pid + memory on the run's own log: if the worker dies, the
+                # next run's pid differs and the last reading shows how big it
+                # had grown — the evidence an admin can send without kubectl.
+                await _append_event(
+                    "info", None,
+                    f"Indexing started (worker pid {os.getpid()}, {_rss_note()})",
+                )
 
+                # Rollback expires ORM objects; error reporting must use a plain ID.
+                run_connection_id = str(row.connection_id)
                 conn_result = await db.execute(
-                    select(Connection).where(Connection.id == row.connection_id)
+                    select(Connection).where(Connection.id == run_connection_id)
                 )
                 connection = conn_result.scalar_one_or_none()
                 if connection is None:
@@ -384,36 +684,46 @@ class ConnectionIndexingService:
                 # consistent (phase, item, done, total) tuple even when the
                 # callback fires mid-flush.
                 last_flush_at = 0.0
-                pending_state: dict = {"phase": None, "item": None, "done": 0, "total": 0}
+                pending_state: dict = {
+                    "phase": None, "item": None, "done": 0, "total": 0,
+                    # Last progress report: wall clock for the UI, monotonic
+                    # for the inactivity timeout.
+                    "activity_at": datetime.utcnow(),
+                    "activity_mono": time.perf_counter(),
+                }
                 state_lock = threading.Lock()
-                last_phase: dict = {"name": None}
+                activity_events: list[tuple] = []
+                last_activity = {"phase": None, "bucket": -1, "time": 0.0}
                 flush_lock = asyncio.Lock()
+                flush_scheduled = False
+                last_scheduled_at = float("-inf")
 
                 def _state_snapshot() -> dict:
                     with state_lock:
                         return dict(pending_state)
 
-                async def _maybe_log_phase_event(phase: str | None, total: int) -> None:
-                    if phase != last_phase["name"]:
-                        last_phase["name"] = phase
-                        if phase:
-                            label = (
-                                f"Phase: {phase} ({total} items)"
-                                if total > 0
-                                else f"Phase: {phase}"
-                            )
-                            await _append_event("info", phase, label, done=0, total=total)
+                def _last_activity() -> float:
+                    with state_lock:
+                        return pending_state["activity_mono"]
+
+                def _last_phase() -> str | None:
+                    with state_lock:
+                        return pending_state["phase"]
 
                 async def _flush(force: bool = False) -> None:
                     nonlocal last_flush_at
-                    now = time.perf_counter()
-                    if not force and (now - last_flush_at) < _PROGRESS_FLUSH_SECONDS:
-                        return
-                    # Take a single consistent snapshot of progress state.
-                    snap = _state_snapshot()
                     async with flush_lock:
+                        now = time.perf_counter()
+                        if not force and (now - last_flush_at) < _PROGRESS_FLUSH_SECONDS:
+                            return
+                        # Snapshot after acquiring the write lock: queued flushes
+                        # must never write an older snapshot over newer progress.
+                        with state_lock:
+                            snap = dict(pending_state)
+                            events = list(activity_events)
+                            activity_events.clear()
                         try:
-                            async with _new_session() as flush_db:
+                            async with events_lock, _new_session() as flush_db:
                                 fresh = await flush_db.get(ConnectionIndexing, indexing_id)
                                 if fresh is None:
                                     return
@@ -421,16 +731,38 @@ class ConnectionIndexingService:
                                 fresh.current_item = snap["item"]
                                 fresh.progress_done = snap["done"]
                                 fresh.progress_total = snap["total"]
+                                fresh.last_activity_at = snap["activity_at"]
+                                history = list(fresh.events_json or [])
+                                for ts, phase, item, done, total, transition in events:
+                                    message = f"Phase: {phase}" if transition else str(item or phase)
+                                    if total > 0:
+                                        message += f" ({done}/{total})"
+                                    history.append({"ts": ts, "level": "info", "phase": phase,
+                                                    "message": message, "done": done, "total": total})
+                                fresh.events_json = history[-_EVENT_LOG_MAX:]
                                 await flush_db.commit()
                         except Exception:
-                            # Never let a failed flush kill the indexing run.
+                            with state_lock:
+                                activity_events[:0] = events
+                                del activity_events[:-_EVENT_LOG_MAX]
                             logger.debug("indexing.flush_failed", exc_info=True)
                         last_flush_at = now
-                    # Phase-transition events live on the same flush schedule —
-                    # one row write only, no extra DB traffic per item.
-                    await _maybe_log_phase_event(snap["phase"], snap["total"])
+
+                async def _scheduled_flush(delay: float):
+                    nonlocal flush_scheduled
+                    try:
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                    finally:
+                        # Re-arm BEFORE snapshotting: a report landing while this
+                        # write is in progress must schedule its own flush, not
+                        # be absorbed by one that already took its snapshot.
+                        with state_lock:
+                            flush_scheduled = False
+                    await _flush(force=True)
 
                 def progress_cb(phase, current_item, done, total):
+                    nonlocal flush_scheduled, last_scheduled_at
                     # Called from inside `asyncio.to_thread(...)` — a worker
                     # thread (schema discovery or warm/convert). Raising here
                     # aborts that loop promptly on cancel.
@@ -439,16 +771,57 @@ class ConnectionIndexingService:
                     # Update state under a lock so the runner loop never reads a
                     # torn (phase, item, done, total).
                     with state_lock:
+                        # None counts (stage markers) keep the current ones, so
+                        # a finished run still reports what discovery found.
+                        if done is None:
+                            done = pending_state["done"]
+                        if total is None:
+                            total = pending_state["total"]
                         pending_state["phase"] = phase
                         pending_state["item"] = current_item
                         pending_state["done"] = done
                         pending_state["total"] = total
+                        now = time.perf_counter()
+                        pending_state["activity_at"] = datetime.utcnow()
+                        pending_state["activity_mono"] = now
+                        transition = phase != last_activity["phase"]
+                        bucket = int(10 * done / total) if total > 0 else -1
+                        if phase and (transition or bucket > last_activity["bucket"] or
+                                      (current_item and now - last_activity["time"] >= 5)):
+                            activity_events.append((datetime.utcnow().isoformat() + "Z", phase,
+                                                    current_item, done, total, transition))
+                            del activity_events[:-_EVENT_LOG_MAX]
+                            last_activity.update(phase=phase, bucket=bucket, time=now)
+
+                        # Bound scheduled work as well as DB writes. A 35k-table
+                        # crawl must not enqueue a coroutine for every column:
+                        # at most one flush is pending at a time. It is a
+                        # TRAILING flush (delayed, snapshotting when it runs), so
+                        # the last report before a hang still reaches the row —
+                        # dropping it would show the stage before the stuck one.
+                        if flush_scheduled:
+                            return
+                        flush_scheduled = True
+                        delay = max(0.0, _PROGRESS_FLUSH_SECONDS - (now - last_scheduled_at))
+                        last_scheduled_at = now + delay
+
                     if runner_loop.is_closed():
+                        with state_lock:
+                            flush_scheduled = False
                         return
+                    task = _scheduled_flush(delay)
                     try:
-                        asyncio.run_coroutine_threadsafe(_flush(), runner_loop)
+                        asyncio.run_coroutine_threadsafe(task, runner_loop)
                     except RuntimeError:
-                        pass
+                        task.close()
+                        with state_lock:
+                            flush_scheduled = False
+
+                def _stage(phase: str) -> None:
+                    """Record entry into a stage that reports no progress of its
+                    own (connecting, saving, syncing), so a run stuck there
+                    shows WHERE — instead of the last stage that did report."""
+                    progress_cb(phase, None, None, None)
 
                 svc = ConnectionService()
                 from app.schemas.data_source_registry import (
@@ -464,7 +837,8 @@ class ConnectionIndexingService:
                 data_shape = data_shape_for(connection.type)
                 noun_sing, noun_plural = catalog_nouns_for(connection.type)
                 _entry = REGISTRY.get(connection.type)
-                catalog_ownership = _entry.catalog_ownership if _entry else "shared"
+                from app.schemas.data_source_registry import connection_catalog_ownership
+                catalog_ownership = connection_catalog_ownership(connection) if _entry else "shared"
 
                 # ── Per-user catalog scope ──────────────────────────────────
                 # A row carrying a user_id syncs THAT user's catalog with THAT
@@ -484,20 +858,47 @@ class ConnectionIndexingService:
                     index_user = await db.get(User, str(row.user_id))
 
                 if row.user_id and not is_tool_provider:
-                    await self._run_user_catalog_sync(
-                        db=db,
-                        new_session=_new_session,
-                        indexing_id=indexing_id,
-                        connection_id=str(row.connection_id),
-                        user_id=str(row.user_id),
-                        progress_cb=progress_cb,
-                        flush=_flush,
-                        append_event=_append_event,
-                        state_snapshot=_state_snapshot,
-                        started=start,
-                        data_shape=data_shape,
-                        nouns=(noun_sing, noun_plural),
-                    )
+                    try:
+                        _stage("connecting")
+                        await _with_stage_timeout(
+                            self._run_user_catalog_sync(
+                                db=db,
+                                new_session=_new_session,
+                                indexing_id=indexing_id,
+                                connection_id=run_connection_id,
+                                user_id=str(row.user_id),
+                                progress_cb=progress_cb,
+                                flush=_flush,
+                                append_event=_append_event,
+                                state_snapshot=_state_snapshot,
+                                started=start,
+                                data_shape=data_shape,
+                                nouns=(noun_sing, noun_plural),
+                                force_refresh=bool((row.stats_json or {}).get("force_schema_refresh")),
+                            ),
+                            _DISCOVERY_TIMEOUT_SECONDS,
+                            "Catalog sync",
+                            idle_seconds=_IDLE_TIMEOUT_SECONDS,
+                            last_activity=_last_activity,
+                            last_phase=_last_phase,
+                        )
+                    except IndexingCancelled:
+                        await self._finalize_cancelled(_new_session, indexing_id, _append_event, _state_snapshot)
+                    except IndexingStageTimeout as exc:
+                        cancel_event.set()
+                        logger.warning(
+                            "indexing.user_catalog.timeout",
+                            extra={"indexing_id": indexing_id, "timeout_s": exc.seconds, "idle": exc.idle},
+                        )
+                        await _flush(force=True)
+                        async with _new_session() as err_db:
+                            fresh = await err_db.get(ConnectionIndexing, indexing_id)
+                            if fresh is not None and not fresh.is_terminal():
+                                fresh.status = ConnectionIndexingStatus.FAILED.value
+                                fresh.error = str(exc)
+                                fresh.finished_at = datetime.utcnow()
+                                await err_db.commit()
+                        await _append_event("error", _state_snapshot()["phase"], f"Catalog sync failed: {exc}")
                     return
 
                 # Per-user-owned catalogs (OneDrive, personal Drive, mail) have
@@ -560,24 +961,59 @@ class ConnectionIndexingService:
                     return
 
                 try:
+                    _stage("connecting")
                     if is_tool_provider:
-                        items = await svc.refresh_tools(
+                        discovery = svc.refresh_tools(
                             db=db,
                             connection=connection,
                             current_user=index_user,
                         )
                     else:
-                        items = await svc.refresh_schema(
+                        async def _diagnostics(stage: str, info: dict) -> None:
+                            if stage == "discovered":
+                                message = (
+                                    f"Discovered {info['tables']:,} {noun_plural} / "
+                                    f"{info['columns']:,} columns, {_rss_note()}"
+                                )
+                            else:
+                                message = f"Saving catalog of {info['tables']:,} {noun_plural}, {_rss_note()}"
+                            # Write the progress queued so far first, so the
+                            # log keeps the order things happened in.
+                            await _flush(force=True)
+                            await _append_event("info", stage, message)
+
+                        discovery = svc.refresh_schema(
                             db=db,
                             connection=connection,
                             current_user=None,
                             progress_callback=progress_cb,
+                            # The runner never reuses the fetched list; keeping
+                            # it alive until finalize only raises peak memory.
+                            keep_fresh_tables=False,
+                            diagnostics_hook=_diagnostics,
                         )
+                    items = await _with_stage_timeout(
+                        discovery, _DISCOVERY_TIMEOUT_SECONDS, "Schema discovery",
+                        idle_seconds=_IDLE_TIMEOUT_SECONDS,
+                        last_activity=_last_activity,
+                        last_phase=_last_phase,
+                    )
                 except IndexingCancelled:
+                    await _flush(force=True)
                     await self._finalize_cancelled(_new_session, indexing_id, _append_event, _state_snapshot)
                     return
                 except Exception as exc:  # pragma: no cover — surface via row
-                    logger.exception("indexing.run.failed", extra={"indexing_id": indexing_id})
+                    if isinstance(exc, IndexingStageTimeout):
+                        # The worker thread cannot be killed; this makes its
+                        # next progress checkpoint raise so it stops working.
+                        cancel_event.set()
+                        logger.warning(
+                            "indexing.run.timeout",
+                            extra={"indexing_id": indexing_id, "timeout_s": exc.seconds, "idle": exc.idle},
+                        )
+                    else:
+                        logger.exception("indexing.run.failed", extra={"indexing_id": indexing_id})
+                    await _flush(force=True)
                     # Use a fresh session — the service may have rolled back.
                     async with _new_session() as err_db:
                         fresh = await err_db.get(ConnectionIndexing, indexing_id)
@@ -585,16 +1021,15 @@ class ConnectionIndexingService:
                             fresh.status = ConnectionIndexingStatus.FAILED.value
                             fresh.error = str(exc)[:4000]
                             fresh.finished_at = datetime.utcnow()
-                            await err_db.commit()
                         # Record the failure on the connection for the scheduled
                         # auto-reindex sweeper's diagnostics. next_retry_at was
                         # already stamped by the sweeper before kicking, so the
                         # connection won't be re-kicked until its interval elapses
                         # (user_required catalogs heal on user login meanwhile).
-                        conn_row = await err_db.get(Connection, row.connection_id)
+                        conn_row = await err_db.get(Connection, run_connection_id)
                         if conn_row is not None:
                             conn_row.last_reindex_error = str(exc)[:4000]
-                            await err_db.commit()
+                        await err_db.commit()
                     await _append_event("error", _state_snapshot()["phase"], f"Indexing failed: {exc}")
                     return
 
@@ -610,11 +1045,17 @@ class ConnectionIndexingService:
                 # warmup retries the convert.
                 extra_stats: dict = {}
                 if not is_tool_provider:
+                    warm_timed_out = threading.Event()
                     try:
+                        _stage("warming")
                         client = await svc.construct_client(db, connection)
-                        await client.awarm_all(
-                            progress_callback=progress_cb,
-                            cancel_check=cancel_event.is_set,
+                        await _with_stage_timeout(
+                            client.awarm_all(
+                                progress_callback=progress_cb,
+                                cancel_check=lambda: cancel_event.is_set() or warm_timed_out.is_set(),
+                            ),
+                            _WARM_TIMEOUT_SECONDS,
+                            "Cache warm",
                         )
                         extra_stats = client.index_stats() or {}
                         await _flush(force=True)
@@ -629,6 +1070,18 @@ class ConnectionIndexingService:
                         # resolution returns 403. The first user-initiated query warms
                         # the cache instead. Log cleanly without a scary traceback.
                         logger.debug("indexing.warm.skipped status=%s detail=%s", exc.status_code, exc.detail)
+                    except IndexingStageTimeout as warm_exc:
+                        # Non-fatal like any warm failure; stop the convert at
+                        # its next cancel check without cancelling the run.
+                        warm_timed_out.set()
+                        logger.warning(
+                            "indexing.warm.timeout",
+                            extra={"indexing_id": indexing_id, "timeout_s": warm_exc.seconds},
+                        )
+                        await _append_event(
+                            "warn", _state_snapshot()["phase"],
+                            f"{warm_exc} (catalog still indexed)",
+                        )
                     except Exception as warm_exc:
                         logger.warning("indexing.warm.failed", exc_info=True)
                         await _append_event(
@@ -643,17 +1096,23 @@ class ConnectionIndexingService:
                     )
                     return
 
-                synced_domains = 0
-                if not is_tool_provider:
-                    # Fan schema out to every DataSource linked to this connection so
-                    # the domain-level view (DataSourceTable) reflects the new schema.
-                    synced_domains = await self._sync_linked_data_sources(
-                        db, connection_id=row.connection_id,
-                        session_factory=session_factory,
-                    )
+                # Catalog and all agent selections were published together by
+                # refresh_schema. Never fan out again in separate transactions.
+                synced_domains = getattr(svc, "last_synced_domains", 0)
 
-                fresh = await db.get(ConnectionIndexing, indexing_id)
+                # Re-read: the identity map still holds the row as this runner
+                # last wrote it. Another process may have reaped it (`failed`)
+                # or a user cancelled it from another worker since; without the
+                # re-read a reaped run ended `completed` with the reaper's
+                # error kept (unchanged vs. the cached `None`, so never
+                # written), and a cancel was overwritten.
+                fresh = await db.get(ConnectionIndexing, indexing_id, populate_existing=True)
                 if fresh is None:
+                    return
+                if fresh.status == ConnectionIndexingStatus.CANCELLED.value:
+                    await self._finalize_cancelled(
+                        _new_session, indexing_id, _append_event, _state_snapshot
+                    )
                     return
                 fresh.status = ConnectionIndexingStatus.COMPLETED.value
                 fresh.finished_at = datetime.utcnow()
@@ -775,14 +1234,13 @@ class ConnectionIndexingService:
         started: float,
         data_shape: str,
         nouns: tuple,
+        force_refresh: bool = False,
     ) -> None:
         """Build ONE user's catalog for this connection, in the background.
 
-        Runs the per-user overlay sync (`get_user_data_source_schema`) for every
-        data source linked to the connection, using that user's credentials. Each
-        data source gets its own session so one failure can't poison the others,
-        and progress flows through the same callback the shared run uses — so a
-        signing-in user sees "listing folders 34/120" instead of a blank wait.
+        Discovers once with the user's credentials and publishes overlays for
+        every linked agent in one transaction. Progress is written independently
+        from the catalog so failures retain both the prior catalog and diagnostics.
 
         Never raises: the outcome lands on the indexing row.
         """
@@ -814,30 +1272,20 @@ class ConnectionIndexingService:
 
         ds_service = DataSourceService()
         item_count = 0
+        unreadable = []
         synced = 0
         try:
-            for ds_id in ds_ids:
-                async with new_session() as per_db:
-                    ds = (await per_db.execute(
-                        select(DataSource).where(
-                            DataSource.id == ds_id,
-                            DataSource.deleted_at.is_(None),
-                        )
-                    )).scalar_one_or_none()
-                    if ds is None:
-                        continue
-                    user = await per_db.get(User, user_id)
-                    if user is None:
-                        break
-                    tables = await ds_service.get_user_data_source_schema(
-                        db=per_db,
-                        data_source=ds,
-                        user=user,
-                        progress_callback=progress_cb,
-                    )
-                    await per_db.commit()
-                    item_count += len(tables or [])
-                    synced += 1
+            async with new_session() as per_db:
+                conn = await per_db.get(Connection, connection_id)
+                user = await per_db.get(User, user_id)
+                if conn is None or user is None:
+                    raise ValueError("Connection or user no longer exists")
+                tables, synced = await ds_service.refresh_user_connection_catalog(
+                    per_db, conn, user, progress_callback=progress_cb,
+                    force_refresh=force_refresh,
+                )
+                unreadable = ds_service.last_discovery_diagnostics
+                item_count = len(tables)
         except IndexingCancelled:
             await self._finalize_cancelled(new_session, indexing_id, append_event, state_snapshot)
             return
@@ -876,10 +1324,20 @@ class ConnectionIndexingService:
                 "item_noun_plural": noun_plural,
                 "elapsed_s": elapsed_s,
             }
+            if unreadable:
+                fresh.stats_json["unreadable_datasets"] = unreadable
+                fresh.stats_json["unreadable_dataset_count"] = len(unreadable)
             if fresh.progress_total and fresh.progress_done < fresh.progress_total:
                 fresh.progress_done = fresh.progress_total
             await fin_db.commit()
 
+        if unreadable:
+            for diagnostic in unreadable:
+                await append_event(
+                    "warn", state_snapshot()["phase"],
+                    f"{diagnostic.get('datasetName') or diagnostic.get('datasetId')}: "
+                    f"{diagnostic.get('reason', 'No tables discovered')}",
+                )
         item_label = noun_sing if item_count == 1 else noun_plural
         await append_event(
             "info", state_snapshot()["phase"],
@@ -926,94 +1384,3 @@ class ConnectionIndexingService:
         except Exception:
             pass
         logger.info("indexing.cancelled", extra={"indexing_id": indexing_id})
-
-    async def _sync_linked_data_sources(
-        self,
-        db: AsyncSession,
-        *,
-        connection_id: str,
-        session_factory,
-    ) -> int:
-        """After a successful refresh_schema, mirror the new ConnectionTable set
-        onto every DataSource that links this connection.
-
-        Each per-DS sync runs in its own session/transaction so that:
-          - a data source deleted mid-flight (concurrent test or user delete)
-            doesn't FK-violate the whole runner — we re-check existence per DS
-            and skip if gone, and catch any leftover IntegrityError on commit;
-          - one corrupt DS doesn't abort the sync for its peers.
-
-        Returns the number of data sources synced successfully.
-        """
-        from sqlalchemy.exc import IntegrityError
-        from sqlalchemy.orm import selectinload
-
-        from app.models.data_source import DataSource
-        from app.services.data_source_service import DataSourceService
-
-        # Snapshot the connection's linked DS IDs from the runner's session,
-        # then close that scope — per-DS work happens in its own session.
-        result = await db.execute(
-            select(Connection)
-            .options(selectinload(Connection.data_sources))
-            .where(Connection.id == str(connection_id))
-        )
-        connection_snapshot = result.scalar_one_or_none()
-        if connection_snapshot is None or not connection_snapshot.data_sources:
-            return 0
-        ds_ids = [str(ds.id) for ds in connection_snapshot.data_sources]
-
-        ds_service = DataSourceService()
-        synced = 0
-        for ds_id in ds_ids:
-            try:
-                async with session_factory() as per_db:
-                    # Re-fetch the DS in the per-DS session. If it was deleted
-                    # (hard or soft) between snapshot and now, skip cleanly.
-                    ds_row = await per_db.execute(
-                        select(DataSource).where(
-                            DataSource.id == ds_id,
-                            DataSource.deleted_at.is_(None),
-                        )
-                    )
-                    ds = ds_row.scalar_one_or_none()
-                    if ds is None:
-                        continue
-                    # Same for the connection — guard against a delete here too.
-                    conn_row = await per_db.execute(
-                        select(Connection).where(
-                            Connection.id == str(connection_id),
-                            Connection.deleted_at.is_(None),
-                        )
-                    )
-                    connection = conn_row.scalar_one_or_none()
-                    if connection is None:
-                        continue
-                    try:
-                        await ds_service.sync_domain_tables_from_connection(
-                            per_db,
-                            ds,
-                            connection,
-                            max_auto_select=ds_service.ONBOARDING_MAX_TABLES,
-                        )
-                        await per_db.commit()
-                        synced += 1
-                    except IntegrityError:
-                        # Most likely cause: the DS was deleted between our
-                        # existence check and the INSERT (FK violation on
-                        # datasource_tables.datasource_id). Roll back this
-                        # DS and move on.
-                        await per_db.rollback()
-                        logger.info(
-                            "indexing.sync_domain_skipped_fk",
-                            extra={
-                                "connection_id": str(connection_id),
-                                "data_source_id": ds_id,
-                            },
-                        )
-            except Exception:
-                logger.exception(
-                    "indexing.sync_domain_failed",
-                    extra={"connection_id": str(connection_id), "data_source_id": ds_id},
-                )
-        return synced

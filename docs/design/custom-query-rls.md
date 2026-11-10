@@ -1,6 +1,6 @@
-# Row-level security on custom queries — design
+# Row-level security on custom tables — design
 
-Phase 2 of custom queries. A custom query is materialized once with a shared
+Phase 2 of custom tables. A custom table is materialized once with a shared
 credential, so every agent that activates it sees the same rows. RLS makes that
 copy safe to expose to people who should each see a slice of it, by filtering
 at read time against **who is asking**.
@@ -16,7 +16,7 @@ lapsed org isn't stuck behind its own filter.
 
 ## Why this is the unlock, not a nice-to-have
 
-Custom queries are gated on `auth_policy == 'system_only'` today. That excludes
+Custom tables are gated on `auth_policy == 'system_only'` today. That excludes
 exactly the governed, enterprise accounts most likely to have a source that
 can't take the load — the ones using per-user credentials precisely because row
 visibility differs per person. RLS moves enforcement from the source's
@@ -118,7 +118,7 @@ schedule UI rather than inferring.
 
 ## Authoring
 
-A fourth tab in the custom query modal, alongside Query / Cache / Danger.
+A fourth tab in the custom table modal, alongside Query / Cache / Danger.
 
 - **Attribute mode**: pick a column, pick an identity source (a
   `profile_attributes` key, a group, or a role), pick an operator. Attribute
@@ -170,6 +170,35 @@ compares BOW's answer against the source's own answer for a real user.
   artifacts are encrypted rather than Parquet.
 - **No per-user artifacts.** One copy per relation (or per role in phase 4).
   Per-user copies defeat the point of caching.
+
+## Identity parameters — the bind check is a guardrail, not isolation
+
+Saved queries can declare an identity parameter (`source: identity`, e.g.
+`identity_binding: viewer.email`) whose value is always derived from the
+viewer. After every run, `verify_identity_binds_in_queries`
+(`backend/app/ai/code_execution/query_params.py`) refuses the result unless
+**every** executed query restricts its rows by that value. The decision is
+structural where we can parse the query
+(`backend/app/ai/code_execution/identity_bind.py`):
+
+| Connector | How the bind is checked |
+|---|---|
+| SQL sources with a sqlglot dialect (Postgres, MySQL, SQLite, Snowflake, BigQuery, MSSQL, ...) and SQL-looking text from unknown clients (generic dialect) | Parsed. `col = value` / `value = col` / `col IN (identity values only)` / `col IN (scoped subquery)` AND-connected to the root of WHERE/HAVING, or the ON of an inner join; or a CTE / derived table the result is built from is itself scoped. UNION: every branch. OR, NOT, `<>`, LIKE, literal-vs-literal do not count. |
+| Salesforce SOQL | Same rule via the generic dialect; `Owner.Email = 'x'` is a qualified column. |
+| Splunk SPL | Base search (before the first `|`) or a later `| search`: `field=value` / `field="value"` implicitly AND-ed, not in an OR group, not under NOT. `| where` on the value falls back. |
+| Anything the above can't decide (parse error, SOQL date literals, SPL with subsearch/append/join/macros/generating commands, non-SQL API captures) | Falls back to the previous text heuristic, unchanged, and logs `identity_bind_check_fallback`. |
+
+What this does **not** do: it does not know which column *should* carry the
+identity, it does not verify that join keys tie a scoped relation to the
+others (`FROM orders, users u WHERE u.email = :me` passes), it does not scope
+lookups sub-selected *beside* a scoped source (a scalar subquery over another
+table in the SELECT list), and the
+fallback path can still be satisfied by a value placed after WHERE. It exists
+to catch a forgotten or mangled filter, not to contain a hostile query author.
+**Strict per-viewer isolation needs the source to enforce it**: database
+row-level security, or a connection with `auth_policy=user_required` so each
+viewer queries with their own credentials (Salesforce sharing rules, Splunk
+roles and index permissions, warehouse grants enforce natively).
 
 ## Open questions
 

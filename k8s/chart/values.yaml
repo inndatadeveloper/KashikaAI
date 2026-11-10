@@ -10,25 +10,123 @@ image:
 # -- Hostname for the Ingress rule (e.g. `app.example.com`).
 host: app.bagofwords.com
 
-# -- Bitnami PostgreSQL subchart values. All subchart keys are accepted here.
-# @default -- see subchart defaults
+# -- Bundled single-instance PostgreSQL, run from the official `postgres`
+# image. Intended for evaluation and small installs; for production point the
+# app at a managed or operator-run database (`postgresql.enabled: false` plus
+# `database.*`, or a Secret supplying `BOW_DATABASE_URL`). Not deployed when
+# `database.auth.provider` is not `password`.
+# @default -- see the `postgresql.*` rows
 postgresql:
+  # -- Deploy the bundled PostgreSQL StatefulSet.
+  enabled: true
+  # -- Confirm the one-time move of a chart 2.x database (Bitnami subchart)
+  # onto this chart's PostgreSQL. While a release still runs the Bitnami
+  # StatefulSet, `helm upgrade` fails until this is `true`, so an unpinned
+  # pipeline cannot migrate the database unattended. A backup first is
+  # recommended (there is no rollback to 2.x); see the
+  # 3.0.0 section of CHANGELOG.md. Not needed for fresh installs or after the
+  # first 3.x upgrade.
+  migrateFromBitnami: false
+  image:
+    # -- PostgreSQL image registry.
+    registry: docker.io
+    # -- PostgreSQL image repository (the Docker Official Image).
+    repository: library/postgres
+    # -- Image tag. Stay on major 17 and the Debian 12 (bookworm) base:
+    # `config.database.idleSessionTimeoutMs` relies on 14+, a major-version
+    # change needs a dump/restore or `pg_upgrade`, and a different glibc can
+    # change text collation order and silently corrupt existing indexes.
+    tag: "17-bookworm"
+    # -- Image pull policy.
+    pullPolicy: IfNotPresent
+  # -- Image pull secrets for the PostgreSQL pod, e.g. `[{name: regcred}]`.
+  imagePullSecrets: []
   auth:
+    # -- Application database user (created as the database owner, not a superuser).
     username: ""
+    # -- Application user's password. Ignored when `existingSecret` is set.
     password: ""
+    # -- Application database name.
     database: ""
+    # -- Password for the `postgres` superuser. Ignored when `existingSecret` is
+    # set. Empty keeps the one already stored in the chart's Secret, or
+    # generates one on first install. Set it (or use `existingSecret`) when the
+    # chart is rendered without cluster access (`helm template`, Argo CD): the
+    # stored value cannot be read there, so a new random one would be written
+    # on every sync while the database keeps the original.
+    postgresPassword: ""
+    # -- Existing Secret holding the passwords under `secretKeys`. When set the
+    # chart does not emit `BOW_DATABASE_URL`; supply it via `config.secretRef`.
     existingSecret: ""
+    secretKeys:
+      # -- Key in the Secret holding the application user's password.
+      userPasswordKey: password
+      # -- Key in the Secret holding the `postgres` superuser's password.
+      adminPasswordKey: postgres-password
   primary:
     persistence:
+      # -- Persist data in a PersistentVolumeClaim. `false` uses an emptyDir (data is lost on restart).
+      enabled: true
+      # -- Size of the data volume.
       size: 20Gi
+      # -- StorageClass for the data volume. Empty uses the cluster default; `-` sets `storageClassName: ""`.
+      storageClass: ""
+      # -- Access modes of the data volume.
+      accessModes:
+        - ReadWriteOnce
+      # -- Use an existing PersistentVolumeClaim instead of creating one.
+      existingClaim: ""
+    # -- Resource requests/limits for the PostgreSQL container.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+    # -- Node selector for the PostgreSQL pod.
     nodeSelector: {}
+    # -- Tolerations for the PostgreSQL pod.
+    tolerations: []
+    # -- Affinity rules for the PostgreSQL pod.
+    affinity: {}
+    # -- Annotations added to the PostgreSQL pod.
+    podAnnotations: {}
+    # -- Pod security context. uid/gid 1001 matches data volumes created by
+    # the Bitnami subchart in chart <= 2.x, so they are adopted as-is.
+    podSecurityContext:
+      runAsUser: 1001
+      runAsGroup: 1001
+      runAsNonRoot: true
+      fsGroup: 1001
+      fsGroupChangePolicy: OnRootMismatch
+      seccompProfile:
+        type: RuntimeDefault
+    # -- Container security context for PostgreSQL.
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+    # -- Seconds PostgreSQL gets to shut down cleanly before it is killed.
+    terminationGracePeriodSeconds: 60
+    # -- Extra `postgresql.conf` lines.
+    # Stock PostgreSQL allows 100 connections, 3 of them reserved for
+    # superusers. One app worker's pool alone can reach
+    # `config.database.poolSize + maxOverflow` (40 by default), and `start.sh`
+    # runs up to 4 workers when the node is big enough — so the default app
+    # deployment can ask for more than the default server allows, and the
+    # server then refuses the connect outright ("remaining connection slots are
+    # reserved for roles with the SUPERUSER attribute") rather than queueing.
+    # Raise this together with `config.database.*` and `replicaCount`; each
+    # connection costs the server memory, so size it, don't max it.
+    extendedConfiguration: |
+      max_connections = 300
 
-# -- Managed database with IAM auth (alternative to the bundled postgresql subchart).
-# When `database.auth.provider` is not `password`, the postgresql subchart values
-# above are ignored and the app connects to the external managed database instead.
+# -- Managed database with IAM auth (alternative to the bundled PostgreSQL).
+# When `database.auth.provider` is not `password`, the bundled PostgreSQL is not
+# deployed, the `postgresql` values above are ignored, and the app connects to
+# the external managed database instead.
 database:
   auth:
-    # -- Authentication provider. `password` uses the bundled postgresql subchart.
+    # -- Authentication provider. `password` uses the bundled PostgreSQL.
     # `aws_iam` connects to an external RDS instance using IAM token authentication.
     provider: password   # password | aws_iam
     # -- AWS region for IAM token generation (aws_iam only, e.g. `us-east-1`).
@@ -49,6 +147,73 @@ database:
   username: ""
   # -- Database name.
   name: ""
+
+# -- Where durable files live: uploads, tool outputs, thumbnails, slide decks,
+# logos, avatars, demo datasets, Parquet/extract caches.
+storage:
+  # -- `local` (default) keeps them on the pod's disk under /app/backend/uploads:
+  # they are lost when the pod is replaced unless `storage.local.persistence` is
+  # enabled, and one ReadWriteOnce volume limits you to one replica.
+  # `s3` (AWS or any S3-compatible store) or `azure` (Blob Storage) make the
+  # bucket the source of truth; every replica fills its own cache on demand.
+  backend: local   # local | s3 | azure
+  # -- Key prefix inside the bucket/container (e.g. `bow/prod/`).
+  prefix: ""
+  s3:
+    # -- Bucket name (required for `s3`).
+    bucket: ""
+    # -- Bucket region, e.g. `us-east-1`.
+    region: ""
+    # -- Custom endpoint for S3-compatible stores (MinIO, R2, Wasabi, Ceph...). Empty = AWS.
+    endpointUrl: ""
+    # -- `auto`, `path` (MinIO usually needs this) or `virtual`.
+    addressingStyle: auto
+    # -- `default`: boto3 chain — use IRSA / EKS Pod Identity via `serviceAccount.annotations`
+    # (no stored secret). `static`: keys from `config.secretRef` (`BOW_STORAGE_S3_ACCESS_KEY_ID`,
+    # `BOW_STORAGE_S3_SECRET_ACCESS_KEY`, optional `BOW_STORAGE_S3_SESSION_TOKEN`).
+    # `assume_role`: STS assume-role of `roleArn` on top of either.
+    auth: default   # default | static | assume_role
+    # -- Role to assume (`assume_role` only).
+    roleArn: ""
+    # -- External ID for the assume-role call, if the role's trust policy requires one.
+    externalId: ""
+    # -- Server-side encryption: "" (bucket default), `AES256` or `aws:kms`.
+    sse: ""
+    # -- KMS key id/ARN when `sse: aws:kms`.
+    kmsKeyId: ""
+  azure:
+    # -- `https://<account>.blob.core.windows.net` (required unless `auth: connection_string`).
+    accountUrl: ""
+    # -- Container name (required for `azure`).
+    container: ""
+    # -- `default`: DefaultAzureCredential — use AKS Workload Identity (`serviceAccount.annotations`
+    # `azure.workload.identity/client-id` + `podLabels` `azure.workload.identity/use: "true"`).
+    # `service_principal`: `BOW_STORAGE_AZURE_CLIENT_SECRET` from `config.secretRef`.
+    # `connection_string` / `sas`: `BOW_STORAGE_AZURE_CONNECTION_STRING` / `BOW_STORAGE_AZURE_SAS_TOKEN`
+    # from `config.secretRef`.
+    auth: default   # default | service_principal | connection_string | sas
+    # -- Entra tenant id (`service_principal`).
+    tenantId: ""
+    # -- Client id: the service principal's, or a user-assigned managed identity's.
+    clientId: ""
+  # -- Per-pod cache for /app/backend/uploads when `backend` is `s3` or `azure`
+  # (an emptyDir). Also holds git clones and render scratch.
+  cache:
+    # -- emptyDir size limit; size it for your largest working set of files and git clones.
+    sizeLimit: 10Gi
+  local:
+    # -- Persist /app/backend/uploads in a PersistentVolumeClaim (`backend: local` only).
+    persistence:
+      # -- Create (or use `existingClaim`) and mount the claim.
+      enabled: false
+      # -- Use an existing claim instead of creating one.
+      existingClaim: ""
+      # -- Requested size of the claim.
+      size: 20Gi
+      # -- StorageClass; empty uses the cluster default.
+      storageClass: ""
+      # -- Use `ReadWriteMany` (EFS, Azure Files, NFS) to run more than one replica on local storage.
+      accessModes: ["ReadWriteOnce"]
 
 # -- Ingress resource configuration. Exposes the app over HTTP/HTTPS.
 ingress:
@@ -98,6 +263,12 @@ config:
   telemetryEnabled: true
   # -- Public base URL of the application (e.g. `https://app.example.com`).
   baseUrl: ""
+  # -- Proxies trusted to set X-Forwarded-For (IPs/CIDRs, comma-separated), e.g.
+  # your ingress controller's pod CIDR. Unset trusts only loopback, so behind an
+  # ingress every anonymous visitor shares one rate-limit identity. Use `*` only
+  # if the Service is reachable solely through an ingress that overwrites
+  # client-sent X-Forwarded-For.
+  forwardedAllowIps: ""
   # -- Authentication mode. `hybrid` allows both local and SSO login.
   # `local_only` disables SSO. `sso_only` disables local login.
   authMode: "hybrid"   # hybrid | local_only | sso_only
@@ -109,6 +280,35 @@ config:
   verifyEmails: false
   # -- Number of Uvicorn worker processes. Leave empty to use Uvicorn's default.
   uvicornWorkers: ""
+  # -- App-side database connection pool, per Uvicorn worker.
+  # The ceiling against the server is
+  # `(poolSize + maxOverflow) * uvicornWorkers * replicaCount`. Keep that under
+  # the server's `max_connections` minus `superuser_reserved_connections`
+  # (stock PostgreSQL: 100 - 3 = 97), or connects are refused outright with
+  # "remaining connection slots are reserved for roles with the SUPERUSER
+  # attribute" — which surfaces to users as a failed agent run, not as a
+  # pool timeout. The bundled PostgreSQL (`postgresql.primary.extendedConfiguration`) is sized to match.
+  database:
+    # -- Pooled connections held per worker. Empty uses the app default (20).
+    poolSize: ""
+    # -- Extra connections a worker may open under load. Empty uses the app
+    # default (20).
+    maxOverflow: ""
+    # -- Let the server close pooled connections left idle this long (ms), so a
+    # quiet worker's backends drain instead of holding slots for the life of the
+    # process. A connection pool never shrinks on its own. `0` disables.
+    # REQUIRES PostgreSQL 14+: on older servers the parameter is rejected at
+    # connect time and *every* connection fails. Left empty here, which applies
+    # `600000` (10 min) only when this chart can be certain the app is talking to
+    # the bundled PostgreSQL 17 — that is, it generates the database URL
+    # itself and nothing can override it. It stays unset when the URL is
+    # delegated elsewhere and the version is therefore unknown: an external
+    # `database.host`, an IAM-authenticated `database.auth.provider`,
+    # `postgresql.enabled: false`, or a Secret supplying `BOW_DATABASE_URL` via
+    # `postgresql.auth.existingSecret` / `config.secretRef`.
+    # Set it explicitly on any server you know is 14 or newer to get the same
+    # draining behaviour — an explicit value always wins.
+    idleSessionTimeoutMs: ""
   otel:
     # -- Enable OpenTelemetry tracing export.
     enabled: false
@@ -265,8 +465,15 @@ nameOverride: ""
 # -- Number of pod replicas.
 replicaCount: 1
 
-# -- Deployment strategy. Leave empty for Kubernetes default (RollingUpdate 25/25).
-strategy: {}
+# -- Deployment strategy. `Recreate` stops every old pod before the new ones
+# start, because each new pod runs the database migrations on startup
+# (`start.sh`) and they take exclusive table locks in one transaction: with old
+# pods still serving, their queries deadlock the migration, and old code can
+# break once the new schema commits. The cost is a short outage on each
+# upgrade (pod startup plus migrations). `RollingUpdate` avoids the outage but
+# is only safe for releases whose migrations the previous version tolerates.
+strategy:
+  type: Recreate
 # strategy:
 #   type: RollingUpdate
 #   rollingUpdate:
@@ -294,6 +501,9 @@ topologySpreadConstraints: []
 
 # -- Annotations added to every pod (not the Deployment metadata).
 podAnnotations: {}
+
+# -- Labels added to every pod (e.g. `azure.workload.identity/use: "true"`).
+podLabels: {}
 
 # -- Security context for the pod (fsGroup, runAsUser, etc.).
 podSecurityContext: {}

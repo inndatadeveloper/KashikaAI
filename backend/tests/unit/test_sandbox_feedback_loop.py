@@ -83,8 +83,10 @@ class TestUnsafePythonIsRetryable:
         assert len(calls) == 2, "executor must regenerate after an unsafe_python violation"
         df = done["df"]
         assert df is not None and list(df.columns) == ["a"]
-        # The violation is still recorded for the caller/audit trail.
-        assert any("unsafe_python" in (err or "") for _, err in done["errors"])
+        # A successful run reports no errors; the violation is still recorded
+        # under attempt_errors for the caller/audit trail.
+        assert done["errors"] == []
+        assert any("unsafe_python" in (err or "") for _, err in done["attempt_errors"])
 
     def test_violation_still_emits_security_event(self):
         """Retrying must not silence the audit event."""
@@ -119,13 +121,14 @@ class TestUnsafePythonIsRetryable:
 
 
 class _PromptCapturingLLM:
-    """Stands in for Coder.llm — records the rendered prompt."""
+    """Stands in for Coder.llm — records the rendered prompt the model sees,
+    system prompt included (create_data sends its rules via `system=`)."""
 
     def __init__(self):
         self.prompts = []
 
-    async def inference_stream_v2(self, messages, **kwargs):
-        self.prompts.append(messages[0].content)
+    async def inference_stream_v2(self, messages, system=None, **kwargs):
+        self.prompts.append(f"{system or ''}\n{messages[0].content}")
         yield TextDeltaEvent(text=CLEAN_CODE)
 
 
@@ -150,6 +153,18 @@ class TestErrorFeedbackReachesPrompts:
 
     def _feedback(self):
         return [(GETATTR_CODE, VIOLATION_MSG)]
+
+    def test_inspection_preserves_business_instructions_and_resources(self):
+        coder = _bare_coder()
+        instructions = "Revenue excludes returns using the certified master measure."
+        resources = "FiscalYear is numeric; the Orders key is Order Number."
+        asyncio.run(coder.generate_inspection_code(
+            prompt="check revenue", schemas="", ds_clients={}, excel_files=[],
+            code_and_error_messages=[], memories="", previous_messages="", retries=0,
+            context=_ctx(instructions_context=instructions, resources_context=resources),
+        ))
+        assert instructions in coder.llm.prompts[0]
+        assert resources in coder.llm.prompts[0]
 
     def test_inspection_prompt_contains_previous_error(self):
         coder = _bare_coder()

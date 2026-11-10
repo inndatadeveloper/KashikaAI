@@ -1,7 +1,10 @@
+import asyncio
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 from app.data_sources.clients.tool_provider_base import ToolProviderClient
+from app.data_sources.clients.progress import IndexingCancelled
 from app.utils.tabular_payload import detect_content_type
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,108 @@ def looks_like_json(text: Any) -> bool:
     return head in ("{", "[")
 
 
+# Unicode TAG characters (U+E0000–U+E007F) render as nothing but are read by
+# the model — a known channel for smuggling instructions through untrusted tool
+# output. Strip them from everything a server sends us, keeping only valid
+# emoji tag sequences (subdivision flags: U+1F3F4, tags, then U+E007F).
+_TAG_SUB_RE = re.compile("(\U0001F3F4[\U000E0020-\U000E007E]+\U000E007F)|[\U000E0000-\U000E007F]")
+_TAG_ANY_RE = re.compile("[\U000E0000-\U000E007F]")
+
+
+def strip_unicode_tags(text: str) -> str:
+    if not isinstance(text, str) or not _TAG_ANY_RE.search(text):
+        return text
+    return _TAG_SUB_RE.sub(lambda m: m.group(1) or "", text)
+
+
+def scrub_tags(value: Any) -> Any:
+    """strip_unicode_tags over every string in a JSON-like value (keys too)."""
+    if isinstance(value, str):
+        return strip_unicode_tags(value)
+    if isinstance(value, list):
+        return [scrub_tags(v) for v in value]
+    if isinstance(value, dict):
+        return {scrub_tags(k): scrub_tags(v) for k, v in value.items()}
+    return value
+
+
+# Tool annotation hints (MCP spec). Advisory, set by the server.
+_HINT_KEYS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+
+# Cap tools/list pagination so a misbehaving server can't make us walk forever.
+_MAX_TOOL_PAGES = 50
+
+
+def tool_hints(tool: Any) -> Dict[str, bool]:
+    """The boolean annotation hints a discovered tool declares (others omitted)."""
+    ann = getattr(tool, "annotations", None)
+    if ann is None:
+        return {}
+    out: Dict[str, bool] = {}
+    for key in _HINT_KEYS:
+        val = ann.get(key) if isinstance(ann, dict) else getattr(ann, key, None)
+        if isinstance(val, bool):
+            out[key] = val
+    return out
+
+
+def default_policy_for_hints(hints: Dict[str, bool]) -> Optional[str]:
+    """Starting policy for a newly-discovered tool.
+
+    Only a tool the server marks read-only runs without asking; a destructive
+    tool, or one with no hints at all, starts on "ask". Missing hints are
+    treated as write-capable.
+    Returns None for "allow" (the caller's default).
+    """
+    if hints.get("readOnlyHint") is True and hints.get("destructiveHint") is not True:
+        return None
+    return "ask"
+
+
+def is_read_only_tool(metadata: Any) -> bool:
+    """True when a stored ConnectionTool's metadata records readOnlyHint=true."""
+    if not isinstance(metadata, dict):
+        return False
+    hints = metadata.get("annotations")
+    return isinstance(hints, dict) and hints.get("readOnlyHint") is True
+
+
+# A pooled session the server no longer knows answers 404 → the SDK reports
+# "Session terminated". The server rejected the request before running the
+# tool, so one retry on a fresh session is safe for any tool.
+_SESSION_GONE_MARKERS = ("session terminated", "session not found")
+
+# Transport failures where the call MAY have reached the server. Retried only
+# for read-only tools: a write could run twice.
+_TRANSPORT_ERROR_NAMES = {
+    "ClosedResourceError", "BrokenResourceError", "EndOfStream",
+    "RemoteProtocolError", "ReadError", "WriteError", "ConnectError",
+    "ReadTimeout", "ConnectTimeout", "PoolTimeout", "ConnectionResetError",
+    "BrokenPipeError",
+}
+
+
+def _leaf_exceptions(e: BaseException) -> List[BaseException]:
+    if isinstance(e, BaseExceptionGroup):
+        out: List[BaseException] = []
+        for sub in e.exceptions:
+            out.extend(_leaf_exceptions(sub))
+        return out
+    return [e]
+
+
+def retry_kind(e: BaseException) -> Optional[str]:
+    """'session_gone' (safe for any tool), 'transport' (read-only only), or None."""
+    leaves = _leaf_exceptions(e)
+    for leaf in leaves:
+        if any(m in str(leaf).lower() for m in _SESSION_GONE_MARKERS):
+            return "session_gone"
+    for leaf in leaves:
+        if type(leaf).__name__ in _TRANSPORT_ERROR_NAMES:
+            return "transport"
+    return None
+
+
 class McpClient(ToolProviderClient):
     """
     Client for connecting to MCP (Model Context Protocol) servers.
@@ -54,6 +159,9 @@ class McpClient(ToolProviderClient):
         # OAuth user_required mode: per-user access_token from
         # UserConnectionCredentials is fed in as a bearer token.
         access_token: Optional[str] = None,
+        # HTTP Basic (e.g. Atlassian email + API token).
+        username: Optional[str] = None,
+        password: Optional[str] = None,
         **_ignored,  # OAuth-app fields (authorize_url, token_url, client_id,
                      # client_secret, scopes, audience) live on the connection
                      # creds but are only used by the OAuth service, not the
@@ -68,12 +176,18 @@ class McpClient(ToolProviderClient):
         self.token = token or access_token
         self.api_key = api_key
         self.api_key_header = api_key_header or "X-API-Key"
+        self.username = username
+        self.password = password
 
     def _build_headers(self) -> Dict[str, str]:
         """Build request headers, merging any auth headers."""
         h = {}
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
+        elif self.username and self.password:
+            import base64
+            pair = f"{self.username}:{self.password}".encode("utf-8")
+            h["Authorization"] = "Basic " + base64.b64encode(pair).decode("ascii")
         if self.api_key:
             h[self.api_key_header] = self.api_key
         h.update(self.headers)
@@ -88,27 +202,50 @@ class McpClient(ToolProviderClient):
         return asyncio.get_event_loop().run_until_complete(self._alist_tools())
 
     async def _alist_tools(self) -> List[Dict[str, Any]]:
-        """Async implementation of list_tools using the MCP SDK."""
+        """Async implementation of list_tools using the MCP SDK.
+
+        Follows tools/list nextCursor pagination (capped). Each tool carries
+        its annotation hints in ``metadata`` and, from them, the policy a
+        newly-discovered tool starts on (``default_policy``).
+        """
+        from mcp.types import PaginatedRequestParams
+
         try:
             tools = []
             async with self._connect() as session:
-                result = await session.list_tools()
-                for tool in result.tools:
-                    tools.append({
-                        "name": tool.name,
-                        "description": tool.description or "",
-                        "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-                        "output_schema": {},
-                    })
+                cursor = None
+                for _ in range(_MAX_TOOL_PAGES):
+                    result = await (
+                        session.list_tools(params=PaginatedRequestParams(cursor=cursor))
+                        if cursor else session.list_tools()
+                    )
+                    for tool in result.tools:
+                        hints = tool_hints(tool)
+                        tools.append({
+                            "name": tool.name,
+                            "description": strip_unicode_tags(tool.description or ""),
+                            "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                            "output_schema": getattr(tool, "outputSchema", None) or {},
+                            "metadata": {"annotations": hints},
+                            "default_policy": default_policy_for_hints(hints),
+                        })
+                    cursor = getattr(result, "nextCursor", None)
+                    if not cursor:
+                        break
+                else:
+                    logger.warning("MCP tools/list: stopped after %d pages", _MAX_TOOL_PAGES)
             return tools
+        except (asyncio.CancelledError, IndexingCancelled):
+            raise
         except BaseException as e:
             raise RuntimeError(self._unwrap_exception(e)) from None
 
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool on the MCP server."""
         import asyncio
+        # A one-off loop: a pooled session would outlive it, so open a fresh one.
         return asyncio.get_event_loop().run_until_complete(
-            self._acall_tool(tool_name, arguments)
+            self._acall_tool(tool_name, arguments, pooled=False)
         )
 
     # ------------------------------------------------------------------
@@ -225,7 +362,7 @@ class McpClient(ToolProviderClient):
                     else:
                         contents.append({
                             "type": "text",
-                            "text": getattr(c, "text", "") or "",
+                            "text": strip_unicode_tags(getattr(c, "text", "") or ""),
                             "mime_type": mime_type,
                             "uri": c_uri,
                         })
@@ -235,43 +372,32 @@ class McpClient(ToolProviderClient):
             logger.error(f"MCP read_resource failed: {uri}: {msg}")
             return {"success": False, "contents": [], "error": msg}
 
-    async def _acall_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Async implementation of call_tool using the MCP SDK."""
-        from mcp import ClientSession
+    async def _acall_tool(
+        self, tool_name: str, arguments: Dict[str, Any], pooled: bool = True, read_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Async implementation of call_tool using the MCP SDK.
 
+        A pooled session can go stale (server restart, session timeout). The
+        call is retried once on a fresh session when that is safe: always when
+        the server rejected the session outright, and on other transport
+        failures only for read-only tools, since a write might already have run.
+        """
         try:
-            async with self._connect() as session:
-                result = await session.call_tool(tool_name, arguments)
-
-                # Determine content type from result
-                data = self._extract_result_data(result)
-                content_type = self._detect_content_type(data)
-
-                is_error = bool(getattr(result, "isError", False))
-                # On a tool-level error (isError=True) the MCP spec puts the
-                # explanation in the content blocks, not in a transport
-                # exception. Surface it in `error` so callers don't see a
-                # useless "None" — otherwise the agent retries blindly.
-                error_msg = self._extract_error_message(data) if is_error else None
-
-                # A payload we declined to parse is still JSON if it looks like
-                # JSON. Say so, or the caller saves 8 MB of records as a .txt
-                # and tells the next tool to read it as prose.
-                parse_skipped = _over_parse_cap(data) and looks_like_json(data)
-
-                return {
-                    "success": not is_error,
-                    "data": data,
-                    "content_type": content_type,
-                    # File blobs a tool returned (EmbeddedResource/blob), surfaced
-                    # so execute_mcp can materialize them into session files.
-                    "binaries": self._extract_binaries(result),
-                    "error": error_msg,
-                    "parse_skipped": parse_skipped,
-                    "size_chars": len(data) if isinstance(data, str) else None,
-                }
+            return await self._call_once(tool_name, arguments, pooled)
         except BaseException as e:
+            kind = retry_kind(e)
+            if kind == "session_gone" or (kind == "transport" and read_only):
+                logger.info("MCP tool call %s: %s on a stale session; retrying once", tool_name, kind)
+                try:
+                    return await self._call_once(tool_name, arguments, pooled)
+                except BaseException as e2:
+                    e = e2
             msg = self._unwrap_exception(e)
+            if kind == "transport" and not read_only:
+                msg += (
+                    " (the connection dropped mid-call, so this write-capable tool was NOT"
+                    " retried automatically — it may or may not have run; check before re-running it)"
+                )
             logger.error(f"MCP tool call failed: {tool_name}: {msg}")
             return {
                 "success": False,
@@ -280,66 +406,188 @@ class McpClient(ToolProviderClient):
                 "error": msg,
             }
 
+    async def _call_once(self, tool_name: str, arguments: Dict[str, Any], pooled: bool) -> Dict[str, Any]:
+        async with (self._call_session() if pooled else self._connect()) as session:
+            result = await session.call_tool(tool_name, arguments)
+
+        data = self._extract_result_data(result)
+        data = self._merge_structured(result, data)
+        data = scrub_tags(data)
+        binaries = self._extract_binaries(result)
+        if data is None and binaries:
+            # Files only: give the data artifact a pointer rather than a
+            # bare null, so the agent knows to look at the saved files.
+            data = f"Tool returned {len(binaries)} file(s); they are attached to this session."
+        content_type = self._detect_content_type(data)
+
+        is_error = bool(getattr(result, "isError", False))
+        # On a tool-level error (isError=True) the MCP spec puts the
+        # explanation in the content blocks, not in a transport
+        # exception. Surface it in `error` so callers don't see a
+        # useless "None" — otherwise the agent retries blindly.
+        error_msg = self._extract_error_message(data) if is_error else None
+
+        # A payload we declined to parse is still JSON if it looks like
+        # JSON. Say so, or the caller saves 8 MB of records as a .txt
+        # and tells the next tool to read it as prose.
+        parse_skipped = _over_parse_cap(data) and looks_like_json(data)
+
+        return {
+            "success": not is_error,
+            "data": data,
+            "content_type": content_type,
+            # File blobs a tool returned (EmbeddedResource/blob), surfaced
+            # so execute_mcp can materialize them into session files.
+            "binaries": binaries,
+            "error": error_msg,
+            "parse_skipped": parse_skipped,
+            "size_chars": len(data) if isinstance(data, str) else None,
+        }
+
+    @staticmethod
+    def _merge_structured(result, data: Any) -> Any:
+        """Fold a result's ``structuredContent`` into its data.
+
+        The spec says a tool returning structuredContent SHOULD also send it
+        serialized in a text block — when one does (compared as parsed JSON),
+        the content is kept as-is so the model doesn't see it twice. When the
+        structured data is the only copy (no content, or only a status line /
+        prose summary next to it), it is kept: dropping it loses the result.
+        """
+        structured = getattr(result, "structuredContent", None)
+        if structured is None:
+            return data
+        if data is None:
+            return structured
+        candidates = data if isinstance(data, list) else [data]
+        for part in candidates:
+            if part == structured:
+                return data
+            if isinstance(part, str):
+                try:
+                    if json.loads(part) == structured:
+                        return data
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+        return {"structured_content": structured, "content": data}
+
+    @staticmethod
+    def _parse_text(text: Any) -> Any:
+        """JSON-parse a text payload when it is JSON; otherwise return it as-is."""
+        if not isinstance(text, str):
+            return text
+        if _over_parse_cap(text):
+            # Parsing multiplies this several times over in Python objects, and
+            # a DataFrame built from it again. Hand back the raw string: the
+            # caller still writes every byte to a file, so nothing is lost.
+            logger.warning(
+                "MCP result of %d chars exceeds the %d-char parse cap; "
+                "returning it unparsed.",
+                len(text), MAX_PARSE_CHARS,
+            )
+            return text
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+
+    @staticmethod
+    def _block_part(block) -> Any:
+        """What one content block contributes to the tool's result data.
+
+        Returns the parsed payload, a one-line note for content the agent must
+        reach another way, or None for a file blob (those travel separately via
+        ``_extract_binaries`` and are saved as session files). Never drops a
+        block silently: an unknown shape comes back as a visible note, because a
+        result that quietly lost its content reads exactly like a tool that
+        returned nothing.
+        """
+        block_type = getattr(block, "type", None)
+
+        # Embedded resource: a file the tool returned inline. GitHub's
+        # get_file_contents sends the file body this way, next to a short
+        # "successfully downloaded" text block.
+        resource = getattr(block, "resource", None)
+        if resource is not None:
+            text = getattr(resource, "text", None)
+            if text is not None:
+                return McpClient._parse_text(text)
+            if getattr(resource, "blob", None) is not None:
+                return None
+            uri = getattr(resource, "uri", None)
+            return f"[MCP content dropped: embedded resource with no text or blob (uri={uri})]"
+
+        # Image / audio: base64 media. Saved as a session file, not inlined —
+        # base64 in the result data costs tokens and no model can read it.
+        if block_type in ("image", "audio") or (
+            getattr(block, "data", None) is not None and getattr(block, "mimeType", None)
+            and not hasattr(block, "text")
+        ):
+            return None
+
+        if hasattr(block, "text"):
+            return McpClient._parse_text(block.text)
+
+        # Top-level blob (non-standard but seen in the wild) → saved as a file.
+        if getattr(block, "blob", None) is not None:
+            return None
+
+        # Resource link: the tool points at a resource instead of embedding it.
+        uri = getattr(block, "uri", None)
+        if block_type == "resource_link" or uri:
+            details = [f"uri={uri}"]
+            for attr, label in (("name", "name"), ("mimeType", "mimeType")):
+                val = getattr(block, attr, None)
+                if val:
+                    details.append(f"{label}={val}")
+            return (
+                f"[MCP resource link: {', '.join(details)} — fetch it with "
+                f"read_mcp_resource(uri='{uri}')]"
+            )
+
+        return f"[MCP content dropped: unsupported block type={block_type or type(block).__name__}]"
+
     def _extract_result_data(self, result) -> Any:
-        """Extract usable data from an MCP CallToolResult."""
+        """Extract usable data from an MCP CallToolResult.
+
+        One payload comes back as itself (parsed JSON or a string); several
+        text parts are joined into one text; mixed parts come back as a list.
+        File blobs (embedded resources, images, audio) are not part of the data
+        — ``_extract_binaries`` hands them to execute_mcp to save as files.
+        """
         if not hasattr(result, "content") or not result.content:
             return None
 
-        # If single text content, return as string
-        if len(result.content) == 1:
-            content = result.content[0]
-            if hasattr(content, "text"):
-                # Try to parse as JSON
-                import json
-                if _over_parse_cap(content.text):
-                    # Parsing multiplies this several times over in Python
-                    # objects, and a DataFrame built from it again. Hand back
-                    # the raw string: the caller still writes every byte to a
-                    # file, so nothing is lost — it just isn't parsed here.
-                    logger.warning(
-                        "MCP result of %d chars exceeds the %d-char parse cap; "
-                        "returning it unparsed.",
-                        len(content.text), MAX_PARSE_CHARS,
-                    )
-                    return content.text
-                try:
-                    return json.loads(content.text)
-                except (json.JSONDecodeError, TypeError):
-                    return content.text
-
-        # Multiple content blocks — return as list
-        parts = []
-        for content in result.content:
-            if hasattr(content, "text"):
-                import json
-                if _over_parse_cap(content.text):
-                    parts.append(content.text)
-                    continue
-                try:
-                    parts.append(json.loads(content.text))
-                except (json.JSONDecodeError, TypeError):
-                    parts.append(content.text)
-            elif hasattr(content, "data"):
-                parts.append(content.data)
+        parts = [p for p in (self._block_part(c) for c in result.content) if p is not None]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return parts[0]
+        if all(isinstance(p, str) for p in parts):
+            return "\n\n".join(parts)
         return parts
 
     @staticmethod
     def _extract_binaries(result) -> List[Dict[str, Any]]:
         """Pull file blobs out of a tool result's content blocks.
 
-        Tools return files as an EmbeddedResource whose `.resource` is a
-        BlobResourceContents (base64 `blob` + `mimeType` + `uri`), or — less
-        commonly — as a content block with a top-level `blob`. Returns a list of
-        {blob_b64, mime_type, uri} for execute_mcp to materialize.
+        Covers an EmbeddedResource whose `.resource` is a BlobResourceContents
+        (base64 `blob` + `mimeType` + `uri`), image/audio content (base64
+        `data` + `mimeType`), and a content block with a top-level `blob`.
+        Returns a list of {blob_b64, mime_type, uri} for execute_mcp to
+        materialize.
         """
         out: List[Dict[str, Any]] = []
         for c in (getattr(result, "content", None) or []):
             res = getattr(c, "resource", None)
-            blob = getattr(res, "blob", None) if res is not None else getattr(c, "blob", None)
+            src = res if res is not None else c
+            blob = getattr(src, "blob", None)
+            if not blob and res is None and getattr(c, "type", None) in ("image", "audio"):
+                blob = getattr(c, "data", None)
             if not blob:
                 continue
-            mime = getattr(res, "mimeType", None) if res is not None else getattr(c, "mimeType", None)
-            uri = getattr(res, "uri", None) if res is not None else getattr(c, "uri", None)
+            mime = getattr(src, "mimeType", None)
+            uri = getattr(src, "uri", None)
             out.append({
                 "blob_b64": blob,
                 "mime_type": mime or "application/octet-stream",
@@ -409,6 +657,9 @@ class McpClient(ToolProviderClient):
         from mcp.client.sse import sse_client
         from mcp.client.streamable_http import streamablehttp_client
         from contextlib import asynccontextmanager
+        # Pinned admin-tier client: metadata/link-local refused, private only
+        # with block_private_outbound, DNS rebinding closed (app.core.egress).
+        from app.core.egress import Policy, mcp_client_factory
 
         @asynccontextmanager
         async def _session():
@@ -416,6 +667,7 @@ class McpClient(ToolProviderClient):
                 async with sse_client(
                     url=self.server_url,
                     headers=self._build_headers(),
+                    httpx_client_factory=mcp_client_factory(Policy.ADMIN),
                 ) as (read_stream, write_stream):
                     async with ClientSession(read_stream, write_stream) as session:
                         await session.initialize()
@@ -425,6 +677,7 @@ class McpClient(ToolProviderClient):
                 async with streamablehttp_client(
                     url=self.server_url,
                     headers=self._build_headers(),
+                    httpx_client_factory=mcp_client_factory(Policy.ADMIN),
                 ) as (read_stream, write_stream, _):
                     async with ClientSession(read_stream, write_stream) as session:
                         await session.initialize()
@@ -437,6 +690,20 @@ class McpClient(ToolProviderClient):
                 )
 
         return _session()
+
+    def _call_session(self):
+        """A session for a tool call: pooled and reused when possible.
+
+        See ``mcp_session_pool``: reuse skips the initialize handshake and the
+        SDK's tools/list after each call on a fresh session. Pooling is off
+        when ``BOW_MCP_POOL_SIZE=0``; then every call opens its own session.
+        """
+        from app.data_sources.clients.mcp_session_pool import POOL, pool_size, session_key
+
+        if pool_size() <= 0:
+            return self._connect()
+        key = session_key(self.transport, self.server_url, self._build_headers())
+        return POOL.session(key, self._connect)
 
     def test_connection(self) -> Dict[str, Any]:
         """Test connectivity by attempting to initialize and list tools."""
@@ -460,10 +727,13 @@ class McpClient(ToolProviderClient):
 
     # Override async wrappers to use native async implementations
     async def alist_tools(self) -> List[Dict[str, Any]]:
-        return await self._alist_tools()
+        self.reset_discovery()
+        result = await self._alist_tools()
+        from app.data_sources.clients.discovery import require_complete_discovery
+        return require_complete_discovery(self, result)
 
-    async def acall_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._acall_tool(tool_name, arguments)
+    async def acall_tool(self, tool_name: str, arguments: Dict[str, Any], read_only: bool = False) -> Dict[str, Any]:
+        return await self._acall_tool(tool_name, arguments, read_only=read_only)
 
     async def atest_connection(self) -> Dict[str, Any]:
         return await self._atest_connection()

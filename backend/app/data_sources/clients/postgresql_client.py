@@ -1,4 +1,6 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_phase
 from app.data_sources.clients.base import DataSourceClient
+from app.data_sources.clients.progress import make_reporter, IndexingCancelled
 
 import pandas as pd
 import sqlalchemy
@@ -12,6 +14,7 @@ from typing import List, Generator
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
 from functools import cached_property
+from app.data_sources.routines import build_routine_tables, postgres_variants, with_routines
 
 
 class PostgresqlClient(DataSourceClient):
@@ -21,8 +24,21 @@ class PostgresqlClient(DataSourceClient):
     # of literal dates that go stale when saved code is re-executed.
     relative_date_hint = "Relative dates (PostgreSQL): CURRENT_DATE, CURRENT_DATE - INTERVAL '7 days', date_trunc('month', CURRENT_DATE); the clock is the DB server's."
 
-    def __init__(self, host, port, database, user, password="", schema=None, sslmode="prefer"):
+    # Schemas the crawl skips unless `include_system_schemas` is set. These hold
+    # Postgres's own catalog (pg_catalog) and the SQL-standard views over it
+    # (information_schema); BOW's schema context normally stands in for them.
+    SYSTEM_SCHEMAS = ("information_schema", "pg_catalog")
+
+    def __init__(self, host, port, database, user, password="", schema=None, sslmode="prefer",
+                 index_routines: bool = False, include_system_schemas: bool = False):
         self.host = host
+        # Opt-in routine indexing (see app.data_sources.routines).
+        self.index_routines = bool(index_routines)
+        # Opt-in crawl of pg_catalog / information_schema tables and views, for
+        # agents that monitor the database itself (pg_stat_activity, pg_locks,
+        # pg_stat_user_tables, ...). Off, those schemas never appear in the
+        # catalog, so there is nothing for an admin to activate later.
+        self.include_system_schemas = bool(include_system_schemas)
         self.port = port
         self.database = database
         self.user = user
@@ -40,6 +56,13 @@ class PostgresqlClient(DataSourceClient):
                 if low not in seen:
                     seen.add(low)
                     self._schemas.append(low)
+
+    def _system_schema_filter(self, column: str) -> List[str]:
+        """WHERE clauses that hide system schemas, or none when they are opted in."""
+        if self.include_system_schemas:
+            return []
+        quoted = ", ".join(f"'{name}'" for name in self.SYSTEM_SCHEMAS)
+        return [f"{column} NOT IN ({quoted})"]
 
     @cached_property
     def pg_uri(self):
@@ -92,20 +115,26 @@ class PostgresqlClient(DataSourceClient):
             print(f"Error executing SQL: {e}")
             raise
 
-    def get_tables(self) -> List[Table]:
+    def get_tables(self, progress_callback=None) -> List[Table]:
         """Get tables with graceful fallback if enriched query fails."""
         try:
-            return self._get_tables_enriched()
+            return self._get_tables_enriched(progress_callback) if progress_callback else self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
-            return self._get_tables_basic()
+            make_reporter(progress_callback).phase("metadata_fallback")
+            return self._get_tables_basic(progress_callback) if progress_callback else self._get_tables_basic()
 
-    def _get_tables_enriched(self) -> List[Table]:
+    def _get_tables_enriched(self, progress_callback=None) -> List[Table]:
         """Get tables with column/table comments via pg_description. May fail on some configurations."""
+        discovery_phase('reading_columns')
+        reporter = make_reporter(progress_callback)
+        reporter.phase("reading_columns")
         with self.connect() as conn:
             params = {"database": self.database}
             where_clauses = [
                 "c.table_catalog = :database",
-                "c.table_schema NOT IN ('information_schema', 'pg_catalog')",
+                *self._system_schema_filter("c.table_schema"),
             ]
             if self._schemas:
                 in_keys = []
@@ -137,10 +166,12 @@ class PostgresqlClient(DataSourceClient):
             result = conn.execute(sql, params).fetchall()
 
             tables = {}
+            reporter.phase("processing_columns", total=len(result))
             for row in result:
                 table_schema, table_name, column_name, data_type, col_comment, tbl_comment = row
                 key = (table_schema, table_name)
                 fqn = f"{table_schema}.{table_name}"
+                reporter.tick(f"{fqn}.{column_name}")
                 if key not in tables:
                     tables[key] = Table(
                         name=fqn,
@@ -158,8 +189,11 @@ class PostgresqlClient(DataSourceClient):
 
             # Materialized views are not exposed via information_schema, so fetch
             # them separately from pg_catalog and merge into the result.
+            reporter.phase("materialized_views")
             self._append_materialized_views(conn, tables, with_comments=True)
+            reporter.phase("relationships", total=len(tables))
             self._attach_foreign_keys(conn, tables)
+            reporter.done()
             return list(tables.values())
 
     def _append_materialized_views(self, conn, tables: dict, with_comments: bool) -> None:
@@ -172,7 +206,7 @@ class PostgresqlClient(DataSourceClient):
         params = {}
         where_clauses = [
             "c.relkind = 'm'",
-            "n.nspname NOT IN ('information_schema', 'pg_catalog')",
+            *self._system_schema_filter("n.nspname"),
         ]
         if self._schemas:
             in_keys = []
@@ -236,14 +270,17 @@ class PostgresqlClient(DataSourceClient):
                 description=col_comment
             ))
 
-    def _get_tables_basic(self) -> List[Table]:
+    def _get_tables_basic(self, progress_callback=None) -> List[Table]:
         """Get tables without comments (original query - always works)."""
+        discovery_phase('metadata_fallback')
+        reporter = make_reporter(progress_callback)
+        reporter.phase("reading_columns")
         try:
             with self.connect() as conn:
                 params = {"database": self.database}
                 where_clauses = [
                     "table_catalog = :database",
-                    "table_schema NOT IN ('information_schema', 'pg_catalog')",
+                    *self._system_schema_filter("table_schema"),
                 ]
                 if self._schemas:
                     in_keys = []
@@ -263,10 +300,12 @@ class PostgresqlClient(DataSourceClient):
                 result = conn.execute(sql, params).fetchall()
 
                 tables = {}
+                reporter.phase("processing_columns", total=len(result))
                 for row in result:
                     table_schema, table_name, column_name, data_type = row
                     key = (table_schema, table_name)
                     fqn = f"{table_schema}.{table_name}"
+                    reporter.tick(f"{fqn}.{column_name}")
                     if key not in tables:
                         tables[key] = Table(
                             name=fqn, columns=[], pks=[], fks=[], metadata_json={"schema": table_schema}
@@ -274,10 +313,16 @@ class PostgresqlClient(DataSourceClient):
                     tables[key].columns.append(TableColumn(name=column_name, dtype=data_type))
 
                 # Materialized views are absent from information_schema; merge them in.
+                reporter.phase("materialized_views")
                 self._append_materialized_views(conn, tables, with_comments=False)
+                reporter.phase("relationships", total=len(tables))
                 self._attach_foreign_keys(conn, tables)
+                reporter.done()
                 return list(tables.values())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("postgresql catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -300,9 +345,19 @@ class PostgresqlClient(DataSourceClient):
         raise NotImplementedError(
             "get_schema() is obsolete. Use get_tables() instead.")
 
-    def get_schemas(self):
-        """Get schemas for all tables in the specified database."""
-        return self.get_tables()
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
+        """Tables, views and materialized views, then stored procedures and
+        functions (see app.data_sources.routines)."""
+        tables = self.get_tables(progress_callback) if progress_callback else self.get_tables()
+        return with_routines(tables, lambda: self.get_routines(t.name for t in tables), source="postgresql",
+                             client=self, enabled=self.index_routines)
+
+    def get_routines(self, table_names=()) -> List[Table]:
+        """Stored procedures and functions as schema entries, named like tables."""
+        with self.connect() as conn:
+            variants = postgres_variants(conn, self._schemas or None)
+        return build_routine_tables(variants, table_names, lambda schema, name: f"{schema}.{name}")
 
     def prompt_schema(self):
         schemas = self.get_schemas()

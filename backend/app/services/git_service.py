@@ -13,10 +13,12 @@ This service handles all Git-related operations:
 import git
 import tempfile
 import os
+import json
 import logging
 import shutil
 import re
 import httpx
+import yaml
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
@@ -33,12 +35,16 @@ from app.models.user import User
 from app.models.metadata_indexing_job import MetadataIndexingJob
 from app.models.metadata_resource import MetadataResource
 from app.models.instruction import Instruction
+from app.errors.redact import redact_error
+from app.services.git_hardening import persist_learned_hosts, ssh_command, with_https_auth
 from app.schemas.git_repository_schema import (
     GitRepositoryCreate,
     GitRepositoryUpdate,
     GitRepositorySchema,
 )
 from app.core.telemetry import telemetry
+from app.core.egress import Policy, check_host, env_proxy_for, pinned_async_client, _literal_ip
+from app.core.url_safety import UnsafeURLError, git_remote_host
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +58,48 @@ class GitService:
         self.metadata_indexing_job_service = MetadataIndexingJobService()
 
     # ==================== Repository CRUD ====================
+
+    @staticmethod
+    def _check_remote(repo_url: str) -> list:
+        """Reject remotes git must never be pointed at (local paths, remote
+        helpers, cloud metadata; private hosts only with
+        ``block_private_outbound``). Returns the validated addresses.
+        See app.core.url_safety / app.core.egress."""
+        try:
+            _, host = git_remote_host(repo_url)
+            return check_host(host, Policy.ADMIN, require_resolution=False)
+        except UnsafeURLError as e:
+            raise HTTPException(status_code=400, detail=redact_error(e))
+
+    @classmethod
+    def _git_env(cls, repo_url: str, base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Environment for ONE network git command against ``repo_url``.
+
+        Runs the remote check again right before the command (a host can be
+        re-pointed after it was saved) and, for http(s) remotes, pins git's
+        libcurl to the address that was just validated
+        (``http.curloptResolve`` via ``GIT_CONFIG_*``; git >= 2.37, older
+        gits ignore it and keep the check). ssh remotes are checked only.
+        """
+        addrs = cls._check_remote(repo_url)
+        env = dict(os.environ if base_env is None else base_env)
+        parsed = urlparse(repo_url)
+        host = parsed.hostname
+        if (
+            parsed.scheme in ("http", "https") and addrs and host
+            and _literal_ip(host) is None and not env_proxy_for(repo_url)
+        ):
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            ip = addrs[0]
+            ip_txt = f"[{ip}]" if ip.version == 6 else str(ip)
+            try:
+                n = int(env.get("GIT_CONFIG_COUNT") or 0)
+            except ValueError:
+                n = 0
+            env[f"GIT_CONFIG_KEY_{n}"] = "http.curloptResolve"
+            env[f"GIT_CONFIG_VALUE_{n}"] = f"{host}:{port}:{ip_txt}"
+            env["GIT_CONFIG_COUNT"] = str(n + 1)
+        return env
 
     async def _verify_data_source(
         self, db: AsyncSession, data_source_id: str, organization: Organization
@@ -138,6 +186,7 @@ class GitService:
         organization: Organization
     ) -> Dict[str, Any]:
         """Test Git repository connection using provided credentials."""
+        self._check_remote(git_repo.repo_url)
         # If data_source_id is provided in the schema, verify it
         if git_repo.data_source_id:
             await self._verify_data_source(db, git_repo.data_source_id, organization)
@@ -157,25 +206,37 @@ class GitService:
                     )
                 else:
                     # Public repo - no auth
-                    remote_refs = git.cmd.Git().ls_remote(git_repo.repo_url)
+                    remote_refs = git.cmd.Git().ls_remote(
+                        git_repo.repo_url, env=self._git_env(git_repo.repo_url)
+                    )
 
-                # Verify that the configured branch exists
+                # Parse ls-remote output ("<sha>\t<ref>" per line) into exact branch names
+                branches = {
+                    line.split("\t", 1)[1].removeprefix("refs/heads/")
+                    for line in remote_refs.splitlines()
+                    if "\trefs/heads/" in line
+                }
                 branch_name = git_repo.branch or "main"
-                expected_ref = f"refs/heads/{branch_name}"
-                if expected_ref not in remote_refs:
+                if not branches:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Git branch '{branch_name}' not found in repository"
+                        detail="Repository is empty — push an initial commit (e.g. add a README) and try again"
+                    )
+                if branch_name not in branches:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Git branch '{branch_name}' not found in repository. "
+                               f"Available branches: {', '.join(sorted(branches)[:10])}"
                     )
 
                 return {"success": True, "message": "Connection successful"}
 
         except git.GitCommandError as e:
-            raise HTTPException(status_code=400, detail=f"Git error: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Git error: {redact_error(e)}")
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Connection failed: {redact_error(e)}")
 
     async def _ls_remote_with_ssh(self, repo_url: str, ssh_key: str) -> str:
         """List remote refs using SSH key."""
@@ -201,49 +262,44 @@ class GitService:
             except subprocess.CalledProcessError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid SSH key format: {e.stderr}")
             
-            git_env = os.environ.copy()
-            git_env["GIT_SSH_COMMAND"] = f'ssh -i {ssh_key_path} -o StrictHostKeyChecking=no'
-            
+            git_env = self._git_env(repo_url)
+            git_env["GIT_SSH_COMMAND"] = ssh_command(ssh_key_path)
+
             return git.cmd.Git().ls_remote(repo_url, env=git_env)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+            persist_learned_hosts()
 
     async def _ls_remote_with_pat(
         self, repo_url: str, access_token: str, username: Optional[str] = None
     ) -> str:
         """List remote refs using Personal Access Token (HTTPS)."""
         # Convert SSH URL to HTTPS if needed
-        https_url = self._convert_to_https_url(repo_url, access_token, username)
-        return git.cmd.Git().ls_remote(https_url)
+        https_url = self._https_url(repo_url)
+        return git.cmd.Git().ls_remote(https_url, env=self._pat_env(https_url, access_token, username))
 
-    def _convert_to_https_url(
-        self, repo_url: str, access_token: str, username: Optional[str] = None
-    ) -> str:
-        """Convert repo URL to HTTPS URL with embedded credentials."""
-        # If already HTTPS, inject credentials
+    @staticmethod
+    def _https_url(repo_url: str) -> str:
+        """The repo's HTTPS URL, WITHOUT credentials (git@host:path → https)."""
         if repo_url.startswith('https://'):
             parsed = urlparse(repo_url)
-            # When no explicit username is supplied, use a placeholder
-            # username so credential helpers don't interpret the bare
-            # token as a username and prompt for a password.
-            # GitHub recommends `x-access-token`; GitLab uses `oauth2`.
-            effective_username = username or "x-access-token"
-            auth = f"{effective_username}:{access_token}"
-            return f"https://{auth}@{parsed.netloc}{parsed.path}"
-        
-        # Convert SSH URL to HTTPS
-        # git@github.com:user/repo.git -> https://github.com/user/repo.git
+            # Drop any userinfo someone pasted into the saved URL.
+            return f"https://{parsed.hostname}{':' + str(parsed.port) if parsed.port else ''}{parsed.path}"
         ssh_match = re.match(r'git@([^:]+):(.+)', repo_url)
         if ssh_match:
-            host = ssh_match.group(1)
-            path = ssh_match.group(2)
-            if username:
-                auth = f"{username}:{access_token}"
-            else:
-                auth = access_token
-            return f"https://{auth}@{host}/{path}"
-        
+            return f"https://{ssh_match.group(1)}/{ssh_match.group(2)}"
         raise ValueError(f"Unsupported URL format: {repo_url}")
+
+    def _pat_env(self, https_url: str, access_token: str, username: Optional[str] = None) -> Dict[str, str]:
+        """Env for one git command authenticating with a PAT over HTTPS.
+
+        The token goes in a per-command Authorization header (``GIT_CONFIG_*``)
+        rather than the remote URL, so it is never written into the clone's
+        ``.git/config``. When no username is supplied, `x-access-token` keeps
+        git from reading the bare token as a username (GitHub's convention;
+        GitLab ignores the username for a token).
+        """
+        return with_https_auth(self._git_env(https_url), username or 'x-access-token', access_token)
 
     async def create_git_repository(
         self,
@@ -328,6 +384,8 @@ class GitService:
         repository = await self._verify_repository(db, repository_id, organization)
 
         update_data = git_repo.dict(exclude_unset=True)
+        if update_data.get("repo_url"):
+            self._check_remote(update_data["repo_url"])
 
         # Handle encrypted fields separately
         if git_repo.ssh_key:
@@ -651,7 +709,7 @@ class GitService:
         except Exception as e:
             repository.status = "failed"
             await db.commit()
-            raise HTTPException(status_code=500, detail=f"Failed to index repository: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to index repository: {redact_error(e)}")
 
     async def clone_repository(
         self,
@@ -668,19 +726,19 @@ class GitService:
             branch: Optional branch to clone (defaults to repository.branch)
         """
         target_branch = branch or repository.branch
-        
+        self._check_remote(repository.repo_url)
+
         try:
             if repository.has_access_token:
                 # Clone via HTTPS with PAT
                 pat = repository.decrypt_access_token()
-                https_url = self._convert_to_https_url(
-                    repository.repo_url, pat, repository.access_token_username
-                )
+                https_url = self._https_url(repository.repo_url)
                 repo = git.Repo.clone_from(
                     https_url,
                     clone_dir,
                     branch=target_branch,
                     depth=1,
+                    env=self._pat_env(https_url, pat, repository.access_token_username),
                     multi_options=["--single-branch", "--no-tags"]
                 )
             elif repository.has_ssh_key:
@@ -697,8 +755,8 @@ class GitService:
 
                     os.chmod(ssh_key_path, 0o600)
 
-                    git_env = os.environ.copy()
-                    git_env["GIT_SSH_COMMAND"] = f'ssh -i {ssh_key_path} -o StrictHostKeyChecking=no'
+                    git_env = self._git_env(repository.repo_url)
+                    git_env["GIT_SSH_COMMAND"] = ssh_command(ssh_key_path)
 
                     repo = git.Repo.clone_from(
                         repository.repo_url,
@@ -710,6 +768,7 @@ class GitService:
                     )
                 finally:
                     shutil.rmtree(ssh_dir, ignore_errors=True)
+                    persist_learned_hosts()
             else:
                 # Public repo - no auth
                 repo = git.Repo.clone_from(
@@ -717,12 +776,13 @@ class GitService:
                     clone_dir,
                     branch=target_branch,
                     depth=1,
+                    env=self._git_env(repository.repo_url),
                     multi_options=["--single-branch", "--no-tags"]
                 )
 
             return repo
         except git.GitCommandError as e:
-            raise HTTPException(status_code=500, detail=f"Failed to clone repository: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to clone repository: {redact_error(e)}")
 
     async def get_indexing_job_status(
         self,
@@ -838,7 +898,7 @@ class GitService:
             raise
         except Exception as e:
             logger.error(f"Failed to sync branch '{branch}': {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to sync branch: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to sync branch: {redact_error(e)}")
 
     # ==================== Push Build (BOW -> Git) ====================
 
@@ -965,20 +1025,22 @@ class GitService:
             raise
         except Exception as e:
             logger.error(f"Failed to push build {build_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to push build: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to push build: {redact_error(e)}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     async def _clone_for_push(self, repository: GitRepository, clone_dir: str) -> git.Repo:
         """Clone repository for push operations (full clone, not shallow)."""
+        self._check_remote(repository.repo_url)
         target_branch = repository.branch or "main"
         
         if repository.has_access_token:
             pat = repository.decrypt_access_token()
-            https_url = self._convert_to_https_url(
-                repository.repo_url, pat, repository.access_token_username
+            https_url = self._https_url(repository.repo_url)
+            return git.Repo.clone_from(
+                https_url, clone_dir, branch=target_branch,
+                env=self._pat_env(https_url, pat, repository.access_token_username),
             )
-            return git.Repo.clone_from(https_url, clone_dir, branch=target_branch)
         elif repository.has_ssh_key:
             ssh_dir = tempfile.mkdtemp()
             try:
@@ -992,14 +1054,15 @@ class GitService:
 
                 os.chmod(ssh_key_path, 0o600)
 
-                git_env = os.environ.copy()
-                git_env["GIT_SSH_COMMAND"] = f'ssh -i {ssh_key_path} -o StrictHostKeyChecking=no'
+                git_env = self._git_env(repository.repo_url)
+                git_env["GIT_SSH_COMMAND"] = ssh_command(ssh_key_path)
 
                 return git.Repo.clone_from(
                     repository.repo_url, clone_dir, branch=target_branch, env=git_env
                 )
             finally:
                 shutil.rmtree(ssh_dir, ignore_errors=True)
+                persist_learned_hosts()
         else:
             raise HTTPException(status_code=400, detail="No credentials configured for push")
 
@@ -1012,8 +1075,13 @@ class GitService:
         - These are feature branches, not protected branches
         """
         if repository.has_access_token:
-            # PAT is already embedded in the remote URL from clone
-            repo.git.push('origin', branch_name, '--set-upstream', '--force')
+            # The clone's remote URL carries no credentials; the PAT rides in a
+            # per-command header. The host is re-checked (and re-pinned) here.
+            push_url = next(repo.remote('origin').urls)
+            env = self._pat_env(
+                push_url, repository.decrypt_access_token(), repository.access_token_username
+            )
+            repo.git.push('origin', branch_name, '--set-upstream', '--force', env=env)
         elif repository.has_ssh_key:
             ssh_dir = tempfile.mkdtemp()
             try:
@@ -1027,12 +1095,13 @@ class GitService:
 
                 os.chmod(ssh_key_path, 0o600)
 
-                git_env = os.environ.copy()
-                git_env["GIT_SSH_COMMAND"] = f'ssh -i {ssh_key_path} -o StrictHostKeyChecking=no'
+                git_env = self._git_env(repository.repo_url)
+                git_env["GIT_SSH_COMMAND"] = ssh_command(ssh_key_path)
 
                 repo.git.push('origin', branch_name, '--set-upstream', '--force', env=git_env)
             finally:
                 shutil.rmtree(ssh_dir, ignore_errors=True)
+                persist_learned_hosts()
 
     async def _resolve_reference_names(
         self, db: AsyncSession, references_json: list
@@ -1075,6 +1144,78 @@ class GitService:
         
         return simple_refs
 
+    # Folders written by the OLD by-category layout. Swept once (on migration,
+    # when no manifest exists yet) and reserved so an agent named e.g. "General"
+    # can never own one and have the sweep delete notes left in it.
+    _LEGACY_DIRS = ("general", "code", "data-modeling", "visualizations", "dashboard", "system")
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        """Filesystem-safe slug: keep word chars (Unicode-aware), spaces -> '-', lower."""
+        return re.sub(r'[^\w\s-]', '', value or '').strip().replace(' ', '-').lower()
+
+    @staticmethod
+    def _is_within(path: Path, root: Path) -> bool:
+        """True iff `path` resolves to a location inside `root` - no escape via an
+        absolute entry, '..', or a symlink. Guards the prune so a crafted manifest
+        can never make the server delete a file outside bow/."""
+        try:
+            return path.resolve().is_relative_to(root.resolve())
+        except (OSError, ValueError):
+            return False
+
+    async def _resolve_agent_folders(
+        self, db: AsyncSession, organization_id: str, used_ds_ids: set
+    ) -> Tuple[Dict[str, str], Dict[str, str]]:
+        """
+        Resolve the agents (data sources) referenced by a build into a stable
+        folder name per agent.
+
+        Returns (ds_id_to_name, ds_folder):
+        - ds_id_to_name: {data_source_id: "Original Agent Name"} - live, non-deleted
+        - ds_folder: {data_source_id: "safe-folder-name"}
+
+        Folder names are derived from the agent name and are STABLE across pushes:
+        collisions are resolved against every agent in the org (not just those in
+        this build), so an unchanged agent is never renamed because another
+        same-named agent appeared later. Reserved names ("shared"/"global") and
+        genuine duplicates get a short id suffix. Soft-deleted agents are excluded
+        so a deleted agent never claims a folder or an `agents:` entry.
+        """
+        ds_id_to_name: Dict[str, str] = {}
+        base_names: Dict[str, str] = {}
+
+        stmt = select(DataSource.id, DataSource.name).where(
+            DataSource.organization_id == organization_id,
+            DataSource.deleted_at.is_(None),
+        )
+        result = await db.execute(stmt)
+        for ds_id, ds_name in result:
+            ds_id_to_name[ds_id] = ds_name
+            base_names[ds_id] = self._slugify(ds_name) or ds_id
+
+        # Count collisions across the whole org so folder names stay stable
+        # push-to-push, not just within the set of agents in this build. The
+        # legacy category names are reserved too, so an agent can never own one.
+        reserved = {"shared", "global", *self._LEGACY_DIRS}
+        name_counts: Dict[str, int] = {}
+        for safe in base_names.values():
+            name_counts[safe] = name_counts.get(safe, 0) + 1
+
+        ds_folder: Dict[str, str] = {}
+        for ds_id, safe in base_names.items():
+            if name_counts[safe] > 1 or safe in reserved:
+                ds_folder[ds_id] = f"{safe}-{ds_id[:8]}"
+            else:
+                ds_folder[ds_id] = safe
+
+        # Keep only the agents this build references.
+        if used_ds_ids:
+            ds_id_to_name = {k: v for k, v in ds_id_to_name.items() if k in used_ds_ids}
+            ds_folder = {k: v for k, v in ds_folder.items() if k in used_ds_ids}
+
+        return ds_id_to_name, ds_folder
+
     async def _write_build_to_repo(
         self, db: AsyncSession, build: InstructionBuild, repo_path: str
     ):
@@ -1084,12 +1225,44 @@ class GitService:
         Path logic:
         - Linked git instructions (source_sync_enabled=True): SKIP, already in Git
         - Unlinked git instructions (source_sync_enabled=False): Write to original source_file_path
-        - User-created instructions (no source_file_path): Write to bow/{category}/{filename}.md
+        - User-created instructions (no source_file_path):
+          - linked to one agent   -> bow/{agent}/{filename}.md
+          - linked to no agent     -> bow/global/{filename}.md (applies to all)
+          - linked to several      -> bow/shared/{filename}.md, with the agent
+            names recorded in the file's `agents:` frontmatter
         """
         from app.services.build_service import BuildService
-        
+
         build_service = BuildService()
         contents = await build_service.get_build_contents(db, build.id)
+        # Deterministic order (get_build_contents has no ORDER BY) so which of two
+        # same-title instructions gets the id suffix is stable across pushes.
+        contents = sorted(contents, key=lambda c: (c.instruction.id if c.instruction else ""))
+
+        # Organize user-created instructions by agent (data source). Pin the
+        # placement to each version's snapshot (data_source_ids), not the live
+        # associations, so old / rollback builds keep the scope they were cut
+        # with. Resolve agent names + stable folder names once up front.
+        instr_to_ds_ids: Dict[str, List[str]] = {}
+        used_ds_ids: set = set()
+        for content in contents:
+            if not (content.instruction_version and content.instruction):
+                continue
+            ids = content.instruction_version.data_source_ids or []
+            instr_to_ds_ids[content.instruction.id] = list(ids)
+            used_ds_ids.update(ids)
+        ds_id_to_name, ds_folder = await self._resolve_agent_folders(
+            db, build.organization_id, used_ds_ids
+        )
+
+        bow_root = Path(repo_path) / "bow"
+        # Paths this push writes under bow/ (repo-relative, posix) - used both as
+        # the next manifest and to decide what the prune may remove.
+        written_rel: set = set()
+        # Linked-git files to protect from the prune even if not (re)written.
+        keep_paths: set = set()
+        # Filenames already used per folder, to avoid same-title overwrites.
+        used_filenames: Dict[str, set] = {}
 
         written_count = 0
         skipped_linked = 0
@@ -1103,71 +1276,140 @@ class GitService:
                 skipped_no_version += 1
                 continue
 
-            # RULE 1: Skip linked git instructions - they're already in Git
+            # RULE 1: Skip linked git instructions - they're already in Git.
+            # Preserve their file so the cleanup below never prunes it.
             if instruction.source_type == 'git' and instruction.source_sync_enabled:
                 logger.debug(f"Skipping linked git instruction: {instruction.source_file_path}")
+                if instruction.source_file_path:
+                    keep_paths.add((Path(repo_path) / instruction.source_file_path).resolve())
                 skipped_linked += 1
                 continue
             
+            # agents are written to frontmatter only for instructions shared
+            # across multiple agents (a single agent is implied by its folder).
+            agent_names: List[str] = []
+
             # RULE 2: Unlinked git instruction - write to original path (preserve extension)
             if instruction.source_file_path:
                 filepath = Path(repo_path) / instruction.source_file_path
                 filepath.parent.mkdir(parents=True, exist_ok=True)
             else:
-                # RULE 3: User-created instruction - write to bow/{category}/{filename}.md
-                category = instruction.category or 'general'
-                
-                # Map category names to directory names
-                category_dir_map = {
-                    'code_gen': 'code',
-                    'data_modeling': 'data-modeling',
-                    'visualizations': 'visualizations',
-                    'dashboard': 'dashboard',
-                    'system': 'system',
-                    'general': 'general',
-                }
-                safe_category = category_dir_map.get(category, category)
-                # Fallback sanitization for unknown categories
-                safe_category = re.sub(r'[^\w\s-]', '', safe_category).strip().replace(' ', '-').lower()
-                if not safe_category:
-                    safe_category = 'general'
-                
-                bow_dir = Path(repo_path) / "bow" / safe_category
+                # RULE 3: User-created instruction - organize by agent (data source).
+                # Keep only agents that still resolve (drops soft-deleted / unknown).
+                # One agent -> that agent's folder; none (applies to all, or every
+                # linked agent was deleted) -> "global"; several -> "shared", with
+                # the agent names recorded in the frontmatter.
+                ds_ids = [d for d in instr_to_ds_ids.get(instruction.id, []) if d in ds_folder]
+                if len(ds_ids) == 1:
+                    folder = ds_folder[ds_ids[0]]
+                elif len(ds_ids) == 0:
+                    folder = 'global'
+                else:
+                    folder = 'shared'
+                    agent_names = sorted(ds_id_to_name[d] for d in ds_ids)
+
+                bow_dir = bow_root / folder
                 bow_dir.mkdir(parents=True, exist_ok=True)
-                
-                title = version.title or instruction.title or str(instruction.id)
-                safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '-').lower()
-                if not safe_title:
-                    safe_title = str(instruction.id)
-                
+
+                safe_title = self._slugify(version.title or instruction.title or '') or str(instruction.id)
+                # Disambiguate same-title instructions in one folder so the later
+                # one does not silently overwrite the earlier one.
+                folder_used = used_filenames.setdefault(folder, set())
                 filename = f"{safe_title}.md"
+                if filename in folder_used:
+                    filename = f"{safe_title}-{instruction.id[:8]}.md"
+                folder_used.add(filename)
                 filepath = bow_dir / filename
 
-            # Only write references to frontmatter (if present)
-            # status, load_mode, category are BOW-only metadata - not written to git
-            # This avoids noisy diffs and lets git be the source of truth for content
+            # Frontmatter carries the agents (for shared instructions) and the
+            # table references. status, load_mode, category stay BOW-only
+            # metadata - not written to git - to avoid noisy diffs and let git
+            # be the source of truth for content.
             simple_refs = []
             if version.references_json and isinstance(version.references_json, list):
                 simple_refs = await self._resolve_reference_names(db, version.references_json)
 
-            # Write file
+            # Emit frontmatter via yaml.safe_dump so names/refs with YAML-special
+            # characters (":", leading "-"/"#", "777", "yes", ...) stay valid and
+            # re-parse cleanly on sync-back.
+            frontmatter: Dict[str, Any] = {}
+            if agent_names:
+                frontmatter['agents'] = agent_names
+            if simple_refs:
+                frontmatter['references'] = simple_refs
+
             with open(filepath, 'w') as f:
-                # Only write frontmatter block if there are references
-                if simple_refs:
+                if frontmatter:
                     f.write("---\n")
-                    f.write("references:\n")
-                    for ref in simple_refs:
-                        f.write(f"  - {ref}\n")
+                    f.write(yaml.safe_dump(
+                        frontmatter,
+                        default_flow_style=False,
+                        allow_unicode=True,
+                        sort_keys=False,
+                    ))
                     f.write("---\n\n")
-                
                 if version.title:
                     f.write(f"# {version.title}\n\n")
                 f.write(version.text or "")
 
+            if bow_root in filepath.parents:
+                written_rel.add(filepath.relative_to(repo_path).as_posix())
             written_count += 1
             logger.debug(f"Wrote instruction to {filepath}")
-        
-        logger.info(f"Push to git: wrote {written_count} file(s), skipped {skipped_linked} linked, {skipped_no_version} without version")
+
+        # Prune only files BOW itself wrote, so hand-authored notes/READMEs and
+        # Git-owned files under bow/ are never deleted. Candidates come from the
+        # previous push's manifest; the legacy by-category folders are swept only
+        # once, when no manifest exists yet (a one-time migration from the old
+        # layout). Every candidate must resolve to a real file under bow/ - a
+        # manifest entry that is absolute or escapes bow/ is ignored, so a crafted
+        # repo can never make the server delete a file elsewhere.
+        manifest_path = bow_root / ".bow-manifest.json"
+        candidates: set = set()
+        if manifest_path.exists():
+            try:
+                candidates.update(json.loads(manifest_path.read_text()).get("files", []))
+            except (ValueError, OSError):
+                candidates = set()
+        else:
+            # First push on this repo: migrate the old category layout once.
+            for name in self._LEGACY_DIRS:
+                legacy_dir = bow_root / name
+                if legacy_dir.is_dir() and not legacy_dir.is_symlink():
+                    for path in legacy_dir.rglob("*.md"):
+                        candidates.add(path.relative_to(repo_path).as_posix())
+
+        pruned_count = 0
+        for rel in candidates:
+            if rel in written_rel:
+                continue
+            path = Path(repo_path) / rel
+            if not self._is_within(path, bow_root):
+                continue  # absolute / escaping entry - never touch it
+            if path.resolve() in keep_paths:
+                continue
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+                pruned_count += 1
+
+        # Record what this push wrote, for the next push's prune - and to mark the
+        # one-time legacy migration as done even when this build wrote nothing.
+        bow_root.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps({"files": sorted(written_rel)}, ensure_ascii=False, indent=2)
+        )
+
+        # Drop directories the pruning left empty.
+        if bow_root.exists():
+            for dir_path in sorted(
+                (p for p in bow_root.rglob("*") if p.is_dir()),
+                key=lambda p: len(p.parts),
+                reverse=True,
+            ):
+                if not any(dir_path.iterdir()):
+                    dir_path.rmdir()
+
+        logger.info(f"Push to git: wrote {written_count} file(s), pruned {pruned_count} stale, skipped {skipped_linked} linked, {skipped_no_version} without version")
 
     # ==================== PR Creation ====================
 
@@ -1262,7 +1504,8 @@ class GitService:
             "base": target_branch,
         }
 
-        async with httpx.AsyncClient() as client:
+        # custom_host is admin-configured: validated + pinned per request.
+        async with pinned_async_client(Policy.ADMIN) as client:
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code == 201:
                 return response.json().get("html_url")
@@ -1303,7 +1546,8 @@ class GitService:
             "target_branch": target_branch,
         }
 
-        async with httpx.AsyncClient() as client:
+        # custom_host is admin-configured: validated + pinned per request.
+        async with pinned_async_client(Policy.ADMIN) as client:
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code == 201:
                 return response.json().get("web_url")
@@ -1366,7 +1610,8 @@ class GitService:
                 "destination": {"branch": {"name": target_branch}},
             }
 
-        async with httpx.AsyncClient() as client:
+        # custom_host is admin-configured: validated + pinned per request.
+        async with pinned_async_client(Policy.ADMIN) as client:
             response = await client.post(url, json=payload, headers=headers)
             if response.status_code in (200, 201):
                 data = response.json()

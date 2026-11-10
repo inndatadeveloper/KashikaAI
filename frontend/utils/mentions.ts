@@ -249,6 +249,9 @@ const GROUP_TYPE_MAP: Record<string, string> = {
   'FILES': 'file',
   'ENTITIES': 'entity',
   'CONNECTION TOOLS': 'connection_tool',
+  // Without this, an instruction mention fell through to 'entity' and the chip
+  // drew the table glyph — an instruction is not a table.
+  'INSTRUCTIONS': 'instruction',
 }
 
 export interface PromptMentionRef {
@@ -256,6 +259,9 @@ export interface PromptMentionRef {
   type: string
   name: string
   data_source_type?: string
+  // An AGENT mention's resolved icon. Tables carry no agent-level token and
+  // keep rendering from data_source_type, which is their connection's.
+  data_source_icon_token?: string | null
 }
 
 /**
@@ -266,7 +272,17 @@ export interface PromptMentionRef {
  */
 export function promptMentionsToRefs(
   mentions?: Array<{ name: string; items: any[] }>,
+  /** Current agent id -> icon_token. A prompt's mentions are a snapshot taken
+   *  when the message was sent, so a chip would keep showing the icon the agent
+   *  had then; the chip names a live agent, so prefer the agent's icon now. */
+  agentIconTokens?: Map<string, string | null | undefined> | Record<string, string | null | undefined>,
 ): PromptMentionRef[] {
+  const currentToken = (id: string) => {
+    if (!agentIconTokens) return undefined
+    return agentIconTokens instanceof Map
+      ? agentIconTokens.get(id)
+      : agentIconTokens[id]
+  }
   if (!mentions?.length) return []
   const refs: PromptMentionRef[] = []
   for (const group of mentions) {
@@ -287,9 +303,38 @@ export function promptMentionsToRefs(
         // data source's type); include it so the chip renders the correct
         // data-source icon instead of the generic fallback glyph.
         data_source_type: item.connection_type || item.data_source_type || item.icon_type || undefined,
+        // An agent mention resolves to the same icon the agents explorer and the
+        // data tools draw for it; DataSourceIcon prefers this over the type above.
+        data_source_icon_token:
+          type === 'data_source'
+            ? (currentToken(item.id) ?? item.icon_token ?? undefined)
+            : undefined,
         name,
       })
     }
   }
   return refs
+}
+
+// ---------------------------------------------------------------------------
+// The @-token being typed in the composer
+// ---------------------------------------------------------------------------
+
+/**
+ * The query text of the @-token the caret sits in: what stands between the `@`
+ * at `atIndex` and the caret.
+ *
+ * The caret bound is the whole point. Slicing to the end of the field instead
+ * pulls the rest of the sentence into the query, so an `@` typed mid-line —
+ * "load your suggestions for @mix| so I can review it" — searches for
+ * "mix so I can review it" and the menu can only say "No results found".
+ */
+export function activeMentionQuery(text: string, atIndex: number, caret: number): string {
+  if (atIndex < 0) return ''
+  const start = atIndex + 1
+  const src = text || ''
+  // A caret behind the `@` means the token is no longer being typed; a caret
+  // past the text (stale measurement) falls back to the rest of the field.
+  if (caret < start) return ''
+  return src.slice(start, Math.min(Math.max(caret, start), src.length))
 }

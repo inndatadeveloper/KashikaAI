@@ -12,8 +12,9 @@ is rejected the same way a path escaping the root is.
 """
 from __future__ import annotations
 
+import base64
 import re
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from app.utils.json_sanitize import sanitize_utf8
 
@@ -346,3 +347,211 @@ class GlobScopeError(ValueError):
     include-globs. A ValueError subclass so existing `except ValueError` paths
     in the tools surface it as a clean error, while callers that care can
     distinguish scope-denials from other resolution failures."""
+
+
+class ScopeEscapeError(GlobScopeError):
+    """The requested path or key climbs OUT of the connection's root / prefix
+    (`..`, an absolute path). A GlobScopeError so every caller that audits
+    scope denials (read_file, attach_file, write_file, the preview endpoint)
+    audits this one too — it is the more hostile of the two, and used to
+    surface as a plain ValueError that nobody audited."""
+
+
+class FileTooLargeError(ValueError):
+    """The file exceeds the caller's byte budget. Raised from the size the
+    source reports, BEFORE downloading, so an oversize file is never pulled
+    into memory just to be rejected."""
+
+
+def byte_limit(*caps: Optional[int]) -> Optional[int]:
+    """The tightest of several byte caps; None/0 means "no cap"."""
+    real = [c for c in caps if c]
+    return min(real) if real else None
+
+
+# Extra bytes a connector fetches past a requested window so the character
+# straddling the window's end can be completed instead of split (a UTF-8
+# sequence is at most 4 bytes, so at most 3 of them lie past the boundary).
+UTF8_SLACK = 3
+
+
+def utf8_window_bounds(data: bytes, offset: int, window: int) -> tuple[int, int]:
+    """[start, end) within `data` (fetched at `offset`, at least `window`
+    bytes when available plus UTF8_SLACK) that covers the requested window
+    without splitting a UTF-8 character at either edge.
+
+    - `start` skips the continuation bytes of a character that began BEFORE
+      `offset` (only when offset > 0 — at the file start they are just
+      invalid bytes). Those bytes belong to the window that holds the
+      character's lead byte, which is where they are returned.
+    - `end` is the requested end, pushed forward over the continuation bytes
+      of the character that started before it, so that character is returned
+      whole here rather than split across two windows.
+
+    Together the two rules make windows at a fixed stride (0, L, 2L, …)
+    concatenate exactly to the file: what one window gains at its end, the
+    next one gives up at its start.
+    """
+    n = len(data)
+    start = 0
+    if offset > 0:
+        while start < n and start < UTF8_SLACK and (data[start] & 0xC0) == 0x80:
+            start += 1
+    end = min(window, n)
+    while end < n and end - window < UTF8_SLACK and (data[end] & 0xC0) == 0x80:
+        end += 1
+    return start, end
+
+
+def byte_window(data: bytes, offset: int, total: int, window: int) -> dict[str, Any]:
+    """The windowed-read result for the bytes a connector fetched at `offset`
+    for a `window`-byte request (`data` may carry up to UTF8_SLACK more).
+
+    The contract every file source shares, so the agent pages the same way
+    across all of them: the window is the requested byte range, adjusted by
+    at most 3 bytes at each edge so a multi-byte character is never split —
+    the character straddling the end is returned whole, and the tail of a
+    character straddling the start is left to the window that holds its lead
+    byte. `offset`/`length` report the range actually returned and
+    `next_cursor` is the first byte NOT returned (`offset + length`).
+    Chaining `next_cursor` is lossless, and independent windows at a fixed
+    stride (0, L, 2L, …) are contiguous. An earlier version snapped text
+    windows to the last newline, which made parallel fixed-stride reads
+    silently skip the bytes between one window's snap point and the next
+    window's start.
+
+    A window that decodes as UTF-8 arrives as text; anything else (binary
+    data) arrives base64-encoded as exactly the requested range, so no byte is
+    ever lost or replaced.
+    """
+    raw = data[:window]
+    raw_end = offset + len(raw)
+
+    start, end = utf8_window_bounds(data, offset, window)
+    text = None
+    if end > start:
+        try:
+            text = data[start:end].decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+
+    if text is not None:
+        begin = offset + start
+        stop = offset + end
+        return {
+            "content": text,
+            "encoding": "text",
+            "offset": begin,
+            "length": end - start,
+            "next_cursor": stop,
+            "total_size": total,
+            "eof": stop >= total,
+        }
+    return {
+        "content": base64.b64encode(raw).decode("ascii"),
+        "encoding": "base64",
+        "offset": offset,
+        "length": len(raw),
+        "next_cursor": raw_end,
+        "total_size": total,
+        "eof": raw_end >= total,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Excel workbooks
+# ---------------------------------------------------------------------------
+#
+# Every file connector used to call `pd.read_excel(..., sheet_name=sheet or 0)`
+# on its own. That reads ONE sheet and throws away the workbook's sheet list,
+# so the model was handed the first sheet as CSV with no way to know the file
+# had others — it then told users "I can't see the sheet names". One reader
+# here keeps every connector aligned: it returns the requested sheet and
+# records the workbook's sheet names on `df.attrs`, which the read_file tool
+# surfaces to the model.
+
+EXCEL_EXTS = ("xlsx", "xls", "xlsm")
+
+# Keys on DataFrame.attrs. Read by render_file_payload (ai/tools).
+SHEET_NAMES_ATTR = "sheet_names"
+SHEET_ATTR = "sheet"
+
+
+class SheetNotFoundError(ValueError):
+    """The requested sheet is not in the workbook. The message lists the
+    sheets that ARE there, so the model can retry with a real name."""
+
+
+def trim_to_data(df):
+    """Excel files exported from BI tools / users often have leading blank
+    rows and blank columns before the actual table starts. Pandas with
+    `header=0` then treats row 1 (empty) as the column names and returns
+    a 0-row frame — even though the sheet has 10+ rows of real data.
+
+    Drop fully-empty rows and columns, then promote the first remaining row
+    to header. Idempotent for well-formed sheets (no leading blanks → no-op).
+    """
+    import pandas as pd
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.dropna(how="all").dropna(axis=1, how="all")
+    if df.empty:
+        return pd.DataFrame()
+    header = df.iloc[0].tolist()
+    body = df.iloc[1:].reset_index(drop=True)
+    body.columns = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(header)]
+    return body
+
+
+def pick_sheet(sheet_names: List[str], sheet: Optional[str]) -> str:
+    """Resolve the model's `sheet` argument to a real sheet name.
+
+    Empty → the first sheet. Exact match first, then a forgiving match
+    (case / surrounding whitespace), since models retype names. Anything else
+    raises SheetNotFoundError naming the real sheets.
+    """
+    if not sheet_names:
+        raise SheetNotFoundError("The workbook has no sheets.")
+    if sheet is None or str(sheet).strip() == "":
+        return sheet_names[0]
+    wanted = str(sheet)
+    if wanted in sheet_names:
+        return wanted
+    folded = wanted.strip().casefold()
+    for name in sheet_names:
+        if name.strip().casefold() == folded:
+            return name
+    listed = ", ".join(f'"{n}"' for n in sheet_names)
+    raise SheetNotFoundError(
+        f'Sheet "{wanted}" not found. This workbook has {len(sheet_names)} '
+        f"sheet(s): {listed}. Pass one of these names as `sheet`."
+    )
+
+
+def tag_sheets(df, sheet_names: List[str], sheet: str):
+    """Record the workbook's sheet list and the sheet shown on `df`."""
+    df.attrs[SHEET_NAMES_ATTR] = list(sheet_names)
+    df.attrs[SHEET_ATTR] = sheet
+    return df
+
+
+def read_excel_sheet(content: bytes, sheet: Optional[str] = None, *, trim: bool = True):
+    """Read one sheet of an Excel workbook and tag it with the sheet list.
+
+    ``trim=True`` reads headerless and promotes the first non-blank row (see
+    trim_to_data); ``trim=False`` keeps pandas' default header=0, for the
+    connectors that always read that way.
+    """
+    import io
+    import pandas as pd
+
+    with pd.ExcelFile(io.BytesIO(content)) as book:
+        names = [str(n) for n in book.sheet_names]
+        target = pick_sheet(names, sheet)
+        # book.sheet_names may hold non-str names (numeric-looking titles);
+        # parse by position so the str() above can't miss.
+        df = book.parse(names.index(target), header=None if trim else 0)
+    if trim:
+        df = trim_to_data(df)
+    return tag_sheets(df, names, target)

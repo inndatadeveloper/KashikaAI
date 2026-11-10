@@ -7,20 +7,20 @@
           <h3 class="text-sm font-semibold text-gray-900 dark:text-white truncate">
             {{ note?.title || $t('tools.createNote.untitled') }}
           </h3>
-          <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-950 text-amber-600 dark:text-amber-400 flex-shrink-0">
+          <span class="text-2xs px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-950 text-amber-600 dark:text-amber-400 flex-shrink-0">
             {{ note?.source === 'user' ? $t('notes.byYou') : $t('notes.byAgent') }}
           </span>
         </div>
-        <button @click="isOpen = false" class="text-gray-400 hover:text-gray-600 flex-shrink-0">
+        <button @click="isOpen = false" class="text-ink-muted hover:text-gray-600 flex-shrink-0">
           <Icon name="heroicons:x-mark" class="w-4 h-4" />
         </button>
       </div>
 
-      <div dir="auto" class="note-markdown text-sm text-gray-700 dark:text-gray-300 max-h-[60vh] overflow-y-auto">
+      <div class="note-markdown text-sm text-gray-700 dark:text-gray-300 max-h-[60vh] overflow-y-auto">
         <MarkdownRender v-if="note?.content" :content="note.content" :final="true" :typewriter="false" :render-code-blocks-as-pre="true" />
       </div>
 
-      <div class="mt-4 pt-3 border-t border-gray-100 dark:border-gray-800 text-[11px] text-gray-400">
+      <div class="mt-4 pt-3 border-t border-gray-100 dark:border-gray-800 text-2xs text-ink-muted">
         {{ $t('notes.updated') }} {{ formatTime(note?.updated_at) }}
       </div>
     </div>
@@ -55,7 +55,7 @@ function formatTime(ts?: string): string {
 .note-markdown :deep(h2) { font-size: 0.875rem; font-weight: 600; margin: 0.8rem 0 0.3rem; }
 .note-markdown :deep(h3) { font-size: 0.8125rem; font-weight: 600; margin: 0.7rem 0 0.25rem; color: rgb(75 85 99); }
 .note-markdown :deep(h1:first-child), .note-markdown :deep(h2:first-child), .note-markdown :deep(h3:first-child) { margin-top: 0; }
-:global(.dark) .note-markdown :deep(h3) { color: rgb(156 163 175); }
+.dark .note-markdown :deep(h3) { color: rgb(156 163 175); }
 .note-markdown :deep(code) { font-size: 0.8125rem; background: rgb(243 244 246); border-radius: 0.25rem; padding: 0.05rem 0.3rem; }
-:global(.dark) .note-markdown :deep(code) { background: rgb(31 41 55); }
+.dark .note-markdown :deep(code) { background: rgb(31 41 55); }
 </style>

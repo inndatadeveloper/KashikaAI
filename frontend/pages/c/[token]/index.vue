@@ -9,7 +9,7 @@
         <!-- Access error state -->
         <div v-else-if="accessError" class="flex-1 flex items-center justify-center">
             <div class="text-center max-w-md mx-auto px-6">
-                <Icon :name="accessError === 'login' ? 'heroicons:lock-closed' : 'heroicons:shield-exclamation'" class="w-12 h-12 text-gray-400 mx-auto mb-4" />
+                <Icon :name="accessError === 'login' ? 'heroicons:lock-closed' : 'heroicons:shield-exclamation'" class="w-12 h-12 text-ink-muted mx-auto mb-4" />
                 <h2 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">
                     {{ accessError === 'login' ? 'Sign in required' : 'Access denied' }}
                 </h2>
@@ -34,7 +34,7 @@
             <div class="text-center">
                 <Icon name="heroicons:exclamation-circle" class="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
                 <h1 class="text-lg font-medium text-gray-700 dark:text-gray-300">Conversation not found</h1>
-                <p class="text-sm text-gray-400 mt-1">This conversation may have been unshared or doesn't exist.</p>
+                <p class="text-sm text-ink-muted mt-1">This conversation may have been unshared or doesn't exist.</p>
             </div>
         </div>
 
@@ -42,17 +42,17 @@
         <template v-else>
             <!-- Minimal header -->
             <header class="flex-none border-b border-gray-100 dark:border-gray-800 py-5 px-4 bg-white dark:bg-gray-900 z-10">
-                <div class="max-w-2xl mx-auto flex items-start justify-between">
+                <div class="max-w-chat mx-auto flex items-start justify-between">
                     <div>
-                        <h1 class="text-base font-medium text-gray-900 dark:text-white">{{ conversation.title || 'Untitled' }}</h1>
-                        <p class="text-xs text-gray-400 mt-1">by {{ conversation.user_name }} · {{ formatDate(conversation.created_at) }}</p>
+                        <h1 v-text-dir class="text-base font-medium text-gray-900 dark:text-white">{{ conversation.title || 'Untitled' }}</h1>
+                        <p class="text-xs text-ink-muted mt-1">by {{ conversation.user_name }} · {{ formatDate(conversation.created_at) }}</p>
                     </div>
                     <!-- Fork button -->
                     <button
                         v-if="forkEligibility?.can_fork"
                         @click="handleFork"
                         :disabled="isForking"
-                        class="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 transition-colors disabled:opacity-50 mt-1"
+                        class="flex items-center gap-1 text-xs text-ink-muted hover:text-gray-600 transition-colors disabled:opacity-50 mt-1"
                     >
                         <Icon name="heroicons:arrow-path-rounded-square" class="w-3.5 h-3.5" />
                         <span>{{ isForking ? 'Forking...' : 'Fork' }}</span>
@@ -68,25 +68,25 @@
             >
                 <!-- Loading more indicator -->
                 <div v-if="isLoadingMore" class="flex justify-center py-3 mb-4">
-                    <Spinner class="w-4 h-4 text-gray-400" />
-                    <span class="text-xs text-gray-400 ms-2">Loading older messages…</span>
+                    <Spinner class="w-4 h-4 text-ink-muted" />
+                    <span class="text-xs text-ink-muted ms-2">Loading older messages…</span>
                 </div>
 
                 <!-- Load more button (shown when there's more to load) -->
                 <div v-else-if="hasMore" class="flex justify-center py-3 mb-4">
                     <button
                         @click="loadPreviousCompletions"
-                        class="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                        class="text-xs text-ink-muted hover:text-gray-600 transition-colors"
                     >
                         ↑ Load older messages
                     </button>
                 </div>
 
-                <ul class="max-w-2xl mx-auto space-y-4">
-                    <li v-for="m in visibleCompletions" :key="m.id" class="text-gray-700 dark:text-gray-300 text-sm">
+                <ul class="max-w-chat mx-auto space-y-4">
+                    <li v-for="m in visibleCompletions" :key="m.id" class="text-gray-700 dark:text-gray-300 text-chat">
                         <!-- Scheduled prompt indicator -->
                         <div v-if="m.scheduled_prompt_id && m.role === 'user'" class="mb-2">
-                            <div class="flex items-center gap-1.5 px-3 py-2 text-xs text-gray-400 rounded-lg border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
+                            <div class="flex items-center gap-1.5 px-3 py-2 text-xs text-ink-muted rounded-lg border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
                                 <Icon name="heroicons-clock" class="w-3.5 h-3.5" />
                                 <span class="font-medium text-gray-500 dark:text-gray-400">Scheduled run</span>
                                 <span class="text-gray-300 dark:text-gray-600">{{ formatDateTime(m.created_at) }}</span>
@@ -97,11 +97,13 @@
                             <template v-if="m.role === 'user'">
                                 <div class="flex items-start gap-2 max-w-xl w-full mb-4">
                                     <div class="flex-1 flex justify-end">
-                                        <div class="inline-block rounded-xl px-3 py-2 bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-white text-start" dir="auto">
+                                        <div class="inline-block rounded-xl px-3 py-2 bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-white text-start" :dir="promptDir(m.prompt?.content)">
                                             <div v-if="m.prompt?.content" class="pt-1 markdown-wrapper">
+                                                <PolishRequestCard v-if="parsePolishPrompt(m.prompt.content)" :request="parsePolishPrompt(m.prompt.content)!" />
                                                 <InstructionText
+                                                    v-else
                                                     :text="m.prompt.content"
-                                                    :references="promptMentionsToRefs(m.prompt.mentions)"
+                                                    :references="promptMentionsToRefs(m.prompt.mentions, agentIconTokens)"
                                                     :prose="true"
                                                 />
                                             </div>
@@ -122,7 +124,7 @@
                                     <div class="h-7 w-7 flex font-bold items-center justify-center text-xs rounded-lg bg-contain bg-center bg-no-repeat" style="background-image: url('/assets/logo-128.png')">
                                     </div>
                                 </div>
-                                <div class="w-full md:ms-4 max-w-2xl">
+                                <div class="flex-1 min-w-0 md:ms-4">
                                     <div>
                                         <!-- Render each completion block -->
                                         <div v-for="block in timelineBlocks(m)" :key="block.id">
@@ -135,11 +137,15 @@
                                                     @toggle="toggleGroup(groupHeaderFor(m, block).id)"
                                                 />
                                             </Transition>
+                                            <!-- Keep prose visible when only this verification step is collapsed. -->
+                                            <div v-if="isBlockFolded(m, block) && (block.tool_execution?.arguments_json?._verification_group_id || block.tool_execution?.result_json?.verification_group_id || block.tool_execution?.arguments_json?.artifact_id) && (block.content || block.plan_decision?.final_answer || block.plan_decision?.assistant)" class="block-content markdown-wrapper text-ink dark:text-gray-100" dir="auto" :data-dir-hint="replyDirHints.get(String(m.id))">
+                                                <MarkdownRender :content="block.content || block.plan_decision?.final_answer || block.plan_decision?.assistant || ''" :final="true" :typewriter="false" :render-code-blocks-as-pre="true" class="markdown-content" />
+                                            </div>
                                             <div v-show="!isBlockFolded(m, block)">
                                             <!-- 1. Thinking box (reasoning) -->
                                             <div v-if="block.plan_decision?.reasoning || block.reasoning || block.status === 'stopped'" class="thinking-box">
                                                 <div class="thinking-header" @click="toggleReasoning(block.id)">
-                                                    <Icon :name="isReasoningCollapsed(block.id) ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-4 h-4 text-gray-400 rtl-flip" />
+                                                    <Icon :name="isReasoningCollapsed(block.id) ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-4 h-4 text-ink-muted rtl-flip" />
                                                     <span v-if="hasCompletedContent(block) || block.tool_execution" class="ms-1">
                                                         {{ getThoughtProcessLabel(block) }}
                                                     </span>
@@ -159,14 +165,14 @@
                                                             />
                                                         </template>
                                                         <template v-else-if="block.status === 'stopped'">
-                                                            <div class="text-gray-400 italic">Generation was stopped before completion.</div>
+                                                            <div class="text-ink-muted italic">Generation was stopped before completion.</div>
                                                         </template>
                                                     </div>
                                                 </Transition>
                                             </div>
 
                                             <!-- 2. Block content - assistant message -->
-                                            <div v-if="(block.content || block.plan_decision?.assistant) && !block.plan_decision?.final_answer && block.status !== 'error'" class="block-content markdown-wrapper" dir="auto">
+                                            <div v-if="(block.content || block.plan_decision?.assistant) && !block.plan_decision?.final_answer && block.status !== 'error'" class="block-content markdown-wrapper text-ink dark:text-gray-100" dir="auto" :data-dir-hint="replyDirHints.get(String(m.id))">
                                                 <MarkdownRender
                                                     :content="block.content || block.plan_decision?.assistant || ''"
                                                     :final="true"
@@ -196,7 +202,7 @@
                                                         <span class="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleToolDetails(block.tool_execution.id)">
                                                             {{ block.tool_execution.tool_name }}{{ toolActionLabel(block.tool_execution) }} ({{ block.tool_execution.status }})
                                                         </span>
-                                                        <div v-if="isToolDetailsExpanded(block.tool_execution.id)" class="ms-2 mt-1 text-xs text-gray-400 bg-gray-50 dark:bg-gray-900 p-2 rounded">
+                                                        <div v-if="isToolDetailsExpanded(block.tool_execution.id)" class="ms-2 mt-1 text-xs text-ink-muted bg-gray-50 dark:bg-gray-900 p-2 rounded">
                                                             <div v-if="block.tool_execution.result_summary">{{ block.tool_execution.result_summary }}</div>
                                                             <div v-if="block.tool_execution.duration_ms">Duration: {{ block.tool_execution.duration_ms }}ms</div>
                                                         </div>
@@ -210,7 +216,7 @@
                                             </div>
 
                                             <!-- 4. Final answer -->
-                                            <div v-if="block.plan_decision?.analysis_complete && (block.plan_decision?.final_answer || (!block.content && !block.tool_execution))" class="mt-2 markdown-wrapper" dir="auto">
+                                            <div v-if="block.plan_decision?.analysis_complete && (block.plan_decision?.final_answer || (!block.content && !block.tool_execution))" class="mt-2 markdown-wrapper text-ink dark:text-gray-100" dir="auto" :data-dir-hint="replyDirHints.get(String(m.id))">
                                                 <MarkdownRender
                                                     :content="block.plan_decision?.final_answer || block.plan_decision?.assistant || block.content || ''"
                                                     :final="true"
@@ -252,7 +258,7 @@
 
             <!-- Footer -->
             <footer class="flex-none border-t border-gray-100 dark:border-gray-800 py-2 text-center bg-white dark:bg-gray-900 z-10">
-                <a href="https://bagofwords.com" target="_blank" class="text-[10px] text-gray-300 dark:text-gray-600 hover:text-gray-400 transition-colors">
+                <a href="https://bagofwords.com" target="_blank" class="text-2xs text-gray-300 dark:text-gray-600 hover:text-ink-muted transition-colors">
                     Powered by Bag of Words
                 </a>
             </footer>
@@ -261,14 +267,21 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, provide } from 'vue'
 import { computeBlockGroups } from '~/composables/useBlockGrouping'
+import { CHAT_VIZ_TEXT_PX } from '~/utils/chatVizText'
+import { useChatDisplay } from '~/composables/useChatDisplay'
 import Spinner from '~/components/Spinner.vue'
 import CreateWidgetTool from '~/components/tools/CreateWidgetTool.vue'
+import CreateDemoDatasetTool from '~/components/tools/CreateDemoDatasetTool.vue'
+import ListSchemaTool from '~/components/tools/ListSchemaTool.vue'
+import DeleteListRowsTool from '~/components/tools/DeleteListRowsTool.vue'
 import CreateDataTool from '~/components/tools/CreateDataTool.vue'
 import DescribeTablesTool from '~/components/tools/DescribeTablesTool.vue'
 import DescribeEntityTool from '~/components/tools/DescribeEntityTool.vue'
 import ReadQueryTool from '~/components/tools/ReadQueryTool.vue'
+import RunQueryTool from '~/components/tools/RunQueryTool.vue'
+import AddParameterTool from '~/components/tools/AddParameterTool.vue'
 import ReadResourcesTool from '~/components/tools/ReadResourcesTool.vue'
 import InspectDataTool from '~/components/tools/InspectDataTool.vue'
 import ExecuteCodeTool from '~/components/tools/ExecuteCodeTool.vue'
@@ -283,8 +296,10 @@ import ReadFileTool from '~/components/tools/ReadFileTool.vue'
 import GenerateImageTool from '~/components/tools/GenerateImageTool.vue'
 import AttachFileTool from '~/components/tools/AttachFileTool.vue'
 import CreateArtifactTool from '~/components/tools/CreateArtifactTool.vue'
+import ManageArtifactResourcesTool from '~/components/tools/ManageArtifactResourcesTool.vue'
 import EditArtifactTool from '~/components/tools/EditArtifactTool.vue'
 import ReadArtifactTool from '~/components/tools/ReadArtifactTool.vue'
+import ReadArtifactActivityTool from '~/components/tools/ReadArtifactActivityTool.vue'
 import CreateDocTool from '~/components/tools/CreateDocTool.vue'
 import EditDocTool from '~/components/tools/EditDocTool.vue'
 import WriteCsvTool from '~/components/tools/WriteCsvTool.vue'
@@ -300,6 +315,7 @@ import SearchAgentsTool from '~/components/tools/SearchAgentsTool.vue'
 import SetReportAgentsTool from '~/components/tools/SetReportAgentsTool.vue'
 import ReadInstructionTool from '~/components/tools/ReadInstructionTool.vue'
 import CreateNoteTool from '~/components/tools/CreateNoteTool.vue'
+import SubmitListTool from '~/components/tools/SubmitListTool.vue'
 import EditNoteTool from '~/components/tools/EditNoteTool.vue'
 import RouteModelTool from '~/components/tools/RouteModelTool.vue'
 import CreateInstructionTool from '~/components/tools/CreateInstructionTool.vue'
@@ -316,7 +332,11 @@ import RunEvalTool from '~/components/tools/RunEvalTool.vue'
 import GetEvalRunTool from '~/components/tools/GetEvalRunTool.vue'
 import ClarifyTool from '~/components/tools/ClarifyTool.vue'
 import WaitTool from '~/components/tools/WaitTool.vue'
-import UpdateUserMemoryTool from '~/components/tools/UpdateUserMemoryTool.vue'
+import DelegateTool from '~/components/tools/DelegateTool.vue'
+import ReadSubAgentTool from '~/components/tools/ReadSubAgentTool.vue'
+import MessageSubAgentTool from '~/components/tools/MessageSubAgentTool.vue'
+import StopSubAgentTool from '~/components/tools/StopSubAgentTool.vue'
+import MemoryTool from '~/components/tools/MemoryTool.vue'
 // Agent actions and bookkeeping — same treatment, same reason.
 import CreateDashboardTool from '~/components/tools/CreateDashboardTool.vue'
 import SendEmailTool from '~/components/tools/SendEmailTool.vue'
@@ -325,7 +345,6 @@ import CreateScheduledTaskTool from '~/components/tools/CreateScheduledTaskTool.
 import EditScheduledTaskTool from '~/components/tools/EditScheduledTaskTool.vue'
 import CancelScheduledTaskTool from '~/components/tools/CancelScheduledTaskTool.vue'
 import CancelWaitTool from '~/components/tools/CancelWaitTool.vue'
-import ListAgentExecutionsTool from '~/components/tools/ListAgentExecutionsTool.vue'
 import CreatePromptTool from '~/components/tools/CreatePromptTool.vue'
 import EditPromptTool from '~/components/tools/EditPromptTool.vue'
 import SearchPromptsTool from '~/components/tools/SearchPromptsTool.vue'
@@ -333,19 +352,41 @@ import ListConnectionsTool from '~/components/tools/ListConnectionsTool.vue'
 import GetConnectionTool from '~/components/tools/GetConnectionTool.vue'
 import ToolWidgetPreview from '~/components/tools/ToolWidgetPreview.vue'
 import InstructionText from '~/components/instructions/InstructionText.vue'
+import { dominantTextDir, type TextDir } from '~/utils/textDirection'
+import PolishRequestCard from '~/components/report/PolishRequestCard.vue'
+import { parsePolishPrompt } from '~/utils/polishPrompt'
 import { promptMentionsToRefs } from '~/utils/mentions'
+
+// A shared conversation never names the org's agents, but the tool cards do
+// carry each referenced agent's resolved icon. Reuse it so an @agent chip draws
+// the same icon as the tool card beneath it, rather than the one snapshotted
+// into the prompt when the message was sent.
+const agentIconTokens = computed<Record<string, string | null | undefined>>(() => {
+    const out: Record<string, string | null | undefined> = {}
+    for (const c of (conversation.value?.completions || []) as any[]) {
+        for (const b of c.completion_blocks || []) {
+            for (const ds of b.tool_execution?.data_sources || []) {
+                if (ds?.id && ds.icon_token) out[ds.id] = ds.icon_token
+            }
+        }
+    }
+    return out
+})
 // Same markdown pipeline as the report view. MDC (stock, no `mdc` config in
 // nuxt.config) renders a ```mermaid / ```d2 / ```infographic fence as a plain
 // code block and leaves $…$ math as literal text, so a shared answer degraded
 // to raw diagram source while the same diagram written into an instruction
 // card — which uses InstructionText — rendered fine on this very page.
 // markstream dispatches on fence language before the render-code-blocks-as-pre
-// flag, so diagrams and math survive it. useMarkdownAutoDir (already mounted
-// below) and the [dir=rtl] .markstream-vue rules in assets/css/rtl.css were
+// flag, so diagrams and math survive it. useMarkdownAutoDir (started app-wide by
+// plugins/markdown-auto-dir.client.ts) and the [dir=rtl] .markstream-vue rules in assets/css/rtl.css were
 // both written against this renderer's DOM.
 import { MarkdownRender } from 'markstream-vue'
 import 'markstream-vue/index.css'
-import { useMarkdownAutoDir } from '~/composables/useMarkdownAutoDir'
+
+// Charts and grids in this conversation follow the chat text size
+// (utils/chatVizText.ts).
+provide(CHAT_VIZ_TEXT_PX, useChatDisplay().textSizePx)
 
 const route = useRoute()
 const token = route.params.token as string
@@ -377,6 +418,27 @@ const visibleCompletions = computed<any[]>(() =>
         return (m.completion_blocks?.length || 0) > 0 || m.status === 'stopped' || m.status === 'error'
     })
 )
+
+// Prompt bubbles take the direction of their own words (a nested
+// `dir="auto"` pair resolves LTR — see docs/design/i18n.md "Content
+// direction"); each reply carries its question's direction as the hint
+// useMarkdownAutoDir uses while the answer is still short.
+function promptDir(text?: string | null): TextDir | 'auto' {
+    return dominantTextDir((text || '').replace(/@\S+/g, ' ')) || 'auto'
+}
+const replyDirHints = computed(() => {
+    const hints = new Map<string, TextDir>()
+    let last: TextDir | null = null
+    for (const m of visibleCompletions.value) {
+        if (m.role === 'user') {
+            const d = dominantTextDir((m.prompt?.content || '').replace(/@\S+/g, ' '))
+            if (d) last = d
+        } else if (last) {
+            hints.set(String(m.id), last)
+        }
+    }
+    return hints
+})
 
 // ---------------------------------------------------------------------------
 // The knowledge harness (the post-analysis reflection sub-loop) runs as its own
@@ -425,10 +487,10 @@ function _groupingFor(m: any) {
     // sitting between two chip-class steps would otherwise break a run that
     // reads as continuous on screen.
     const blocks = timelineBlocks(m)
-    const key = `${blocks.length}`
+    const key = `${m.status}:${blocks.map(b => `${b.id}:${b.status}:${b.tool_execution?.status}`).join(",")}`
     const hit = _groupingCache.get(String(m.id))
     if (hit && hit.key === key) return hit.grouping
-    const grouping = computeBlockGroups(blocks)
+    const grouping = computeBlockGroups(blocks, { executionStatus: m.status })
     _groupingCache.set(String(m.id), { key, grouping })
     return grouping
 }
@@ -520,6 +582,15 @@ function hasCompletedContent(block: any): boolean {
 function getThoughtProcessLabel(block: any): string {
     if (block.status === 'stopped') return 'Thought Process'
 
+    // Measured reasoning: the planner's plus the tool's code generation, which
+    // streams into this same block.
+    const pm = block.plan_decision?.metrics || block.plan_decision?.metrics_json
+    const measured = [pm?.thinking_ms, block.tool_execution?.sub_timings_json?.codegen_reasoning_ms]
+        .filter((ms: any) => typeof ms === 'number' && isFinite(ms) && ms >= 0)
+    if (measured.length) {
+        return `Thought for ${Math.round(measured.reduce((a: number, b: number) => a + b, 0) / 1000)}s`
+    }
+
     if (block.started_at && block.completed_at) {
         const startTime = new Date(block.started_at).getTime()
         const endTime = new Date(block.completed_at).getTime()
@@ -529,15 +600,17 @@ function getThoughtProcessLabel(block: any): string {
         return `Thought for ${durationSeconds}s`
     }
 
-    if (block.tool_execution?.duration_ms) {
-        const durationSeconds = (block.tool_execution.duration_ms / 1000).toFixed(1)
-        return `Thought for ${durationSeconds}s`
-    }
-
+    // The tool's own duration is not reasoning time; it already shows on the tool row.
     return 'Thought Process'
 }
 
 function getToolComponent(toolName: string) {
+    // Native per-list tools (submit_<list>) stream under their own name
+    // before the gateway rewrite to submit_list.
+    if (toolName?.startsWith('submit_')) return SubmitListTool
+    // Native MCP tools (mcp__<connection>__<tool>) and call_tool stream under
+    // their own name before the rewrite to execute_mcp.
+    if (toolName?.startsWith('mcp__')) return MCPTool
     switch (toolName) {
         case 'create_widget':
             return CreateWidgetTool
@@ -549,6 +622,10 @@ function getToolComponent(toolName: string) {
             return DescribeEntityTool
         case 'read_query':
             return ReadQueryTool
+        case 'run_query':
+            return RunQueryTool
+        case 'add_parameter':
+            return AddParameterTool
         case 'read_resources':
             return ReadResourcesTool
         case 'inspect_data':
@@ -572,12 +649,16 @@ function getToolComponent(toolName: string) {
             return ReadFileTool
         case 'attach_file':
             return AttachFileTool
+        case 'manage_artifact_resources':
+            return ManageArtifactResourcesTool
         case 'create_artifact':
             return CreateArtifactTool
         case 'edit_artifact':
             return EditArtifactTool
         case 'read_artifact':
             return ReadArtifactTool
+        case 'read_artifact_activity':
+            return ReadArtifactActivityTool
         case 'create_doc':
             return CreateDocTool
         case 'edit_doc':
@@ -593,6 +674,8 @@ function getToolComponent(toolName: string) {
         case 'write_officejs_code':
             return WriteOfficeJsCodeTool
         case 'search_mcps':
+        case 'search_tools':
+        case 'call_tool':
         case 'execute_mcp':
             return MCPTool
         case 'search_reports':
@@ -624,6 +707,8 @@ function getToolComponent(toolName: string) {
             return SetReportAgentsTool
         case 'create_note':
             return CreateNoteTool
+        case 'submit_list':
+            return SubmitListTool
         case 'edit_note':
             return EditNoteTool
         case 'route_model':
@@ -651,10 +736,19 @@ function getToolComponent(toolName: string) {
         // transcript exactly as it happened.
         case 'clarify':
             return ClarifyTool
+        case 'delegate':
+            return DelegateTool
+        case 'message_sub_agent': return MessageSubAgentTool
+        case 'read_sub_agent':
+            return ReadSubAgentTool
+        case 'stop_sub_agent':
+            return StopSubAgentTool
         case 'wait':
             return WaitTool
-        case 'update_user_memory':
-            return UpdateUserMemoryTool
+        case 'create_memory':
+        case 'edit_memory':
+        case 'search_memory':
+            return MemoryTool
         case 'create_dashboard':
             return CreateDashboardTool
         case 'send_email':
@@ -669,8 +763,6 @@ function getToolComponent(toolName: string) {
             return CancelScheduledTaskTool
         case 'cancel_wait':
             return CancelWaitTool
-        case 'list_agent_executions':
-            return ListAgentExecutionsTool
         case 'create_prompt':
             return CreatePromptTool
         case 'edit_prompt':
@@ -681,6 +773,18 @@ function getToolComponent(toolName: string) {
             return ListConnectionsTool
         case 'get_connection':
             return GetConnectionTool
+        // Renders only what the run recorded (the approved spec, row counts and
+        // the agents' names/icons) — nothing fetched live — and in readonly
+        // mode drops the review controls and the links into the workspace.
+        case 'create_demo_dataset':
+            return CreateDemoDatasetTool
+        // Same contract: the proposed/saved schema from the run's own record,
+        // review controls and the workspace link dropped in readonly mode.
+        case 'create_list':
+        case 'edit_list':
+            return ListSchemaTool
+        case 'delete_list_rows':
+            return DeleteListRowsTool
         // Deliberately NOT mapped here — these two stay owner-view-only, and
         // not merely for effort. suggest_instructions is a review queue over
         // UNREVIEWED draft instructions, and create_agent builds its body by
@@ -747,6 +851,7 @@ async function loadConversation() {
         error.value = true
     } finally {
         isLoading.value = false
+        scheduleLiveRefresh()
 
         // Scroll to bottom after DOM renders (must be after isLoading = false)
         await nextTick()
@@ -756,6 +861,52 @@ async function loadConversation() {
                 scrollToBottom()
             })
         }, 100)
+    }
+}
+
+// A shared run that is still going (e.g. waiting on its owner's review, or
+// generating) refreshes until it settles, so the viewer sees it finish instead
+// of a frozen spinner. Only the newest page is refetched; older pages the
+// viewer scrolled in stay as they are.
+const LIVE_REFRESH_MS = 4000
+let liveRefreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function isRunInProgress(): boolean {
+    for (const c of conversation.value?.completions || []) {
+        if (c.status === 'in_progress') return true
+        for (const b of c.completion_blocks || []) {
+            if (['in_progress', 'running'].includes(b.tool_execution?.status)) return true
+        }
+    }
+    return false
+}
+
+function scheduleLiveRefresh() {
+    if (liveRefreshTimer) clearTimeout(liveRefreshTimer)
+    liveRefreshTimer = null
+    if (!isRunInProgress()) return
+    liveRefreshTimer = setTimeout(refreshLatest, LIVE_REFRESH_MS)
+}
+
+async function refreshLatest() {
+    try {
+        const { data, error: fetchError } = await useMyFetch(`/api/c/${token}?limit=10`)
+        if (fetchError.value || !data.value) return
+        const latest: any[] = (data.value as any).completions || []
+        const latestIds = new Set(latest.map((c: any) => c.id))
+        const older = (conversation.value?.completions || []).filter((c: any) => !latestIds.has(c.id))
+        conversation.value = { ...conversation.value, completions: [...older, ...latest] }
+        for (const completion of latest) {
+            for (const block of completion.completion_blocks || []) {
+                if (block.content || block.tool_execution || block.plan_decision?.final_answer) {
+                    collapsedReasoning.value.add(block.id)
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Failed to refresh conversation:', e)
+    } finally {
+        scheduleLiveRefresh()
     }
 }
 
@@ -819,16 +970,12 @@ function handleScroll(event: Event) {
     }
 }
 
-// Fixes list-marker direction for RTL content (see useMarkdownAutoDir).
-const markdownAutoDir = ref<{ stop: () => void } | null>(null)
-
 onMounted(() => {
     loadConversation()
-    markdownAutoDir.value = useMarkdownAutoDir()
 })
 
 onUnmounted(() => {
-    markdownAutoDir.value?.stop()
+    if (liveRefreshTimer) clearTimeout(liveRefreshTimer)
 })
 </script>
 
@@ -889,7 +1036,11 @@ onUnmounted(() => {
 /* Block content - assistant messages */
 .block-content {
     margin-bottom: 4px;
-    font-size: 13px;
+    /* The chat reading size, same token as the report view — a shared link
+       that renders two sizes smaller than the conversation it came from is
+       the divergence the comment below warns about. */
+    font-size: var(--bow-chat-font-size);
+    line-height: var(--bow-chat-line-height);
 }
 
 /* Markdown styling — kept in step with the same block in the report view, since
@@ -902,8 +1053,8 @@ onUnmounted(() => {
    scrollHeight to anchor scroll position when prepending older pages, and
    estimated offscreen sizes would make that jump.) */
 .markdown-wrapper :deep(.markdown-content) {
-    @apply leading-relaxed;
-    font-size: 13px;
+    font-size: var(--bow-chat-font-size);
+    line-height: var(--bow-chat-line-height);
 
     p {
         margin-bottom: 1em;
@@ -922,7 +1073,9 @@ onUnmounted(() => {
     h2 { @apply text-xl; }
     h3 { @apply text-lg; }
 
-    ul, ol { @apply ps-6 mb-4; unicode-bidi: plaintext; }
+    /* Marker gutter lives on each <li> (assets/css/rtl.css rule 7), so it
+	   follows the item's own direction. */
+	ul, ol { @apply mb-4; unicode-bidi: plaintext; }
     ul { @apply list-disc; }
     ol { @apply list-decimal; }
     li { @apply mb-1.5; unicode-bidi: plaintext; }
@@ -942,7 +1095,7 @@ onUnmounted(() => {
         background: none;
         padding: 0;
         border-radius: 0;
-        font-size: 13px;
+        font-size: var(--bow-chat-font-size-2);
         line-height: 1.5;
         display: block;
         white-space: pre-wrap;
@@ -966,7 +1119,7 @@ onUnmounted(() => {
     /* Physical l/pl, matching the report view verbatim. Both put a blockquote's
        rule on the left edge under RTL — one pre-existing nit, kept identical
        rather than fixed on one side only. */
-    blockquote { @apply border-l-4 border-gray-200 pl-4 italic my-4; unicode-bidi: plaintext; }
+    blockquote { @apply border-s-4 border-gray-200 ps-4 italic my-4; unicode-bidi: plaintext; }
     table { @apply w-full border-collapse mb-4; unicode-bidi: plaintext; }
     table th, table td { @apply border border-gray-200 p-2 text-xs bg-white; unicode-bidi: plaintext; }
 
@@ -975,7 +1128,7 @@ onUnmounted(() => {
        dir governs alignment — plaintext keeps re-resolving from the first
        strong character, which is exactly what mis-aligns an RTL sentence that
        opens with a Latin token (see composables/useMarkdownAutoDir.ts). */
-    :where(p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, table):is([dir="rtl"], [dir="ltr"]) {
+    :where(p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, table, th, td):is([dir="rtl"], [dir="ltr"]) {
         unicode-bidi: isolate;
     }
 }

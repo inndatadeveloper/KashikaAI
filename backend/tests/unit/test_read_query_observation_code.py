@@ -56,6 +56,12 @@ class _Result:
     def scalar_one_or_none(self):
         return self._value
 
+    def first(self):
+        # The owner lookup (app/services/row_owner.py) runs after the Query
+        # and Visualization reads, on an empty queue: None = the query
+        # belongs to no saved report, the ungated path these tests are about.
+        return self._value
+
 
 class _FakeDB:
     """Returns the queued rows in call order: read_query looks up the Query
@@ -66,6 +72,14 @@ class _FakeDB:
 
     async def execute(self, *args, **kwargs):
         return _Result(self._values.pop(0) if self._values else None)
+
+    async def scalar(self, *args, **kwargs):
+        # read_query resolves each result's report_id to gate saved monitoring
+        # data (bow_source_access). None = this query belongs to no saved
+        # report, so report_access() short-circuits and can_read() allows it —
+        # the ungated path these tests are about. It must not consume the
+        # execute() queue, which is ordered Query-then-Visualization.
+        return None
 
 
 class _Org:

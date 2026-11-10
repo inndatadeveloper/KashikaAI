@@ -138,17 +138,23 @@ class WriteFileTool(Tool):
         if not db or not organization:
             return None, "Missing database/organization context."
         from app.models.file import File
+        from app.services.file_access_service import run_viewable_file_ids
 
-        result = await db.execute(
-            select(File).where(
-                File.id == str(source_file_id),
-                File.organization_id == str(organization.id),
-            )
+        # Copying a file out to a connection publishes it, so it must be one
+        # the run's user may see — not merely any file id in the org.
+        allowed = await run_viewable_file_ids(
+            db, user=runtime_ctx.get("user"), report=runtime_ctx.get("report"),
+            organization=organization, file_ids=[str(source_file_id)],
         )
-        f = result.scalar_one_or_none()
+        f = None
+        if allowed:
+            result = await db.execute(select(File).where(File.id == str(source_file_id)))
+            f = result.scalar_one_or_none()
         if not f:
             return None, f"source_file_id '{source_file_id}' not found."
         try:
+            from app.services import storage
+            await storage.aensure_local(f.path)
             async with aiofiles.open(f.path, "rb") as fh:
                 return await fh.read(), None
         except Exception as e:

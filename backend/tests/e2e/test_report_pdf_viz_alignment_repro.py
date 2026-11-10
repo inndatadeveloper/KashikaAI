@@ -56,12 +56,14 @@ from app.dependencies import async_session_maker
 from app.models.organization import Organization
 from app.models.user import User
 from app.models.report import Report
-from app.models.artifact import Artifact
+from tests.fixtures.artifact import seed_artifact
 from app.models.visualization import Visualization
 from app.models.query import Query
 from app.models.step import Step
 from app.models.widget import Widget
 from app.services.report_pdf_service import ReportPdfService
+
+pytestmark = pytest.mark.e2e
 
 
 def _run(coro):
@@ -177,19 +179,18 @@ async def _seed():
         # The artifact's contract: an ORDERED list of exactly its two vizs.
         ordered_viz_ids = [str(viz_txn.id), str(viz_revenue.id)]
 
-        artifact = Artifact(
+        artifact = await seed_artifact(
+            db,
             report_id=report.id,
             user_id=user.id,
             organization_id=org.id,
-            title="Dashboard",
             mode="page",
+            title="Dashboard",
             content={
                 "code": "<div id='dash'></div>",
                 "visualization_ids": ordered_viz_ids,
             },
         )
-        db.add(artifact)
-        await db.flush()
 
         await db.commit()
         return (

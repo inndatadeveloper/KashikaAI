@@ -8,7 +8,7 @@ from app.models.base import BaseSchema
 from app.models.organization import Organization
 from app.models.domain_connection import domain_connection
 from app.models.datasource_table import DataSourceTable
-from app.ai.prompt_formatters import Table, TableColumn
+from app.ai.prompt_formatters import Table, TableColumn, filter_columns, filter_fks
 
 
 class DataSource(BaseSchema):
@@ -55,6 +55,9 @@ class DataSource(BaseSchema):
     # default (OrganizationSettings.config['agent_automation_defaults']). None /
     # empty means "fully inherit the org default".
     automation_settings = Column(JSON, nullable=True)
+    # Watermark for the nightly agent dream: drafts, feedback and usage up to
+    # here have been consolidated.
+    agent_dreamed_at = Column(DateTime, nullable=True)
 
     # Lifecycle of the reliability loop, orthogonal to publish_status. The
     # automation system writes this; humans set publish_status. Keeping them
@@ -187,7 +190,14 @@ class DataSource(BaseSchema):
         "Connection",
         secondary=domain_connection,
         back_populates="data_sources",
-        lazy="selectin"
+        lazy="selectin",
+        # Deterministic. Several call sites still reduce a multi-connection
+        # agent to `connections[0]`, and with no ORDER BY the database was free
+        # to return a different "first" connection between two requests — the
+        # same agent would show one connection's tables on one render and
+        # another's on the next. Ordering doesn't make those call sites correct,
+        # but it makes them reproducible, which is what a regression test needs.
+        order_by="Connection.created_at, Connection.id",
     )
 
     # M:N relationship to File. Files attached here are auto-snapshotted
@@ -253,10 +263,15 @@ class DataSource(BaseSchema):
         # Default to first connection for backward compatibility
         return self.connections[0]
 
-    async def get_schemas(self, db: AsyncSession = None, include_inactive: bool = False, with_stats: bool = False, organization: Organization | None = None, top_k: int | None = None) -> List[Table]:
+    async def get_schemas(self, db: AsyncSession = None, include_inactive: bool = False, with_stats: bool = False, organization: Organization | None = None, top_k: int | None = None, visible_table_ids: set[str] | None = None) -> List[Table]:
         """
         Get the database schema information from associated DataSourceTable records.
         Returns a list of Table objects containing table structure information.
+
+        `visible_table_ids`, when not None, restricts the result to those
+        canonical row ids. Callers on a multi-connection agent use it to apply
+        per-connection identity scoping (DataSourceService._resolve_catalog_scope)
+        without this model method having to know anything about auth policies.
         """
         # Use provided session or try to get from object
         session = db or object_session(self)
@@ -292,10 +307,16 @@ class DataSource(BaseSchema):
         for table in data_source.tables:
             if not include_inactive and not table.is_active:
                 continue
+            if visible_table_ids is not None and str(table.id) not in visible_table_ids:
+                continue
                 
+            # Agent-facing reads (active only) drop the columns the agent
+            # manager hid; the management view (include_inactive) shows every
+            # column so they can be toggled back on.
+            excluded = None if include_inactive else table.excluded_columns
             columns = [
                 TableColumn(name=col["name"], dtype=col.get("dtype", "unknown"))
-                for col in table.columns
+                for col in filter_columns(table.columns, excluded)
             ]
             
             # Extract connection info from relationship
@@ -312,8 +333,9 @@ class DataSource(BaseSchema):
                 id=str(table.id),  # Include table ID for mention service
                 name=table.name,
                 columns=columns,
-                pks=table.pks,
-                fks=table.fks,
+                pks=filter_columns(table.pks, excluded),
+                fks=filter_fks(table.fks, excluded),
+                excluded_columns=table.excluded_columns or None,
                 is_active=table.is_active,
                 metadata_json=table.metadata_json,
                 # Connection info (for multi-connection support)

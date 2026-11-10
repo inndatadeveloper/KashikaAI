@@ -82,12 +82,16 @@
 
 <script setup lang="ts">
 const config = useRuntimeConfig();
-const { token } = useAuth();
+const token = useApiAuthorization();
+const embedCredential = useEmbedCredential();
 const { organization, ensureOrganization } = useOrganization();
 const { t } = useI18n();
 
 const props = defineProps<{
   artifactId: string;
+  // A published dashboard's previews (/d/{id}/previews: a count, then each
+  // image by index) instead of the artifact version's.
+  previewsBase?: string;
 }>();
 
 const currentSlide = ref(0);
@@ -126,24 +130,29 @@ async function fetchPreviews() {
 
   try {
     // First get the list of preview endpoints
-    const { data, error: fetchError } = await useMyFetch(`/api/artifacts/${props.artifactId}/previews`);
+    const { data, error: fetchError } = await useMyFetch(
+      props.previewsBase || `/api/artifacts/${props.artifactId}/previews`);
 
     if (fetchError.value) {
       throw new Error(fetchError.value.message || t('slideViewer.fetchPreviewsFailed'));
     }
+    if (props.previewsBase && data.value) {
+      const count = Number((data.value as any).count) || 0;
+      (data.value as any).previews = Array.from({ length: count }, (_, i) => `${props.previewsBase}/${i}`);
+    }
 
     if (data.value && data.value.previews && data.value.previews.length > 0) {
       // Ensure organization is loaded before fetching images
-      const org = await ensureOrganization();
+      const org = embedCredential.value ? { id: embedCredential.value.organizationId } : await ensureOrganization();
 
       // Fetch each image with auth headers and convert to blob URLs
       const blobUrls: string[] = [];
 
       for (const previewPath of data.value.previews) {
         try {
-          const headers: Record<string, string> = {
-            Authorization: `${token.value}`,
-          };
+          const headers: Record<string, string> = {};
+          // A public dashboard's reader may be signed out.
+          if (token.value) headers.Authorization = `${token.value}`;
           if (org?.id) {
             headers['X-Organization-Id'] = org.id;
           }

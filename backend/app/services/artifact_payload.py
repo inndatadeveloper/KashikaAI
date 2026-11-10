@@ -20,6 +20,85 @@ from sqlalchemy.orm import selectinload
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for "no reader in scope": the in-app/owner renders (PDF, thumbnail,
+# in-app HTML export, edit previews) bake the stored snapshot as before. Pass
+# `viewer=` (a User, or None for an anonymous share-link reader) to resolve
+# every step's rows through viewer_data_policy.resolve_step_data instead — the
+# exact code path the public JSON view (ReportService.get_public_step) uses,
+# so a public export can never embed rows that view withholds. Parity is
+# pinned by tests/e2e/test_public_output_parity.py.
+UNSCOPED: Any = object()
+
+
+def row_count_fields(data: Any) -> dict[str, Any]:
+    """How much of a query's result a stored dataset holds.
+
+    Stored rows are cut at the org's `limit_row_count`, so `len(rows)` says
+    nothing about the size of the result; `info.total_rows` does. `row_count` is
+    the result's real size, `loaded_row_count` the rows actually present, and
+    `truncated` whether anything is missing. Totals computed from truncated rows
+    are wrong, so anything that builds or renders a page needs all three.
+    """
+    data = data if isinstance(data, dict) else {}
+    rows = data.get("rows")
+    loaded = len(rows) if isinstance(rows, list) else 0
+    info = data.get("info")
+    total = info.get("total_rows") if isinstance(info, dict) else None
+    real = total if isinstance(total, int) and not isinstance(total, bool) and total >= loaded else loaded
+    return {"row_count": real, "loaded_row_count": loaded, "truncated": real > loaded}
+
+
+def partial_rows_note(row_count: Any, stored_rows: int) -> Optional[str]:
+    """What to tell the planner when a query's result was cut, else None.
+
+    Said when the query is created, because that is when the planner can still
+    write a better one.
+    """
+    if not isinstance(row_count, int) or row_count <= stored_rows:
+        return None
+    return (
+        f"only the first {stored_rows} rows are kept (org row limit), so pages and charts receive "
+        f"{stored_rows}; for totals, KPIs, rankings or trends, aggregate in the query; a list or lookup "
+        "may use these rows if the page says how many it shows (a query with optional filters returns "
+        "every row when run with no values, which is expected)"
+    )
+
+
+def partial_data_used(visualizations: list[dict[str, Any]], code: str) -> list[dict[str, Any]]:
+    """The cut datasets a page's code actually reads, for the planner to fix."""
+    return [
+        {"visualization_id": v["id"], "title": v.get("title"), "row_count": v.get("row_count"),
+         "loaded_row_count": v.get("loaded_row_count")}
+        for v in visualizations
+        if v.get("truncated") and str(v.get("id")) in (code or "")
+    ]
+
+
+def partial_data_warning(partial: list[dict[str, Any]]) -> str:
+    """The planner's warning for `partial_data_used` results; "" when there are none."""
+    if not partial:
+        return ""
+    described = "; ".join(
+        f"'{p.get('title') or 'Untitled'}' ({p.get('loaded_row_count')} of {p.get('row_count')} rows)" for p in partial
+    )
+    return (
+        f" WARNING: this page reads only part of its data: {described}. Totals, KPIs, rankings or trends "
+        "computed from those rows are wrong. Create a query that aggregates in the database and use it with "
+        "edit_artifact. A browsable list may stay if it says how many rows it shows."
+    )
+
+
+async def _resolve_rows(db, step, report, viewer) -> tuple[dict, bool]:
+    """(data, withheld) for `step` as `viewer` may see it."""
+    if step is None:
+        return {}, False
+    if viewer is UNSCOPED:
+        return step.data or {}, False
+    from app.services.viewer_data_policy import resolve_step_data
+
+    resolution = await resolve_step_data(db, step, report, viewer)
+    return resolution.data or {}, resolution.withheld
+
 
 def _ordered_visualizations(artifact, visualizations: list) -> list:
     """Order a report's visualizations the way the artifact's code indexes them.
@@ -44,17 +123,25 @@ def _ordered_visualizations(artifact, visualizations: list) -> list:
     return ordered
 
 
-async def collect_visualizations(db, artifact) -> list[dict[str, Any]]:
-    """Ordered visualizations with their stored rows, columns and data model."""
+async def _viz_steps(db, artifact) -> list[tuple[Any, Any, Any]]:
+    """(visualization, query, step) for the artifact, in its index order."""
     from app.models.visualization import Visualization
     from app.models.query import Query
     from app.models.step import Step
 
+    # A published dashboard's release (dashboard_data.ReleaseRender) owns its
+    # copies; a version reads its conversation's charts.
+    release_id = getattr(artifact, "artifact_release_id", None)
+    owner = (Visualization.artifact_release_id == release_id if release_id
+             else Visualization.report_id == artifact.report_id)
+    # The rows one reader may see, when the caller knows the reader (a /d
+    # export); otherwise the stored snapshot.
+    rows_for = getattr(artifact, "rows_for", None)
     viz_stmt = (
         select(Visualization)
         .options(selectinload(Visualization.query))
         .where(
-            Visualization.report_id == artifact.report_id,
+            owner,
             # Soft-deleted queries take their visualizations with them —
             # exports and thumbnails must not keep serving deleted data
             Visualization.deleted_at.is_(None),
@@ -63,7 +150,7 @@ async def collect_visualizations(db, artifact) -> list[dict[str, Any]]:
     viz_result = await db.execute(viz_stmt)
     visualizations = _ordered_visualizations(artifact, list(viz_result.scalars().all()))
 
-    viz_data: list[dict[str, Any]] = []
+    out: list[tuple[Any, Any, Any]] = []
     for viz in visualizations:
         if not viz.query_id:
             continue
@@ -72,9 +159,13 @@ async def collect_visualizations(db, artifact) -> list[dict[str, Any]]:
             continue
 
         step = None
-        if query.default_step_id:
+        if rows_for is not None:
+            # For a reader, the step their step route serves (successful only).
+            from app.services.dashboard_data import default_step
+            step = await default_step(db, query)
+        elif query.default_step_id:
             step = await db.get(Step, query.default_step_id)
-        if not step:
+        if not step and rows_for is None:
             step_result = await db.execute(
                 select(Step)
                 .where(Step.query_id == query.id)
@@ -82,20 +173,123 @@ async def collect_visualizations(db, artifact) -> list[dict[str, Any]]:
                 .limit(1)
             )
             step = step_result.scalar_one_or_none()
+        out.append((viz, query, step))
+    return out
 
-        viz_data.append({
+
+async def collect_visualizations(db, artifact, *, viewer: Any = UNSCOPED) -> list[dict[str, Any]]:
+    """Ordered visualizations with their stored rows, columns and data model.
+
+    With `viewer` given, rows and applied params are what that reader may see
+    (see UNSCOPED)."""
+    from app.models.report import Report
+
+    report = (await db.get(Report, artifact.report_id)
+              if viewer is not UNSCOPED and getattr(artifact, "report_id", None) else None)
+    # A published dashboard's render (dashboard_data.ReleaseRender) carries the
+    # rows its one reader may see; it decides them itself.
+    rows_for = getattr(artifact, "rows_for", None)
+
+    viz_data: list[dict[str, Any]] = []
+    for viz, query, step in await _viz_steps(db, artifact):
+        if rows_for is not None and step is not None:
+            seen = await rows_for(db, step, query)
+            data, applied = seen["data"], seen["applied_params"] or {}
+            withheld = seen["withheld"]
+        else:
+            data, withheld = await _resolve_rows(db, step, report, viewer)
+            applied = getattr(step, "applied_params", None) or {}
+            if viewer is not UNSCOPED:
+                from app.services.viewer_data_policy import redact_applied_params
+
+                applied = redact_applied_params(applied, query.parameters, withheld=withheld) or {}
+        entry = {
             "id": str(viz.id),
             # Carried so an offline host can tell which visualizations a
             # declared query param is scoped to (declaration.query_ids).
             "query_id": str(viz.query_id),
+            "parameters": query.parameters or [],
+            "applied_params": applied,
             "title": viz.title or query.title or "Untitled",
             "view": viz.view or {},
-            "rows": step.data.get("rows", []) if step and step.data else [],
-            "columns": step.data.get("columns", []) if step and step.data else [],
+            "rows": data.get("rows", []) if data else [],
+            "columns": data.get("columns", []) if data else [],
+            **row_count_fields(data),
             "dataModel": step.data_model or {} if step else {},
-        })
+            # As ArtifactFrame.vue sends it: artifact code may tell a chart
+            # whose step failed from one that returned no rows.
+            "stepStatus": step.status if step else None,
+        }
+        if viewer is not UNSCOPED:
+            # Reader-scoped callers (the chat context, the public export) must
+            # be able to tell "this reader may not see these rows" from "the
+            # query returned nothing" — an empty `rows` means both.
+            entry["withheld"] = withheld
+        viz_data.append(entry)
 
     return viz_data
+
+
+async def any_rows_withheld(db, artifact, viewer: Any) -> bool:
+    """Whether `viewer` is denied any of the rows this artifact draws on.
+
+    For outputs that were rendered once with the stored snapshot and cannot be
+    filtered afterwards (a generated .pptx deck and its PDF conversion): if the
+    public JSON view would withhold even one of their queries from this
+    reader, the file must not be served to them at all.
+    """
+    if viewer is UNSCOPED:
+        return False
+    from app.models.report import Report
+
+    report = await db.get(Report, artifact.report_id)
+    for _viz, _query, step in await _viz_steps(db, artifact):
+        if step is None:
+            continue
+        _, withheld = await _resolve_rows(db, step, report, viewer)
+        if withheld:
+            return True
+    return False
+
+
+# What a viewer's resolved rows are, relative to the stored snapshot:
+ROWS_SNAPSHOT = "snapshot"   # exactly the stored rows (owner, plain content)
+ROWS_PERSONAL = "personal"   # at least one query serves the viewer's OWN run
+ROWS_WITHHELD = "withheld"   # at least one query has nothing for this viewer
+
+
+async def viewer_rows_state(db, artifact, viewer: Any) -> str:
+    """Classify what `viewer` gets for the queries this artifact renders.
+
+    A file rendered once from the stored rows (a generated .pptx deck) is only
+    correct for a reader whose rows ARE the stored rows. A signed-in viewer who
+    ran an identity-scoped query themselves resolves to their own
+    step_user_results slice instead — for them the baked deck holds someone
+    else's rows even though nothing is "withheld". Callers re-render
+    (ROWS_PERSONAL) or refuse (ROWS_WITHHELD); ROWS_SNAPSHOT may be served
+    as stored.
+
+    Scoped to the artifact's own visualization_ids when it lists them — those
+    are the only rows a deck's code is handed.
+    """
+    if viewer is UNSCOPED:
+        return ROWS_SNAPSHOT
+    from app.models.report import Report
+    from app.services.viewer_data_policy import resolve_step_data
+
+    report = await db.get(Report, artifact.report_id)
+    included = set((artifact.content or {}).get("visualization_ids") or [])
+    state = ROWS_SNAPSHOT
+    for viz, _query, step in await _viz_steps(db, artifact):
+        if step is None or (included and str(viz.id) not in included):
+            continue
+        resolution = await resolve_step_data(db, step, report, viewer)
+        if resolution.withheld:
+            return ROWS_WITHHELD
+        vr = resolution.viewer_result or {}
+        if vr.get("status") == "success":
+            state = ROWS_PERSONAL
+    return state
 
 
 async def collect_files(db, artifact) -> list[dict[str, Any]]:
@@ -110,7 +304,7 @@ async def collect_files(db, artifact) -> list[dict[str, Any]]:
     return await build_file_datauris(db, (artifact.content or {}).get("files") or [])
 
 
-async def collect_artifact_payload(db, artifact) -> Optional[dict[str, Any]]:
+async def collect_artifact_payload(db, artifact, *, viewer: Any = UNSCOPED) -> Optional[dict[str, Any]]:
     """Build the full ARTIFACT_DATA payload for a page-mode artifact.
 
     `current_user` is deliberately absent: identity is per-viewer and injected
@@ -122,19 +316,23 @@ async def collect_artifact_payload(db, artifact) -> Optional[dict[str, Any]]:
     """
     from app.models.report import Report
 
-    report = await db.get(Report, artifact.report_id)
-    if not report:
-        return None
+    report_payload = getattr(artifact, "report_payload", None)  # a release has no conversation
+    if report_payload is None:
+        report = await db.get(Report, artifact.report_id)
+        if not report:
+            return None
+        report_payload = {"id": str(report.id), "title": report.title, "theme": report.theme_name}
 
+    visualizations = await collect_visualizations(db, artifact, viewer=viewer)
     return {
-        "report": {
-            "id": str(report.id),
-            "title": report.title,
-            "theme": report.theme_name,
-        },
-        "visualizations": await collect_visualizations(db, artifact),
+        "report": report_payload,
+        "visualizations": [{k: v for k, v in viz.items() if k != "applied_params"} for viz in visualizations],
         "files": await collect_files(db, artifact),
         "current_user": None,
+        # Which sandbox runtime generation to render with (themed kit at >= 11;
+        # absent on rows created before it → legacy look and semantics).
+        "runtime": {"version": int((artifact.content or {}).get("runtime_version") or 0)},
+        "params": await collect_params(db, artifact, visualizations=visualizations, viewer=viewer),
     }
 
 
@@ -149,7 +347,41 @@ def _normalize_options(raw: list) -> list[dict[str, Any]]:
     return out
 
 
-async def _options_from_source(db, source) -> list[dict[str, Any]]:
+def build_params_payload(visualizations: list[dict[str, Any]]) -> dict[str, Any]:
+    """Project existing query declarations into the iframe's parameter contract.
+
+    Shared by generation previews and stored-artifact payloads. No queries are
+    executed here; values reflect the stored snapshot, with declaration defaults
+    only when the snapshot does not specify a value.
+    """
+    from app.schemas.param_schema import parse_param_specs
+
+    declarations: dict[str, dict[str, Any]] = {}
+    values: dict[str, Any] = {}
+    options: dict[str, list[dict[str, Any]]] = {}
+    for viz in visualizations:
+        qid = str(viz.get("query_id") or viz.get("queryId") or "")
+        vid = str(viz.get("id") or "")
+        applied = viz.get("applied_params") or {}
+        for spec in parse_param_specs(viz.get("parameters")):
+            entry = declarations.setdefault(spec.name, {
+                **spec.model_dump(), "query_ids": [], "visualization_ids": [],
+            })
+            if qid and qid not in entry["query_ids"]:
+                entry["query_ids"].append(qid)
+            if vid and vid not in entry["visualization_ids"]:
+                entry["visualization_ids"].append(vid)
+            if spec.source != "identity":
+                value = applied.get(spec.name, spec.default) if spec.source == "input" else spec.default
+                values.setdefault(spec.name, value)
+            if spec.options:
+                options.setdefault(spec.name, _normalize_options(spec.options))
+    return {"declarations": list(declarations.values()), "values": values,
+            "options": options, "ack": 0}
+
+
+async def _options_from_source(db, source, viewer: Any = UNSCOPED, rows_for=None,
+                               release_id=None) -> list[dict[str, Any]]:
     """Resolve an options_source (another query's column) to stable choices.
 
     Mirrors resolveParamOptions in ArtifactFrame.vue: the choices come from
@@ -163,9 +395,15 @@ async def _options_from_source(db, source) -> list[dict[str, Any]]:
     query = await db.get(Query, source.query_id)
     if not query:
         return []
+    if release_id and str(query.artifact_release_id or "") != str(release_id):
+        return []  # a release reads its own copies only
 
-    step = await db.get(Step, query.default_step_id) if query.default_step_id else None
-    if not step:
+    if rows_for is not None:
+        from app.services.dashboard_data import default_step
+        step = await default_step(db, query)
+    else:
+        step = await db.get(Step, query.default_step_id) if query.default_step_id else None
+    if not step and rows_for is None:
         result = await db.execute(
             select(Step)
             .where(Step.query_id == query.id)
@@ -173,12 +411,23 @@ async def _options_from_source(db, source) -> list[dict[str, Any]]:
             .limit(1)
         )
         step = result.scalar_one_or_none()
-    if not step or not step.data:
+    if step is not None and rows_for is not None:
+        # The option list is rows too: a /d reader gets the ones they may see.
+        data = (await rows_for(db, step, query))["data"]
+    elif viewer is not UNSCOPED:
+        # Option lists are another query's rows — same withholding applies.
+        from app.models.report import Report
+
+        report = await db.get(Report, query.report_id) if query.report_id else None
+        data, _ = await _resolve_rows(db, step, report, viewer)
+    else:
+        data = (step.data or {}) if step else {}
+    if not data:
         return []
 
     seen: set = set()
     out: list[dict[str, Any]] = []
-    for row in step.data.get("rows", []) or []:
+    for row in data.get("rows", []) or []:
         if not isinstance(row, dict) or source.value_column not in row:
             continue
         value = row[source.value_column]
@@ -191,75 +440,24 @@ async def _options_from_source(db, source) -> list[dict[str, Any]]:
     return out
 
 
-async def collect_params(db, artifact) -> dict[str, Any]:
-    """Declared query parameters for the artifact's report, as ARTIFACT_DATA.params.
-
-    Same aggregation as paramsPayload() in ArtifactFrame.vue: params sharing a
-    name across queries collapse into ONE declaration whose query_ids lists
-    every query it drives, so a single control moves all of them.
-
-    Only the HTML export calls this. The PDF export deliberately ships without
-    params — it is a flat render, and declaring controls that a sheet of paper
-    cannot operate would only draw dead widgets.
-    """
-    from app.models.query import Query
-    from app.models.visualization import Visualization
+async def collect_params(
+    db, artifact, *, visualizations: Optional[list[dict[str, Any]]] = None, viewer: Any = UNSCOPED,
+) -> dict[str, Any]:
+    """Snapshot parameter context, scoped to this artifact's visualizations."""
     from app.schemas.param_schema import parse_param_specs
 
-    # No SELECT DISTINCT here: Query.parameters (and the joined-loaded
-    # organization_settings.config) are Postgres `json`, which has no equality
-    # operator, so a whole-row DISTINCT raises UndefinedFunctionError on
-    # Postgres (SQLite silently allows it). The join fans out one row per
-    # visualization, so dedupe the Query identities in Python instead.
-    result = await db.execute(
-        select(Query)
-        .join(Visualization, Visualization.query_id == Query.id)
-        .where(Visualization.report_id == artifact.report_id)
-    )
-    queries = list(result.scalars().unique().all())
-
-    by_name: dict[str, dict[str, Any]] = {}
-    options: dict[str, list[dict[str, Any]]] = {}
-
-    for query in queries:
-        for spec in parse_param_specs(query.parameters):
-            entry = by_name.get(spec.name)
-            if entry is None:
-                entry = {
-                    "name": spec.name,
-                    "type": spec.type,
-                    "label": spec.label,
-                    "source": spec.source,
-                    "default": spec.default,
-                    "required": spec.required,
-                    "options": spec.options,
-                    "query_ids": [],
-                }
-                by_name[spec.name] = entry
-            entry["query_ids"].append(str(query.id))
-
-            if spec.name in options:
-                continue
-            if spec.options:
-                options[spec.name] = _normalize_options(spec.options)
-            elif spec.options_source:
-                resolved = await _options_from_source(db, spec.options_source)
+    if visualizations is None:
+        visualizations = await collect_visualizations(db, artifact, viewer=viewer)
+    included = set((artifact.content or {}).get("visualization_ids") or [])
+    if included:
+        visualizations = [v for v in visualizations if v["id"] in included]
+    payload = build_params_payload(visualizations)
+    for viz in visualizations:
+        for spec in parse_param_specs(viz.get("parameters")):
+            if spec.options_source:
+                resolved = await _options_from_source(db, spec.options_source, viewer,
+                                                      getattr(artifact, "rows_for", None),
+                                                      getattr(artifact, "artifact_release_id", None))
                 if resolved:
-                    options[spec.name] = resolved
-
-    # Applied values start at each param's default, exactly as the live host
-    # seeds them. Identity params carry no client value — the server binds
-    # them per viewer, and an export has no viewer.
-    values: dict[str, Any] = {}
-    for name, entry in by_name.items():
-        if entry["source"] == "identity":
-            continue
-        if entry["default"] is not None:
-            values[name] = entry["default"]
-
-    return {
-        "declarations": list(by_name.values()),
-        "values": values,
-        "options": options,
-        "ack": 0,
-    }
+                    payload["options"][spec.name] = resolved
+    return payload

@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import os
@@ -119,8 +120,12 @@ class OracledbClient(DataSourceClient):
                 current_schema = self._schemas[0]
                 try:
                     conn.execute(text(f'ALTER SESSION SET CURRENT_SCHEMA = {current_schema}'))
+                except IndexingCancelled:
+                    raise
                 except Exception:
                     pass
+        except IndexingCancelled:
+            raise
         except Exception as e:
             if conn is not None:
                 conn.close()
@@ -153,53 +158,90 @@ class OracledbClient(DataSourceClient):
         """Get tables with graceful fallback if enriched query fails."""
         try:
             return self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             return self._get_tables_basic()
 
-    def _get_tables_enriched(self) -> List[Table]:
-        """Get tables with column/table comments. May fail on some Oracle configurations."""
-        with self.connect() as conn:
-            params = {}
-            where_clauses = []
-            if self._schemas:
-                in_keys = []
-                for idx, sch in enumerate(self._schemas):
-                    key = f"o{idx}"
-                    params[key] = sch
-                    in_keys.append(f":{key}")
-                where_clauses.append(f"c.owner IN ({', '.join(in_keys)})")
-            else:
-                params["owner"] = self.user.upper()
-                where_clauses.append("c.owner = :owner")
+    def _owner_filter(self, column: str = "owner") -> tuple[str, dict]:
+        """WHERE fragment + bind params restricting a dictionary view to the
+        configured schemas, or to the login user's own schema when none is set."""
+        params: dict = {}
+        if self._schemas:
+            keys = []
+            for idx, sch in enumerate(self._schemas):
+                key = f"o{idx}"
+                params[key] = sch
+                keys.append(f":{key}")
+            return f"{column} IN ({', '.join(keys)})", params
+        params["owner"] = self.user.upper()
+        return f"{column} = :owner", params
 
-            where_sql = " WHERE " + " AND ".join(where_clauses)
-            sql = text(f"""
-                SELECT
-                    c.owner,
-                    c.table_name,
-                    c.column_name,
-                    c.data_type,
-                    cc.comments AS column_comment,
-                    tc.comments AS table_comment
-                FROM all_tab_columns c
-                LEFT JOIN all_col_comments cc
-                    ON c.owner = cc.owner
-                    AND c.table_name = cc.table_name
-                    AND c.column_name = cc.column_name
-                LEFT JOIN all_tab_comments tc
-                    ON c.owner = tc.owner
-                    AND c.table_name = tc.table_name
-                {where_sql}
-                ORDER BY c.owner, c.table_name, c.column_id
-            """)
-            result = conn.execute(sql, params).fetchall()
+    def count_tables(self) -> int:
+        """Cheap table + view count for the connection test.
+
+        The test only needs len(get_schemas()), and on pre-12c servers the
+        column introspection behind get_schemas() can take minutes. ALL_TABLES
+        and ALL_VIEWS are one row per object and answer in about a second even
+        on a large dictionary; together they cover the same objects whose
+        columns ALL_TAB_COLUMNS reports, so the count matches what indexing
+        will find.
+        """
+        where_sql, params = self._owner_filter()
+        with self.connect() as conn:
+            sql = text(
+                f"SELECT (SELECT COUNT(*) FROM all_tables WHERE {where_sql})"
+                f" + (SELECT COUNT(*) FROM all_views WHERE {where_sql}) FROM dual"
+            )
+            return int(conn.execute(sql, params).scalar() or 0)
+
+    def _get_tables_enriched(self) -> List[Table]:
+        """Get tables with column/table comments. May fail on some Oracle configurations.
+
+        Columns and the two comment views are read in three separate
+        owner-filtered statements and merged here instead of one three-way
+        LEFT JOIN. The ALL_* dictionary views each carry a per-row privilege
+        check, and on Oracle 10g/11g the optimizer cannot push the owner filter
+        through the join: a single join over 137k columns ran for more than
+        two minutes on a 10.2 warehouse where the same three views, scanned
+        one at a time, each answer in a second or two. Comment keys are unique
+        per column / per table, so a dict lookup yields exactly the rows the
+        LEFT JOIN did.
+        """
+        discovery_phase('reading_columns')
+        with self.connect() as conn:
+            where_sql, params = self._owner_filter()
+
+            col_comments: dict[tuple, str] = {}
+            for owner, table_name, column_name, comment in conn.execute(text(f"""
+                SELECT owner, table_name, column_name, comments
+                FROM all_col_comments
+                WHERE {where_sql} AND comments IS NOT NULL
+            """), params).fetchall():
+                col_comments[(owner, table_name, column_name)] = comment
+
+            tbl_comments: dict[tuple, str] = {}
+            for owner, table_name, comment in conn.execute(text(f"""
+                SELECT owner, table_name, comments
+                FROM all_tab_comments
+                WHERE {where_sql} AND comments IS NOT NULL
+            """), params).fetchall():
+                tbl_comments[(owner, table_name)] = comment
+
+            result = conn.execute(text(f"""
+                SELECT owner, table_name, column_name, data_type
+                FROM all_tab_columns
+                WHERE {where_sql}
+                ORDER BY owner, table_name, column_id
+            """), params).fetchall()
 
             tables = {}
-            for row in result:
-                owner, table_name, column_name, data_type, col_comment, tbl_comment = row
+            for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
+                owner, table_name, column_name, data_type = row
                 key = (owner, table_name)
                 fqn = f"{owner}.{table_name}"
                 if key not in tables:
+                    tbl_comment = tbl_comments.get(key)
                     tables[key] = Table(
                         name=fqn,
                         description=tbl_comment if tbl_comment else None,
@@ -208,6 +250,7 @@ class OracledbClient(DataSourceClient):
                         fks=[],
                         metadata_json={"schema": owner}
                     )
+                col_comment = col_comments.get((owner, table_name, column_name))
                 tables[key].columns.append(TableColumn(
                     name=column_name,
                     dtype=data_type,
@@ -218,6 +261,7 @@ class OracledbClient(DataSourceClient):
 
     def _get_tables_basic(self) -> List[Table]:
         """Get tables without comments (original query - always works)."""
+        discovery_phase('metadata_fallback')
         try:
             with self.connect() as conn:
                 params = {}
@@ -243,7 +287,7 @@ class OracledbClient(DataSourceClient):
                 result = conn.execute(sql, params).fetchall()
 
                 tables = {}
-                for row in result:
+                for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                     owner, table_name, column_name, data_type = row
                     key = (owner, table_name)
                     fqn = f"{owner}.{table_name}"
@@ -254,7 +298,10 @@ class OracledbClient(DataSourceClient):
                     tables[key].columns.append(TableColumn(name=column_name, dtype=data_type))
                 self._attach_foreign_keys(conn, tables)
             return list(tables.values())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("oracledb catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -277,7 +324,8 @@ class OracledbClient(DataSourceClient):
             lambda schema, table: f"{schema}.{table}",
         )
 
-    def get_schemas(self):
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
         """Get schemas for all tables in the specified database."""
         return self.get_tables()
 

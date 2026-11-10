@@ -1,9 +1,11 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 from app.ai.prompt_formatters import Table, TableColumn, ServiceFormatter
 
 import json
+import re
 import pandas as pd
-import requests
+from app.core.egress import pinned_request
 from typing import Any, Dict, List, Optional
 
 
@@ -26,6 +28,11 @@ class OpenSearchClient(DataSourceClient):
 
     # The engine's default max_result_window: size + from must stay under it.
     MAX_RESULT_WINDOW = 10_000
+    # One URL path segment holding an index expression: names, globs,
+    # comma lists, `-` exclusions, `cluster:` prefixes. No `/ ? # % \`
+    # or whitespace, so the value can't redirect the request to another
+    # endpoint (e.g. `orders/_delete_by_query?`).
+    _INDEX_EXPR_RE = re.compile(r"[A-Za-z0-9_.*,:+-]+")
 
     # Bucket-level keys that are not sub-aggregations.
     _BUCKET_META_KEYS = {"key", "key_as_string", "doc_count", "from", "to",
@@ -84,7 +91,7 @@ class OpenSearchClient(DataSourceClient):
     def _request(self, method: str, path: str, json_body: Any = None,
                  params: Optional[Dict[str, Any]] = None) -> Any:
         auth = (self.user, self.password or "") if self.user else None
-        resp = requests.request(
+        resp = pinned_request(
             method,
             f"{self.base_url}{path}",
             json=json_body,
@@ -216,7 +223,10 @@ class OpenSearchClient(DataSourceClient):
                 for s in (self._request("GET", path) or {}).get("data_streams") or []:
                     if s.get("name"):
                         streams.setdefault(s["name"], s)
+            except IndexingCancelled:
+                raise
             except Exception:
+                self.mark_discovery_incomplete("opensearch catalog")
                 continue
         return list(streams.values())
 
@@ -233,7 +243,10 @@ class OpenSearchClient(DataSourceClient):
             path = f"/{','.join(self._patterns)}/_mapping" if self._patterns else "/_mapping"
             mappings_by_index = self._request("GET", path)
             aliases_by_index = self._request("GET", "/_alias")
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("opensearch catalog")
             print(f"Error retrieving OpenSearch mappings: {e}")
             return []
 
@@ -245,7 +258,7 @@ class OpenSearchClient(DataSourceClient):
 
         tables: List[Table] = []
         alias_members: Dict[str, List[str]] = {}
-        for index_name, body in sorted(mappings_by_index.items()):
+        for index_name, body in discovery_items(sorted(mappings_by_index.items()), 'indices', label=lambda pair: pair[0]):
             # Backing indices are queried through their stream, never directly.
             if index_name in stream_backing:
                 continue
@@ -257,7 +270,7 @@ class OpenSearchClient(DataSourceClient):
                 alias_members.setdefault(alias, []).append(index_name)
 
         by_name = {t.name: t for t in tables}
-        for alias, members in sorted(alias_members.items()):
+        for alias, members in discovery_items(sorted(alias_members.items()), 'aliases', label=lambda pair: pair[0]):
             if alias.startswith("."):
                 continue
             tables.append(self._union_table(
@@ -304,7 +317,10 @@ class OpenSearchClient(DataSourceClient):
         for chunk in chunks:
             try:
                 fetched.update(self._request("GET", f"/{','.join(chunk)}/_mapping") or {})
+            except IndexingCancelled:
+                raise
             except Exception:
+                self.mark_discovery_incomplete("opensearch catalog")
                 continue
 
         tables: List[Table] = []
@@ -322,11 +338,21 @@ class OpenSearchClient(DataSourceClient):
             tables.append(self._union_table(name, members, "data_stream", backing))
         return tables
 
-    def get_schemas(self) -> List[Table]:
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
         return self.get_tables()
+
+    @classmethod
+    def _check_index(cls, index: Any) -> str:
+        """Reject index values that would escape their URL path segment."""
+        if (not isinstance(index, str) or not cls._INDEX_EXPR_RE.fullmatch(index)
+                or any(part in (".", "..") for part in index.split(","))):
+            raise ValueError(f"Invalid index expression: {index!r}")
+        return index
 
     def get_schema(self, index_name: str) -> Table:
         """Schema for a single index (or alias/pattern resolving to one)."""
+        index_name = self._check_index(index_name)
         body = self._request("GET", f"/{index_name}/_mapping")
         # The response is keyed by concrete index name, which for an alias
         # differs from what was asked for; take the first entry.
@@ -363,6 +389,7 @@ class OpenSearchClient(DataSourceClient):
         index = envelope.get("index")
         if not index or not isinstance(index, str):
             raise ValueError("Query must specify 'index' (or use the 'sql' key)")
+        index = self._check_index(index)
 
         body = {k: v for k, v in envelope.items() if k in self.SEARCH_KEYS}
         has_aggs = "aggs" in body or "aggregations" in body

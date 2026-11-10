@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import re
@@ -188,10 +189,14 @@ class SparkConnectClient(DataSourceClient):
             if self.catalog:
                 try:
                     spark.catalog.setCurrentCatalog(self.catalog)
+                except IndexingCancelled:
+                    raise
                 except Exception:
                     # Not all catalog providers support setCurrentCatalog; schema
                     # discovery still scopes by catalog where it can.
                     pass
+        except IndexingCancelled:
+            raise
         except Exception as e:
             raise RuntimeError(f"Error connecting to Spark Connect: {e}")
         try:
@@ -200,6 +205,8 @@ class SparkConnectClient(DataSourceClient):
             if spark is not None:
                 try:
                     spark.stop()
+                except IndexingCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -277,10 +284,15 @@ class SparkConnectClient(DataSourceClient):
             return self._databases
         try:
             return [db.name for db in spark.catalog.listDatabases()]
+        except IndexingCancelled:
+            raise
         except Exception:
             # Fall back to the current database only
+            self.mark_discovery_incomplete("spark_connect catalog")
             try:
                 return [spark.catalog.currentDatabase()]
+            except IndexingCancelled:
+                raise
             except Exception:
                 return []
 
@@ -292,12 +304,15 @@ class SparkConnectClient(DataSourceClient):
         """
         tables: List[Table] = []
         with self.connect() as spark:
-            for db in self._target_databases(spark):
+            for db in discovery_items(self._target_databases(spark), 'databases', label=str):
                 try:
                     catalog_tables = spark.catalog.listTables(db)
+                except IndexingCancelled:
+                    raise
                 except Exception:
+                    self.mark_discovery_incomplete("spark_connect catalog")
                     continue
-                for t in catalog_tables:
+                for t in discovery_items(catalog_tables, 'tables', label=lambda table: table.name):
                     cols: List[TableColumn] = []
                     part_cols: List[str] = []
                     try:
@@ -315,8 +330,11 @@ class SparkConnectClient(DataSourceClient):
                                 description=_clean_str(getattr(c, "description", None)),
                                 metadata=meta,
                             ))
+                    except IndexingCancelled:
+                        raise
                     except Exception:
                         # Skip columns we can't introspect; keep the table listed
+                        self.mark_discovery_incomplete("spark_connect catalog")
                         pass
                     fqn = f"{db}.{t.name}" if db else t.name
                     if self.profile_partitions and part_cols:
@@ -345,6 +363,8 @@ class SparkConnectClient(DataSourceClient):
         limit = self.partition_profile_limit
         try:
             rows = spark.sql(f"SHOW PARTITIONS {fqn}").limit(limit + 1).collect()
+        except IndexingCancelled:
+            raise
         except Exception:
             return  # not partitioned in metastore, or no permission — skip
         truncated = len(rows) > limit
@@ -378,7 +398,8 @@ class SparkConnectClient(DataSourceClient):
         """Deprecated — use get_tables() / get_schemas() instead."""
         raise NotImplementedError("get_schema() is deprecated. Use get_tables() instead.")
 
-    def get_schemas(self) -> List[Table]:
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
         return self.get_tables()
 
     def prompt_schema(self) -> str:

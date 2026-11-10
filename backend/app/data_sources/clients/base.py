@@ -1,10 +1,13 @@
 import asyncio
 import inspect
+import threading
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from app.data_sources.clients.progress import CancelCheck, ProgressCallback
+from app.data_sources.clients.discovery import DiscoveryClient, require_complete_discovery
+from app.data_sources.query_tag import query_tag_defaults
 
 
 class Capability(str, Enum):
@@ -84,7 +87,23 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-class DataSourceClient(ABC):
+class SearchStopped(Exception):
+    """A live search stopped before covering the whole source.
+
+    Raised by `search_files` implementations that honor a deadline, a cancel
+    check or a scan bound. `files` holds the matches found so far and
+    `stop_reason` says why it stopped ("deadline", "cancelled",
+    "folder_limit", "catalog_limit"), so the caller can return them as an
+    explicitly incomplete result instead of nothing.
+    """
+
+    def __init__(self, stop_reason: str, files: Optional[list] = None):
+        super().__init__(f"live search stopped early ({stop_reason})")
+        self.stop_reason = stop_reason
+        self.files = list(files or [])
+
+
+class DataSourceClient(DiscoveryClient, ABC):
 
     # Capabilities this client supports. Subclasses override.
     # Defaults to {QUERY} since the historic base contract is execute_query +
@@ -166,13 +185,16 @@ class DataSourceClient(ABC):
             with ephemeral():
                 return self.test_connection()
 
-        return await asyncio.to_thread(_probe)
+        # Warehouse query tag (app/data_sources/query_tag.py): a health probe.
+        with query_tag_defaults(source="connection_test"):
+            return await asyncio.to_thread(_probe)
 
     async def aget_schemas(
         self,
         progress_callback: Optional[ProgressCallback] = None,
         prior_catalog: "dict | None" = None,
         prior_tables: "dict | None" = None,
+        force_refresh: bool = False,
     ):
         """Forwards `progress_callback` / `prior_catalog` / `prior_tables` to
         the sync `get_schemas` only if it accepts each kwarg, determined by
@@ -181,22 +203,27 @@ class DataSourceClient(ABC):
         re-extracting unchanged files (incremental indexing). `prior_tables`
         is the richer `{table_name: {columns, pks, fks, metadata_json}}` form —
         catalog-crawling clients (Power BI) use it to skip re-introspecting
-        datasets that are already indexed.
+        datasets that are already indexed. `force_refresh` requests live
+        introspection while preserving prior metadata as discovery candidates.
 
         We do NOT catch a bare `TypeError` from the call: a real `TypeError`
         from inside `get_schemas` (e.g. a bug in a client) should surface,
         not be silently retried without progress.
         """
+        self.reset_discovery()
         kwargs = {}
+        if force_refresh and _accepts_kwarg(self.get_schemas, "force_refresh"):
+            kwargs["force_refresh"] = True
         if progress_callback is not None and _accepts_kwarg(self.get_schemas, "progress_callback"):
             kwargs["progress_callback"] = progress_callback
         if prior_catalog and _accepts_kwarg(self.get_schemas, "prior_catalog"):
             kwargs["prior_catalog"] = prior_catalog
         if prior_tables and _accepts_kwarg(self.get_schemas, "prior_tables"):
             kwargs["prior_tables"] = prior_tables
-        if not kwargs:
-            return await asyncio.to_thread(self.get_schemas)
-        return await asyncio.to_thread(self.get_schemas, **kwargs)
+        # Warehouse query tag (app/data_sources/query_tag.py): catalog reads.
+        with query_tag_defaults(source="indexing"):
+            result = await asyncio.to_thread(self.get_schemas, **kwargs)
+        return require_complete_discovery(self, result)
 
     async def aget_schema(self, table_name):
         return await asyncio.to_thread(self.get_schema, table_name)
@@ -230,6 +257,27 @@ class DataSourceClient(ABC):
         `source_bytes`, `file_count`, `row_count` for file-based sources so the
         UI can show how big the indexed data was. Default empty."""
         return {}
+
+    def unindexed_table_prefixes(self) -> List[str]:
+        """Table-name prefixes the last `get_schemas` call could not read.
+
+        A catalog crawler that reads its source in parts (one BI app, one
+        semantic model) returns nothing for a part it could not open on this
+        run — the server was busy, the app was mid-reload, a call timed out.
+        Absent from the result is not the same as gone from the source, so the
+        schema refresh keeps existing tables under these prefixes (and the
+        agents' selection of them) instead of pruning them. Each prefix covers
+        names that start with ``prefix + "/"``. Default: nothing unread.
+        """
+        return []
+
+    def unindexed_entry_types(self) -> List[str]:
+        """``metadata_json["type"]`` values the last `get_schemas` call could
+        not read, e.g. ``"routine"`` when routine discovery failed while the
+        tables were read fine. The schema refresh keeps existing entries of
+        these types instead of pruning them. Default: nothing unread.
+        """
+        return sorted(getattr(self, "_unindexed_entry_types", None) or ())
 
     # File-shaped capabilities. Default implementations raise NotImplementedError;
     # clients that declare LIST_FILES / READ_FILE / SEARCH_FILES override.
@@ -323,11 +371,36 @@ class DataSourceClient(ABC):
     async def aread_file(self, file_id: str, **kwargs) -> Any:
         return await asyncio.to_thread(self.read_file, file_id, **kwargs)
 
-    async def asearch_files(self, query: str, **kwargs) -> list:
-        return await asyncio.to_thread(self.search_files, query, **kwargs)
+    async def asearch_files(self, query: str, *, deadline: Optional[float] = None, **kwargs) -> list:
+        """Run `search_files` in a worker thread.
+
+        A thread cannot be killed, so a crawl that outlives its caller would
+        keep hitting the source. Clients whose `search_files` accepts
+        `deadline` (a `time.monotonic()` value) and/or `cancel_check` stop at
+        their next checkpoint once the deadline passes or the awaiting task is
+        cancelled (e.g. by the tool runner's timeout). Other clients ignore
+        both and behave as before.
+        """
+        cancelled = threading.Event()
+        if deadline is not None and _accepts_kwarg(self.search_files, "deadline"):
+            kwargs["deadline"] = deadline
+        if _accepts_kwarg(self.search_files, "cancel_check"):
+            kwargs["cancel_check"] = cancelled.is_set
+        try:
+            return await asyncio.to_thread(self.search_files, query, **kwargs)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     async def agrep_files(self, pattern: str, **kwargs) -> dict:
-        return await asyncio.to_thread(self.grep_files, pattern, **kwargs)
+        cancelled = threading.Event()
+        if _accepts_kwarg(self.grep_files, "cancel_check"):
+            kwargs["cancel_check"] = cancelled.is_set
+        try:
+            return await asyncio.to_thread(self.grep_files, pattern, **kwargs)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     async def afile_version(self, file_id: str) -> Optional[str]:
         return await asyncio.to_thread(self.file_version, file_id)

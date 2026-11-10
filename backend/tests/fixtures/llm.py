@@ -86,6 +86,58 @@ def create_bedrock_provider_and_models(test_client):
 
 
 @pytest.fixture
+def create_vertex_provider_and_models(test_client):
+    """Create a Google Vertex AI provider + one model.
+
+    Uses ``GOOGLE_VERTEX_PROJECT_ID`` and, for service-account auth,
+    ``GOOGLE_VERTEX_SA_JSON`` (the key file's contents, or a path to it).
+    With neither, auth_mode defaults to ADC so the fixture still exercises the
+    request/persistence path on a machine with Workload Identity or gcloud ADC.
+    """
+    def _create_vertex_provider_and_models(user_token=None, org_id=None):
+        headers = {}
+        if user_token:
+            headers["Authorization"] = f"Bearer {user_token}"
+        if org_id:
+            headers["X-Organization-Id"] = str(org_id)
+
+        credentials = {
+            "project_id": os.getenv("GOOGLE_VERTEX_PROJECT_ID", ""),
+            "location": os.getenv("GOOGLE_VERTEX_LOCATION", "global"),
+        }
+        sa_json = os.getenv("GOOGLE_VERTEX_SA_JSON", "")
+        if sa_json:
+            # Accept either the JSON itself or a path to the key file.
+            if not sa_json.lstrip().startswith("{") and os.path.exists(sa_json):
+                sa_json = open(sa_json).read()
+            credentials["auth_mode"] = "service_account"
+            credentials["service_account_json"] = sa_json
+        else:
+            credentials["auth_mode"] = "adc"
+
+        response = test_client.post(
+            "/api/llm/providers",
+            json={
+                "name": "vertex provider",
+                "provider_type": "vertex",
+                "credentials": credentials,
+                "models": [
+                    {
+                        "model_id": os.getenv("GOOGLE_VERTEX_MODEL_ID", "gemini-3.8-flash"),
+                        "name": "Gemini 3.8 Flash (Vertex)",
+                        "is_custom": False,
+                        "is_default": True,
+                    }
+                ],
+            },
+            headers=headers,
+        )
+        return response.json()
+
+    return _create_vertex_provider_and_models
+
+
+@pytest.fixture
 def create_anthropic_provider_and_models(test_client):
     """Create an Anthropic provider + Claude Opus 5 and Haiku models.
 
@@ -129,13 +181,21 @@ def create_anthropic_provider_and_models(test_client):
     return _create
 
 
+def _openai_api_key_or_skip() -> str:
+    """The real key, or skip: PRs from forks get no repo secrets. A push to
+    main does, so a missing key there is a failure, not a quiet skip."""
+    key = os.getenv("OPENAI_API_KEY_TEST", "")
+    if key:
+        return key
+    if os.getenv("GITHUB_EVENT_NAME") == "push" and os.getenv("GITHUB_REF") == "refs/heads/main":
+        pytest.fail("OPENAI_API_KEY_TEST is not set on a push to main")
+    pytest.skip("OPENAI_API_KEY_TEST is not set")
+
+
 @pytest.fixture
 def create_llm_provider_and_models(test_client):
     def _create_llm_provider_and_models(user_token=None, org_id=None, base_url=None):
-        openai_api_key = os.getenv("OPENAI_API_KEY_TEST", "")
-
-        if not openai_api_key:
-            pytest.fail("OPENAI_API_KEY_TEST is not set")
+        openai_api_key = _openai_api_key_or_skip()
         headers = {}
         if user_token:
             headers["Authorization"] = f"Bearer {user_token}"
@@ -159,13 +219,18 @@ def create_llm_provider_and_models(test_client):
                            "is_custom": False
                        },
                        {
+                           "model_id": "gpt-6.1-terra",
+                           "name": "GPT-6.1 Terra",
+                           "is_custom": False
+                       },
+                       {
                            "model_id": "gpt-5.6-terra",
                            "name": "GPT-5.6 Terra",
                            "is_custom": False
                        },
                        {
-                           "model_id": "gpt-5.6-luna",
-                           "name": "GPT-5.6 Luna",
+                           "model_id": "gpt-6-luna",
+                           "name": "GPT-6 Luna",
                            "is_custom": False
                        }
                        ]},
@@ -178,11 +243,8 @@ def create_llm_provider_and_models(test_client):
 @pytest.fixture
 def create_openai_provider_with_base_url(test_client):
     def _create_openai_provider_with_base_url(base_url, user_token=None, org_id=None, provider_name=None):
-        openai_api_key = os.getenv("OPENAI_API_KEY_TEST", "")
+        openai_api_key = _openai_api_key_or_skip()
 
-        if not openai_api_key:
-            pytest.fail("OPENAI_API_KEY_TEST is not set")
-        
         headers = {}
         if user_token:
             headers["Authorization"] = f"Bearer {user_token}"

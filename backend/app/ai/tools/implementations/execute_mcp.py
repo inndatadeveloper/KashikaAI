@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import AsyncIterator, Dict, Any, Type
+from typing import AsyncIterator, Dict, Any, Optional, Type
 from pydantic import BaseModel
 
 from app.ai.tools.base import Tool
@@ -32,64 +32,48 @@ _SHAPE_MAX_COLUMNS = 40
 # disk either way (see the materialization block below) — this only decides how
 # much the model can read WITHOUT opening the file.
 #
-# It used to be three records, flat, whoever the caller was. Three records is
-# enough to infer a schema and not enough to answer a question, so a 40-record
-# purchase order came back, went to disk in full, and the agent still had to
-# spend a second tool call to read what it had just fetched. Budgeting by
-# characters instead of by record count makes the cutoff track what actually
-# costs tokens: narrow rows arrive whole, wide ones still get capped.
-_DEFAULT_INLINE_CHARS = 50_000
+# There is no fixed cap: a result arrives whole whenever it fits the model's
+# window. It used to be min(org setting, default 50k / max 500k chars, 15% of the
+# transcript budget). On a 1M-token model that showed 50k of a 360k-char export;
+# the agent then paged the file 8k chars at a time, made 4-18 model calls and
+# answered correctly 1-3 times in 5. Clients that pass the whole result answer
+# from it in one call.
+#
+# The window still decides. The transcript's decay ladder protects the last
+# PROTECT_LAST_TURNS turns, which shields roughly the last TWO tool results, so
+# one result may take at most half the transcript budget. Characters per token
+# is taken at 2: dense tabular payloads measured ~1.8 (a CSV export of 360k
+# chars was 203k tokens), well below the ~4 of English prose, and
+# underestimating is what overflows the window.
+_PROTECTED_RESULT_SHARE = 0.5
+_CHARS_PER_TOKEN = 2
+# Fallback for the one path that wants a budget when none was computed.
 _MAX_INLINE_CHARS = 500_000
-# Floor when the budget is set to 0 — the shape has to survive even when an
-# operator has turned inlining off, or the agent cannot write a reader for the
-# file without opening it first.
+
+# Files saved from one tool result; the rest are reported, not saved.
+_MAX_ATTACHED_FILES = 10
+# Floor for a result too big for the window: the shape has to survive, or the
+# agent cannot write a reader for the file without opening it first.
 _MIN_PREVIEW_ROWS = 3
 
-# Share of the transcript budget one preview may occupy, and the rough
-# chars-per-token used to convert between the two (measured at ~4.0 on real
-# record payloads).
-#
-# The setting alone is not safe on a small-window model. The transcript's decay
-# ladder protects the last PROTECT_LAST_TURNS turns, and because turns alternate
-# assistant/user that shields roughly the last TWO tool results — which the
-# ladder then cannot decay no matter how far over budget it is. Six 400-record
-# calls measured a 27,250-token floor: fine against a 200k model's 100k budget,
-# larger than the whole 16k budget of a 32k model. So the configured value is a
-# CEILING, and the window decides the rest.
-_PREVIEW_BUDGET_SHARE = 0.15
-_CHARS_PER_TOKEN = 4
 
+def _inline_budget(organization_settings: Any = None, context_window_tokens: Any = None) -> int:
+    """Characters of result the model may see inline: as much as the window holds.
 
-def _inline_budget(organization_settings: Any, context_window_tokens: Any = None) -> int:
-    """Characters of result the model may see inline.
-
-    `mcp_result_inline_chars` clamped, then capped against what this model's
-    transcript can actually hold. Clamped because a bad stored value here is
-    the difference between a useless observation and one that fills the
-    context window on its own.
+    ``organization_settings`` is accepted for callers that still pass it; no
+    setting caps the result any more. An unknown window uses the transcript's
+    own assumed window.
     """
-    try:
-        cfg = organization_settings.get_config("mcp_result_inline_chars") if organization_settings else None
-        budget = int(getattr(cfg, "value", _DEFAULT_INLINE_CHARS))
-    except (TypeError, ValueError, AttributeError):
-        budget = _DEFAULT_INLINE_CHARS
-    budget = max(0, min(_MAX_INLINE_CHARS, budget))
-
-    if not isinstance(context_window_tokens, int) or context_window_tokens <= 0:
-        # No window to reason about — the operator's number stands. Guessing a
-        # small window here would silently shrink every result on a provider
-        # that simply doesn't report one.
-        return budget
     try:
         from app.ai.agents.planner.transcript_bridge import transcript_budget_tokens
 
+        window = context_window_tokens if isinstance(context_window_tokens, int) and context_window_tokens > 0 else None
         transcript_budget = transcript_budget_tokens(
-            type("_S", (), {"context_window_tokens": context_window_tokens})()
+            type("_S", (), {"context_window_tokens": window})()
         )
     except Exception:
-        return budget
-    ceiling = int(transcript_budget * _PREVIEW_BUDGET_SHARE * _CHARS_PER_TOKEN)
-    return min(budget, max(ceiling, 0))
+        return _MAX_INLINE_CHARS // 10
+    return max(0, int(transcript_budget * _PROTECTED_RESULT_SHARE * _CHARS_PER_TOKEN))
 
 
 def _fit_rows(rows: list, budget: int) -> tuple:
@@ -198,6 +182,71 @@ def _upload_path(filename: str) -> str:
 
     os.makedirs(_UPLOAD_DIR, exist_ok=True)
     return os.path.join(_UPLOAD_DIR, filename)
+
+
+async def save_text_artifact(runtime_ctx: dict, filename: str, text: str, *, content_type: str = "text/plain",
+                             source_ref: Optional[str] = None):
+    """Save `text` as a tool-produced File on the current report.
+
+    The one persistence path for agent-tool artifacts (execute_mcp results,
+    list_files persisted listings): bytes under uploads/files, a File owned by
+    the acting user with source_kind="artifact", linked to the report, and
+    registered for the tools that run later in the same turn — so
+    create_data / inspect_data / read_file can load it by file_id right away
+    and later turns find it in the report's files.
+    """
+    from uuid import uuid4
+    from app.models.file import File
+
+    db = runtime_ctx.get("db")
+    report = runtime_ctx.get("report")
+    organization = runtime_ctx.get("organization")
+    # The agent loop puts the acting user under "user"; only some callers set
+    # "current_user" (files.user_id is NOT NULL).
+    user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
+
+    path = _upload_path(f"{uuid4()}_{filename}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    from app.services import storage
+    await storage.apersist(path, content_type)
+
+    file = File(
+        filename=filename,
+        path=path,
+        content_type=content_type,
+        # A tool product, not a user attachment: keeps it off the prompt
+        # box's pending-attachment chips (see File.source_kind).
+        source_kind="artifact",
+        # Optional producer tag (e.g. list_files' listing fingerprint) so the
+        # producer can find and reuse its own earlier artifact.
+        source_ref=source_ref,
+        user_id=str(user.id) if user else None,
+        organization_id=str(organization.id) if organization else None,
+    )
+
+    try:
+        from app.services.file_preview import generate_file_preview
+        file.preview = generate_file_preview(file)
+    except Exception:
+        pass
+
+    async with db.begin_nested():
+        db.add(file)
+        await db.flush()
+
+        if report:
+            from app.models.report_file_association import report_file_association
+            from sqlalchemy import insert
+            await db.execute(
+                insert(report_file_association).values(
+                    report_id=str(report.id),
+                    file_id=str(file.id),
+                )
+            )
+
+    _register_same_turn(file, runtime_ctx, report)
+    return file
 
 
 def _record_shape(rows: list) -> Dict[str, Any]:
@@ -373,7 +422,29 @@ def _result_summary(tool_name: str, content_type: str, output: Dict[str, Any]) -
         summary += f" → {output['row_count']} rows (inline)"
     else:
         summary += f" → {content_type} result"
-    return summary
+    return summary + _files_summary(output)
+
+
+def _files_summary(output: Dict[str, Any]) -> str:
+    """Tell the agent about files the tool returned, saved or not."""
+    out = ""
+    attached = output.get("attached_files") or []
+    if attached:
+        listed = ", ".join(
+            f"{f['file_name']} ({f['mime_type']}, file_id={f['file_id']})" for f in attached
+        )
+        out += (
+            f" The tool also returned {len(attached)} file(s), saved to this"
+            f" session: {listed}. Open one with read_file(file_id=…) — images"
+            " and PDFs are shown to you as pictures."
+        )
+    dropped = output.get("dropped_files") or []
+    if dropped:
+        listed = ", ".join(
+            f"{d['mime_type']}{' ' + d['uri'] if d.get('uri') else ''} ({d['reason']})" for d in dropped
+        )
+        out += f" {len(dropped)} returned file(s) could NOT be saved: {listed}."
+    return out
 
 
 class ExecuteMCPTool(Tool):
@@ -411,9 +482,8 @@ access to it.
 Use when:
     - You need to fetch data from an external tool (Notion, Jira, Datadog, etc.)
     - You need to invoke an API endpoint to retrieve or submit data
-    - If a tool's <mcp_tools> entry shows no <arg> elements (or the tool isn't
-      listed), call search_mcps first for its schema; entries WITH <arg>
-      elements are complete — call directly.
+    - The model never sees this tool: native mcp__ tools and call_tool are
+      rewritten into it, so this description documents the shared path.
 
 Argument typing — `arguments` is validated against the tool's real schema
 before the call goes out, so match declared types exactly:
@@ -448,6 +518,8 @@ Do not use when:
         return ExecuteMCPOutput
 
     async def run_stream(self, tool_input: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> AsyncIterator[ToolEvent]:
+        runtime_ctx.pop("_mcp_policy_approval", None)
+        runtime_ctx.pop("_remote_shell_authorized", None)
         data = ExecuteMCPInput(**tool_input)
         organization_settings = runtime_ctx.get("settings")
 
@@ -502,15 +574,30 @@ Do not use when:
         from app.models.connection_tool import ConnectionTool
         from app.services.connection_service import ConnectionService
 
-        # Resolve connection — only allow MCP/API connections linked to this report's data sources
+        # Resolve connection — only allow MCP/API connections on the agents
+        # this run executes against. The run's agents are the scope when the
+        # agent loop supplies them: an Auto report has no attachments, so
+        # scoping by the report alone left every connection in the org
+        # callable by id. Other callers fall back to the report's agents.
         from sqlalchemy import or_
         report = runtime_ctx.get("report")
         allowed_conn_ids = set()
-        if report:
+        run_agent_ids = runtime_ctx.get("run_agent_ids")
+        enforce_scope = run_agent_ids is not None
+        if enforce_scope:
+            if run_agent_ids:
+                from app.models.domain_connection import domain_connection
+                rows = await db.execute(
+                    select(domain_connection.c.connection_id)
+                    .where(domain_connection.c.data_source_id.in_([str(i) for i in run_agent_ids]))
+                )
+                allowed_conn_ids = {str(r[0]) for r in rows.all()}
+        elif report:
             for ds in (report.data_sources or []):
                 for conn in (ds.connections or []):
-                    if conn.type in ("mcp", "custom_api"):
+                    if conn.type in ("mcp", "custom_api", "remote_ssh", "remote_smb"):
                         allowed_conn_ids.add(str(conn.id))
+            enforce_scope = bool(allowed_conn_ids)
 
         conn_result = await db.execute(
             select(Connection).where(
@@ -519,13 +606,13 @@ Do not use when:
                     Connection.name == data.connection_id,
                 ),
                 Connection.organization_id == str(organization.id),
-                Connection.type.in_(["mcp", "custom_api"]),
+                Connection.type.in_(["mcp", "custom_api", "remote_ssh", "remote_smb"]),
             )
         )
         connection = conn_result.scalars().first()
 
-        # Verify connection is linked to this report's data sources
-        if connection and allowed_conn_ids and str(connection.id) not in allowed_conn_ids:
+        # Verify connection is on one of the agents in scope
+        if connection and enforce_scope and str(connection.id) not in allowed_conn_ids:
             connection = None
         if not connection:
             yield ToolEndEvent(
@@ -537,8 +624,24 @@ Do not use when:
             )
             return
 
+        # Persist display identity on authorized execution paths, including failures.
+        # Never expose credentials or the full connection configuration.
+        connection_info = {"connection_id": str(connection.id), "connection_name": connection.name,
+                           "connection_type": connection.type}
+        if connection.type in ("remote_ssh", "remote_smb"):
+            import json
+            config = json.loads(connection.config) if isinstance(connection.config, str) else connection.config
+            connection_info["execution_target"] = {"server": config.get("host"), "port": config.get("port", 22)}
+
+        if connection.type in ("remote_ssh", "remote_smb"):
+            from app.services.remote_server_access import remote_run_access
+            remote_agent_ids = run_agent_ids if run_agent_ids is not None else [str(ds.id) for ds in (getattr(report, "data_sources", None) or [])]
+            if not await remote_run_access(db, connection, user, remote_agent_ids):
+                yield self._policy_end_event(data.tool_name, "Remote connection is not accessible through this run's agents.", blocked_by="deny")
+                return
+
         # Emit connection name so the UI can show it during streaming
-        yield ToolProgressEvent(type="tool.progress", payload={"stage": "connection_resolved", "connection_name": connection.name})
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "connection_resolved", **connection_info})
 
         # Resolve per-user context forwarding (identity/membership → headers +
         # custom_metadata). Locked metadata fields clobber the model's values;
@@ -549,9 +652,14 @@ Do not use when:
             resolve_mcp_context,
             apply_metadata_injection,
         )
+        from app.utils.request_metadata import completion_request_metadata
         forward_ctx = None
         try:
-            forward_ctx = await resolve_mcp_context(db, connection, user, organization)
+            # The question's prompt.metadata feeds the connection's Dynamic params.
+            forward_ctx = await resolve_mcp_context(
+                db, connection, user, organization,
+                request_metadata=completion_request_metadata(runtime_ctx.get("head_completion")),
+            )
         except Exception as e:
             logger.warning(f"execute_mcp: context forwarding resolve failed: {e}")
         if forward_ctx is not None:
@@ -577,6 +685,9 @@ Do not use when:
             )
         )
         tool_record = tool_result.scalar_one_or_none()
+        if connection.type in ("remote_ssh", "remote_smb") and tool_record is None:
+            yield self._policy_end_event(data.tool_name, "Remote operation is not in the connection's discovered tool catalog.", blocked_by="deny")
+            return
         # Capture the tool's declared input schema up front so that, on any
         # downstream failure, we can hand the agent the *correct* argument shape
         # in the observation. Without this the agent only learns what was wrong
@@ -598,7 +709,7 @@ Do not use when:
             yield ToolEndEvent(
                 type="tool.end",
                 payload={
-                    "output": {"success": False, "error_message": f"Tool '{data.tool_name}' is disabled."},
+                    "output": {**connection_info, "success": False, "error_message": f"Tool '{data.tool_name}' is disabled."},
                     "observation": {"summary": f"Tool '{data.tool_name}' is disabled by admin", "success": False},
                 },
             )
@@ -614,6 +725,7 @@ Do not use when:
             )
             async for ev in policy_gate:
                 if isinstance(ev, ToolEndEvent):
+                    ev.payload["output"].update(connection_info)
                     yield ev
                     return
                 yield ev
@@ -640,12 +752,32 @@ Do not use when:
                         "Arguments do not match the tool's input schema — "
                         + "; ".join(arg_errors),
                         tool_input_schema,
+                        extra_output=connection_info,
                     ),
                 )
                 return
 
+        from app.services import mcp_cooldown
+        cooldown_key = (str(organization.id), str(getattr(user, "id", "system")), str(connection.id))
+        remaining = mcp_cooldown.remaining(cooldown_key)
+        if remaining:
+            yield ToolEndEvent(type="tool.end", payload=self._failure_payload(
+                data.tool_name, f"Rate limit: retry after {remaining} seconds", tool_input_schema,
+                extra_output=connection_info))
+            return
+
         # Construct client and call tool
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "calling_tool"})
+        stop = runtime_ctx.get("sigkill_event")
+        if stop is not None and stop.is_set():
+            approval = {**(runtime_ctx.get("_mcp_policy_approval") or {}), "cancelled": True, "timed_out": False}
+            yield self._policy_end_event(
+                data.tool_name, "Cancelled before execution.", blocked_by="ask",
+                guidance="The user stopped the run. Do not execute this call.",
+                extra_output={**connection_info, "approval": approval,
+                              "outcome": "cancelled", "execution_state": "not_started"},
+            )
+            return
 
         try:
             # A configured MCP/API connection is ALWAYS called over its own wire.
@@ -672,20 +804,42 @@ Do not use when:
             if _is_loopback_url(server_url):
                 await self._release_db(db)
             logger.info(f"execute_mcp: Calling remote MCP: {server_url or '?'}")
-            result = await client.acall_tool(data.tool_name, data.arguments)
+            from app.data_sources.clients.mcp_client import McpClient, is_read_only_tool
+            if isinstance(client, McpClient):
+                # Read-only tools may be retried after a dropped connection.
+                result = await client.acall_tool(
+                    data.tool_name, data.arguments,
+                    read_only=is_read_only_tool(getattr(tool_record, "metadata_json", None)),
+                )
+            else:
+                from app.data_sources.clients.remote_server_client import RemoteServerClient
+                if isinstance(client, RemoteServerClient) and data.tool_name == "execute_shell":
+                    approval = runtime_ctx.get("_mcp_policy_approval") or {}
+                    if not (approval.get("approved") or runtime_ctx.pop("_remote_shell_authorized", False)):
+                        raise PermissionError("Remote shell requires policy authorization")
+                    result = await client.acall_authorized(data.tool_name, data.arguments)
+                else:
+                    result = await client.acall_tool(data.tool_name, data.arguments)
             logger.info(f"execute_mcp: Remote call returned success={result.get('success')}, error={result.get('error')}")
-        except BaseException as e:
+        except Exception as e:
+            mcp_cooldown.record(cooldown_key, str(e))
             logger.error(f"execute_mcp: Tool call failed: {e}", exc_info=True)
             yield ToolEndEvent(
                 type="tool.end",
-                payload=self._failure_payload(data.tool_name, str(e), tool_input_schema),
+                payload=self._failure_payload(data.tool_name, str(e), tool_input_schema,
+                    outcome="execution_timed_out" if isinstance(e, TimeoutError) else "failed",
+                    extra_output={**connection_info, "approval": runtime_ctx.get("_mcp_policy_approval")}),
             )
             return
 
         if not result.get("success"):
+            mcp_cooldown.record(cooldown_key, result.get("error", ""))
             yield ToolEndEvent(
                 type="tool.end",
-                payload=self._failure_payload(data.tool_name, result.get("error", "Unknown error"), tool_input_schema),
+                payload=self._failure_payload(data.tool_name, result.get("error", "Unknown error"), tool_input_schema,
+                    outcome=result.get("error_code", "failed"),
+                    extra_output={**connection_info, "approval": runtime_ctx.get("_mcp_policy_approval"),
+                                  **({"execution_result": result.get("data")} if data.tool_name == "execute_shell" else {})}),
             )
             return
 
@@ -703,6 +857,7 @@ Do not use when:
             "preview": None,
             "error_message": None,
         }
+        output.update(connection_info)
         # Persist policy outcomes with the result so the UI (after rehydration)
         # and the planner's conversation digest can see them.
         policy_verdict = runtime_ctx.pop("_mcp_policy_verdict", None)
@@ -852,24 +1007,45 @@ Do not use when:
         # it into a session File so the analysis stack can use it — same path as
         # read_mcp_resource / uploaded files. Sets session_file_id for the agent
         # to pass to inspect_data / create_data.
-        if not output.get("file_id"):
+        # Every file is attached, alongside the data artifact above — a tool
+        # that returns text AND a file (GitHub's "downloaded" note + the file
+        # body) must not lose the file because the text already took file_id.
+        binaries = result.get("binaries") or []
+        if binaries:
             import base64
             from ._file_tool_common import attach_drive_file_to_session, ext_for_mime
-            for b in (result.get("binaries") or []):
-                if not b.get("blob_b64") or not ext_for_mime(b.get("mime_type")):
+            attached: list = []
+            dropped: list = []
+            for idx, b in enumerate(binaries):
+                mime = b.get("mime_type") or "application/octet-stream"
+                uri = b.get("uri")
+                if len(attached) >= _MAX_ATTACHED_FILES:
+                    dropped.append({"mime_type": mime, "uri": uri, "reason": "too many files in one result"})
                     continue
                 try:
-                    raw = base64.b64decode(b["blob_b64"], validate=False)
+                    raw = base64.b64decode(b.get("blob_b64") or "", validate=False)
                 except Exception:
+                    dropped.append({"mime_type": mime, "uri": uri, "reason": "invalid base64"})
                     continue
-                name = (str(b.get("uri") or data.tool_name).rstrip("/").split("/")[-1]) or data.tool_name
+                if not ext_for_mime(mime):
+                    dropped.append({"mime_type": mime, "uri": uri, "bytes": len(raw),
+                                    "reason": "file type cannot be opened here"})
+                    continue
+                base = (str(uri or "").rstrip("/").split("/")[-1]) or data.tool_name
+                name = base if uri or len(binaries) == 1 else f"{base}_{idx + 1}"
                 sid = await attach_drive_file_to_session(
-                    runtime_ctx, filename=name, content_bytes=raw, mime_type=b.get("mime_type"),
+                    runtime_ctx, filename=name, content_bytes=raw, mime_type=mime,
                 )
                 if sid:
-                    output["file_id"] = sid
-                    output["session_file_id"] = sid
-                    break
+                    attached.append({"file_id": sid, "file_name": name, "mime_type": mime})
+                else:
+                    dropped.append({"mime_type": mime, "uri": uri, "bytes": len(raw),
+                                    "reason": "could not be saved (empty or over the size cap)"})
+            if attached:
+                output["attached_files"] = attached
+                output["session_file_id"] = attached[0]["file_id"]
+            if dropped:
+                output["dropped_files"] = dropped
 
         # Audit
         await log_tool_audit(
@@ -902,6 +1078,8 @@ Do not use when:
                     # read it without re-running the call.
                     "media": output.get("media"),
                     "file_name": output.get("file_name"),
+                    "attached_files": output.get("attached_files"),
+                    "dropped_files": output.get("dropped_files"),
                     "tabular_path": output.get("tabular_path"),
                     "candidate_paths": output.get("candidate_paths"),
                     "record_shape": output.get("record_shape"),
@@ -935,6 +1113,7 @@ Do not use when:
         caller proceeds to execute the tool.
         """
         import asyncio
+        import json
         from uuid import uuid4
         from app.services.tool_policy_service import (
             ToolPolicyService,
@@ -945,13 +1124,27 @@ Do not use when:
         )
         from app.ai.tools.schemas import ToolConfirmationEvent
 
+        runtime_ctx.pop("_mcp_policy_approval", None)
         user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
         # Agents in this run that own the connection — their overlay applies.
-        ds_ids = [
-            str(ds.id)
-            for ds in (getattr(report, "data_sources", None) or [])
-            if any(str(c.id) == str(connection.id) for c in (ds.connections or []))
-        ]
+        # The run's agents when known (an Auto report has none attached, which
+        # silently skipped per-agent overrides such as a disabled tool).
+        run_agent_ids = runtime_ctx.get("run_agent_ids")
+        if run_agent_ids is not None:
+            from sqlalchemy import select
+            from app.models.domain_connection import domain_connection
+            ds_ids = [str(r[0]) for r in (await db.execute(
+                select(domain_connection.c.data_source_id).where(
+                    domain_connection.c.connection_id == str(connection.id),
+                    domain_connection.c.data_source_id.in_([str(i) for i in run_agent_ids] or [""]),
+                )
+            )).all()]
+        else:
+            ds_ids = [
+                str(ds.id)
+                for ds in (getattr(report, "data_sources", None) or [])
+                if any(str(c.id) == str(connection.id) for c in (ds.connections or []))
+            ]
         policy_svc = ToolPolicyService()
         resolution = await policy_svc.resolve_for_run(
             db, tool=tool_record, data_source_ids=ds_ids, user=user
@@ -966,7 +1159,13 @@ Do not use when:
             return
 
         effective = resolution.effective
+        remote_shell = connection.type == "remote_ssh" and data.tool_name == "execute_shell"
+        if remote_shell:
+            from app.services.remote_shell_policy import effective_shell_policy
+            effective = await effective_shell_policy(db, connection, tool_record, resolution, user, data.arguments, getattr(report, "id", None) if ToolPolicyService.is_interactive_run(runtime_ctx) else None)
         if effective == TOOL_POLICY_ALLOW:
+            if remote_shell:
+                runtime_ctx["_remote_shell_authorized"] = True
             return
 
         if effective == TOOL_POLICY_DENY:
@@ -983,9 +1182,9 @@ Do not use when:
             )
             yield self._policy_end_event(
                 data.tool_name,
-                f"Tool '{data.tool_name}' is denied by policy and cannot be executed. "
-                "Continue the task without it.",
+                f"Tool '{data.tool_name}' is denied by policy and cannot be executed.",
                 blocked_by="deny",
+                guidance="Continue the task without it.",
             )
             return
 
@@ -1024,9 +1223,9 @@ Do not use when:
             if not verdict.approve:
                 yield self._policy_end_event(
                     data.tool_name,
-                    f"Automatic policy review declined this call: {verdict.reason or 'not approved'}. "
-                    "You may ask the user to run it manually or continue without it.",
+                    f"Automatic policy review declined this call: {verdict.reason or 'not approved'}.",
                     blocked_by="auto",
+                    guidance="You may ask the user to run it manually or continue without it.",
                     extra_output={
                         "policy_reason": verdict.reason,
                         "policy_verdict": {"approved": False, "reason": verdict.reason or ""},
@@ -1050,8 +1249,9 @@ Do not use when:
                 yield self._policy_end_event(
                     data.tool_name,
                     f"Tool '{data.tool_name}' requires user approval, which is not "
-                    "available in this context (scheduled/background run). Continue without it.",
+                    "available in this context (scheduled/background run).",
                     blocked_by="ask",
+                    guidance="Continue without it.",
                 )
                 return
 
@@ -1061,6 +1261,23 @@ Do not use when:
             )
             from app.services.tool_confirmation_service import ToolConfirmationService
 
+            from app.data_sources.clients.remote_server_client import action_digest
+            approval_snapshot = None
+            confirmation_arguments = dict(data.arguments or {})
+            if connection.type == "remote_ssh":
+                from app.services.connection_service import ConnectionService
+                remote_credentials = await ConnectionService().resolve_credentials(db, connection, user)
+                approval_snapshot = action_digest({"arguments": data.arguments, "config": connection.config, "credentials": remote_credentials})
+                remote_config = json.loads(connection.config) if isinstance(connection.config, str) else connection.config
+                confirmation_arguments["_execution_target"] = {
+                    "server": remote_config.get("host"), "port": remote_config.get("port", 22),
+                    "username": remote_credentials.get("username"),
+                    "mandatory_approval": data.tool_name == "execute_shell" and remote_config.get("shell_policy") == "strict",
+                    "shell_permissions": data.tool_name == "execute_shell",
+                    "shell": "powershell" if remote_config.get("operating_system") == "windows" else remote_config.get("linux_shell", "bash"),
+                    "session_permissions": bool(report),
+                    "timeout_seconds": remote_config.get("timeout_seconds", 30),
+                }
             confirmation_id = str(uuid4())
             head = runtime_ctx.get("head_completion")
             system = runtime_ctx.get("system_completion")
@@ -1089,7 +1306,7 @@ Do not use when:
                 connection_id=str(connection.id),
                 connection_tool_id=str(tool_record.id),
                 tool_name=data.tool_name,
-                arguments=data.arguments or {},
+                arguments=confirmation_arguments,
                 timeout_seconds=self._ASK_TIMEOUT_S,
             )
             # Release the session's transaction before blocking on the user —
@@ -1106,7 +1323,7 @@ Do not use when:
                     "connection_id": str(connection.id),
                     "connection_name": connection.name,
                     "connection_tool_id": str(tool_record.id),
-                    "arguments": data.arguments or {},
+                    "arguments": confirmation_arguments,
                     "timeout_seconds": self._ASK_TIMEOUT_S,
                 })
                 sigkill = runtime_ctx.get("sigkill_event")
@@ -1147,7 +1364,23 @@ Do not use when:
                     # row as answerable so a late click gets a clear 'expired'.
                     await confirmations.expire(db, confirmation_id)
 
-            approved = bool(response and response.get("approved"))
+            # Stop wins even if an approval landed in the final poll window.
+            sigkill = runtime_ctx.get("sigkill_event")
+            cancelled = bool(sigkill is not None and sigkill.is_set())
+            approved = bool(response and response.get("approved")) and not cancelled
+            if approved and approval_snapshot is not None:
+                await db.refresh(connection)
+                await db.refresh(tool_record)
+                remote_credentials = await ConnectionService().resolve_credentials(db, connection, user)
+                current = action_digest({"arguments": data.arguments, "config": connection.config, "credentials": remote_credentials})
+                latest_policy = await policy_svc.resolve_for_run(db, tool=tool_record, data_source_ids=ds_ids, user=user)
+                from app.services.remote_server_access import remote_run_access
+                still_authorized = await remote_run_access(db, connection, user, ds_ids)
+                latest_effective = latest_policy.effective
+                if remote_shell:
+                    latest_effective = await effective_shell_policy(db, connection, tool_record, latest_policy, user, data.arguments, getattr(report, "id", None) if ToolPolicyService.is_interactive_run(runtime_ctx) else None)
+                if current != approval_snapshot or not latest_policy.is_enabled or latest_effective == TOOL_POLICY_DENY or not still_authorized:
+                    approved = False
             # Who decided. The DB-poll path only carries the resolver's id, but
             # may_respond restricts responding to the run's own user, so their
             # name is the correct display fallback whenever a decision exists.
@@ -1162,7 +1395,8 @@ Do not use when:
             runtime_ctx["_mcp_policy_approval"] = {
                 "approved": approved,
                 "remember": bool(response and response.get("remember")),
-                "timed_out": response is None,
+                "timed_out": response is None and not cancelled,
+                "cancelled": cancelled,
                 "resolved_by_name": resolved_by_name,
             }
             await log_tool_audit(
@@ -1175,14 +1409,17 @@ Do not use when:
                     "connection_id": str(connection.id),
                     "approved": approved,
                     "remembered": bool(response and response.get("remember")),
-                    "timed_out": response is None,
+                    "timed_out": response is None and not cancelled,
+                    "cancelled": cancelled,
                 },
             )
             if not approved:
-                reason = (
-                    "the approval request timed out"
-                    if response is None else "the user declined it"
-                )
+                outcome = "cancelled" if cancelled else "approval_expired" if response is None else "denied"
+                message = {
+                    "cancelled": "Cancelled before execution.",
+                    "approval_expired": "Approval expired before execution.",
+                    "denied": "Execution was denied.",
+                }[outcome]
                 remembered = bool(response and response.get("remember"))
                 if remembered:
                     guidance = "The user saved 'always deny' for this tool — do not retry it."
@@ -1197,9 +1434,11 @@ Do not use when:
                     )
                 yield self._policy_end_event(
                     data.tool_name,
-                    f"Tool '{data.tool_name}' was not executed because {reason}. {guidance}",
+                    message,
                     blocked_by="ask",
-                    extra_output={"approval": runtime_ctx.get("_mcp_policy_approval")},
+                    guidance="The user stopped the run. Do not execute this call." if cancelled else guidance,
+                    extra_output={"approval": runtime_ctx.get("_mcp_policy_approval"), "outcome": outcome,
+                                  "execution_state": "not_started"},
                 )
                 return
             yield ToolProgressEvent(type="tool.progress", payload={
@@ -1267,7 +1506,8 @@ Do not use when:
 
     @staticmethod
     def _policy_end_event(tool_name: str, message: str, *, blocked_by: str,
-                          extra_output: Dict[str, Any] | None = None) -> ToolEndEvent:
+                          extra_output: Dict[str, Any] | None = None,
+                          guidance: str = "") -> ToolEndEvent:
         output = {
             "success": False,
             "error_message": message,
@@ -1280,7 +1520,7 @@ Do not use when:
             payload={
                 "output": output,
                 "observation": {
-                    "summary": message,
+                    "summary": " ".join(filter(None, [message, guidance])),
                     "success": False,
                     "blocked_by_policy": blocked_by,
                 },
@@ -1288,7 +1528,8 @@ Do not use when:
         )
 
     @staticmethod
-    def _failure_payload(tool_name: str, error: str, input_schema: Any) -> Dict[str, Any]:
+    def _failure_payload(tool_name: str, error: str, input_schema: Any, *,
+                         outcome: str = "failed", extra_output: Dict[str, Any] | None = None) -> Dict[str, Any]:
         """Build a tool.end payload for a failed MCP call that includes the
         tool's declared input schema.
 
@@ -1299,6 +1540,21 @@ Do not use when:
         """
         err = error or "Unknown error"
         summary = f"Tool '{tool_name}' failed: {err}"
+        if outcome == "execution_timed_out":
+            return {
+                "output": {**(extra_output or {}), "success": False, "error_message": err,
+                           "outcome": outcome, "execution_state": "unknown"},
+                "observation": {"summary": summary + " Check remote state before retrying; do not assume the process stopped.",
+                                "success": False, "outcome": outcome},
+            }
+        from app.services.mcp_cooldown import retry_after
+        delay = retry_after(err)
+        if delay is not None:
+            return {
+                "output": {**(extra_output or {}), "success": False, "error_message": err, "outcome": outcome, "retry_after_seconds": delay},
+                "observation": {"success": False, "retry_after_seconds": delay,
+                    "summary": summary + f". Wait at least {delay} seconds before retrying this connection. Use wait; do not fan out retries or change valid arguments to solve a rate limit."},
+            }
         resolved = input_schema
         if input_schema:
             # Render the FULL shape, not one flat level: nested objects, array
@@ -1319,7 +1575,7 @@ Do not use when:
             except Exception:
                 resolved = input_schema
         return {
-            "output": {"success": False, "error_message": err, "input_schema": resolved},
+            "output": {**(extra_output or {}), "success": False, "error_message": err, "outcome": outcome, "input_schema": resolved},
             "observation": {"summary": summary, "success": False, "input_schema": resolved},
         }
 
@@ -1338,54 +1594,10 @@ Do not use when:
         floor. A long log, transcript or report is exactly the kind of result a
         follow-up tool needs in full, so it goes to disk like everything else.
         """
-        from uuid import uuid4
-        from app.models.file import File
-
-        db = runtime_ctx.get("db")
-        report = runtime_ctx.get("report")
-        organization = runtime_ctx.get("organization")
-        user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
-
         safe_name = tool_name.replace("/", "_").replace(" ", "_")
-        unique_name = f"{uuid4()}_{safe_name}.{extension}"
-        path = _upload_path(unique_name)
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-
-        file = File(
-            filename=f"{safe_name}.{extension}",
-            path=path,
-            content_type=content_type,
-            # A tool product, not a user attachment: keeps it off the prompt
-            # box's pending-attachment chips (see File.source_kind).
-            source_kind="artifact",
-            user_id=str(user.id) if user else None,
-            organization_id=str(organization.id) if organization else None,
+        return await save_text_artifact(
+            runtime_ctx, f"{safe_name}.{extension}", text, content_type=content_type,
         )
-
-        try:
-            from app.services.file_preview import generate_file_preview
-            file.preview = generate_file_preview(file)
-        except Exception:
-            pass
-
-        async with db.begin_nested():
-            db.add(file)
-            await db.flush()
-
-            if report:
-                from app.models.report_file_association import report_file_association
-                from sqlalchemy import insert
-                await db.execute(
-                    insert(report_file_association).values(
-                        report_id=str(report.id),
-                        file_id=str(file.id),
-                    )
-                )
-
-        _register_same_turn(file, runtime_ctx, report)
-        return file
 
     async def _materialize_to_json(self, data: Any, tool_name: str, runtime_ctx: dict):
         """Save a JSON result as a file so write_csv / create_data can read it."""
@@ -1409,6 +1621,8 @@ Do not use when:
 
         with open(path, "w") as f:
             json.dump(data, f, default=str)
+        from app.services import storage
+        await storage.apersist(path, "application/json")
 
         file = File(
             filename=f"{safe_name}.json",

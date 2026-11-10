@@ -66,24 +66,6 @@ class TimeSeriesMetrics(BaseModel):
     activity_metrics: ActivityMetrics
     performance_metrics: PerformanceMetrics
 
-# Diagnosis activity timeseries (agent executions bucketed daily by status)
-class DiagnosisStatusPoint(BaseModel):
-    date: str
-    success: int
-    error: int
-
-class DiagnosisTimeSeriesMetrics(BaseModel):
-    date_range: DateRange
-    points: List[DiagnosisStatusPoint]
-
-class DiagnosisUser(BaseModel):
-    id: str
-    name: str
-    email: str
-
-class DiagnosisUsersResponse(BaseModel):
-    users: List[DiagnosisUser]
-
 class TableUsageData(BaseModel):
     table_name: str
     usage_count: int
@@ -125,6 +107,16 @@ class LLMUsageItem(BaseModel):
     completion_tokens: int
     cache_read_tokens: int
     cache_creation_tokens: int
+    # Of cache_creation_tokens, the share written under the 1-hour TTL (billed
+    # at 2x rather than 1.25x). Reasoning tokens are a subset of
+    # completion_tokens, billed at the output rate.
+    cache_write_1h_tokens: int = 0
+    reasoning_tokens: int = 0
+    # Share of input tokens served from cache. None (not 0) when the model
+    # family reports no cache telemetry at all — Gemini and non-Claude Bedrock
+    # models — because 0% and "cannot be measured" are different answers and
+    # rendering the second as the first reads as a broken cache.
+    cache_hit_rate: Optional[float] = None
     total_tokens: int
     input_cost_usd: float
     output_cost_usd: float
@@ -302,26 +294,6 @@ class TraceData(BaseModel):
     issue_type: str
     user_name: str
     user_email: Optional[str] = None
-
-# Compact issues (completion-anchored)
-class CompactIssueItem(BaseModel):
-    completion_id: str
-    created_at: UTCDatetime
-    issue_type: str
-    summary_text: str
-    full_message: Optional[str] = None
-    tool_name: Optional[str] = None
-    tool_action: Optional[str] = None
-    user_name: Optional[str] = None
-    user_email: Optional[str] = None
-    head_prompt_snippet: Optional[str] = None
-    report_id: str
-    trace_url: Optional[str] = None
-
-class CompactIssuesResponse(BaseModel):
-    items: List[CompactIssueItem]
-    total_items: int
-    date_range: DateRange
 
 # Tool executions table (diagnosis)
 class ToolExecutionDiagnosisItem(BaseModel):

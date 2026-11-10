@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.data_sources.clients.progress import discovery_progress
 
 import glob
 import os
@@ -11,6 +12,7 @@ import duckdb
 import pandas as pd
 
 from app.ai.prompt_formatters import Table, TableColumn, TableFormatter
+from app.data_sources.clients.progress import IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 from app.data_sources.clients.progress import ProgressCallback, make_reporter
 from app.settings.logging_config import get_logger
@@ -193,7 +195,10 @@ class CSVClient(DataSourceClient):
                 try:
                     for fname, ftype in self._describe_file(con, filepath):
                         cols.append(TableColumn(name=fname, dtype=ftype))
+                except IndexingCancelled:
+                    raise
                 except Exception as exc:
+                    self.mark_discovery_incomplete("csv catalog")
                     logger.warning(
                         "csv.schema.file.error",
                         extra={"csv_file": filepath, "csv_error": str(exc)},
@@ -211,6 +216,7 @@ class CSVClient(DataSourceClient):
         logger.debug("csv.schema.done", extra={"csv_tables": len(tables)})
         return tables
 
+    @discovery_progress
     def get_schemas(self, progress_callback: Optional[ProgressCallback] = None) -> List[Table]:
         return self.get_tables(progress_callback=progress_callback)
 

@@ -41,13 +41,44 @@ class FileEntry(BaseModel):
             "directly instead of reading each message just to get its date."
         ),
     )
+    created_at: Optional[str] = Field(
+        None,
+        description="ISO-8601 creation time when the source reports one (SharePoint Server); otherwise null.",
+    )
+    sender: Optional[str] = Field(
+        None,
+        description=(
+            "For EMAIL items, the sender's address. Together with "
+            "`modified_at` (the received date) this answers \"who sent what, "
+            "when\" from the listing alone — no need to open each message. "
+            "None for ordinary files."
+        ),
+    )
     web_url: Optional[str] = None
+    preview: Optional[str] = Field(
+        None,
+        description=(
+            "For EMAIL items, the first ~255 characters of the body as plain "
+            "text — enough to triage a message without opening it. None for "
+            "ordinary files."
+        ),
+    )
+    is_read: Optional[bool] = Field(None, description="For EMAIL items, whether the message is marked read.")
+    folder: Optional[str] = Field(None, description="For EMAIL items, the mail folder (or label) path when known.")
 
 
 # ----------------------------------------------------------- list_files
 
 
 class ListFilesInput(BaseModel):
+    limit: int = Field(
+        50, ge=1, le=500,
+        description=(
+            "SharePoint only: maximum matching files to return (default 50). "
+            "Use 1 when any one file is sufficient. Other connectors keep their existing limits. "
+            "With persist=true: only the number of preview rows (default 20, max 50)."
+        ),
+    )
     connection_id: str = Field(
         ...,
         description=(
@@ -61,7 +92,10 @@ class ListFilesInput(BaseModel):
     folder_id: Optional[str] = Field(
         None,
         description=(
-            "Optional folder ID returned by a previous list_files call. "
+            "Optional folder: an id returned by a previous list_files call, or for "
+            "SharePoint a folder path relative to the library ('Finance/2026'). "
+            "For KMS Lighthouse, pass the folder part of an entry's path (for example 'Folder/Subfolder'); "
+            "paths start below the connection's root folder when one is set. "
             "Leave blank to use the connection's configured root."
         ),
     )
@@ -77,7 +111,84 @@ class ListFilesInput(BaseModel):
             "roundtrip vs listing everything and filtering client-side."
         ),
     )
+    created_after: Optional[str] = Field(
+        None,
+        description=(
+            "SharePoint only: keep files created at or after this ISO-8601 date/datetime "
+            "(UTC when no offset is given). Files whose source reports no creation time never match."
+        ),
+    )
+    created_before: Optional[str] = Field(
+        None, description="SharePoint only: keep files created strictly before this ISO-8601 date/datetime.",
+    )
+    modified_after: Optional[str] = Field(
+        None, description="SharePoint only: keep files last modified at or after this ISO-8601 date/datetime.",
+    )
+    modified_before: Optional[str] = Field(
+        None, description="SharePoint only: keep files last modified strictly before this ISO-8601 date/datetime.",
+    )
+    source: Literal["auto", "catalog", "live"] = Field(
+        "auto",
+        description=(
+            "Where to list from. 'auto' (default) uses the indexed catalog when the connection has one "
+            "(SharePoint; instant, supports cursor paging and sorting; as fresh as the last index run, "
+            "see indexed_at in the result) and otherwise reads the source live. 'catalog' requires the "
+            "catalog and fails if there is none. 'live' always reads the source (bounded, slower; use it "
+            "when a file was added since the last index run)."
+        ),
+    )
+    cursor: Optional[str] = Field(
+        None,
+        description=(
+            "Continuation token (next_cursor from the previous list_files call) to fetch the next page of the "
+            "SAME listing — keep every other input identical. Catalog listings only."
+        ),
+    )
+    sort_by: Literal["name", "modified_at", "created_at", "size"] = Field(
+        "name", description="Catalog listings only: sort key. Files lacking the field sort last.",
+    )
+    sort_order: Literal["asc", "desc"] = Field("asc", description="Catalog listings only: sort direction.")
+    group_by: Literal["file", "folder"] = Field(
+        "file",
+        description=(
+            "Catalog listings only. 'file' (default) lists files. 'folder' lists the folders `depth` levels "
+            "below the scope (or below folder_id), one row per folder with its file count, latest modified "
+            "and earliest created time and sample file names — every top-level folder in one call. Filters "
+            "(name_pattern, dates, folder_id) apply to files before grouping and always include subfolders. "
+            "sort_by='size' sorts folders by file count. Needs the indexed catalog; fails with source='live'."
+        ),
+    )
+    depth: int = Field(
+        1, ge=1, le=20,
+        description="With group_by='folder': folder level to group at (1 = top-level folders, 2 = their subfolders).",
+    )
+    persist: bool = Field(
+        False,
+        description=(
+            "Save the COMPLETE listing as a CSV in this report; returns a file_id and a short preview instead "
+            "of rows. Use for large listings, folder-by-folder work, resuming an interrupted run, or giving "
+            "sub-agents slices. Every row matching folder_id, recursive, name_pattern, the dates and group_by is "
+            "saved, in sort_by order; limit only sizes the preview (default 20, max 50); no cursor. Columns: "
+            "files — id, path, folder (parent path), folder_1..N (folder name per level, folder_1 = top), name, "
+            "ext, size, modified_at, created_at, web_url, indexed_at; folders — path, name, parent, depth, "
+            "folder_1..N, file_count, latest_modified_at, earliest_created_at, sample_files, indexed_at. Reads "
+            "the indexed catalog only: leave source='auto' (source='live' is refused). On a per-user (sign-in) "
+            "connection it saves only YOUR own indexed files. Query it with create_data(source_file_ids=[file_id]); for folders not yet in an "
+            "Agent List, pass the file_id AND the list's table (tables_by_source) to one create_data and keep "
+            "folders with no matching key. The same call again returns the same file; reuse its file_id on "
+            "later turns instead of listing again."
+        ),
+    )
     title: Optional[str] = _title_field()
+
+
+class FolderEntry(BaseModel):
+    path: str = Field(..., description="Folder path relative to the library; pass as folder_id to list its files.")
+    name: str
+    file_count: int = Field(..., description="Matching files in this folder, including its subfolders.")
+    latest_modified_at: Optional[str] = None
+    earliest_created_at: Optional[str] = None
+    sample_files: List[str] = Field(default_factory=list)
 
 
 class ListFilesOutput(BaseModel):
@@ -86,6 +197,29 @@ class ListFilesOutput(BaseModel):
     file_count: int = 0
     files: List[FileEntry] = Field(default_factory=list)
     truncated: bool = False
+    incomplete: bool = False
+    stop_reason: Optional[str] = None
+    source: Optional[str] = Field(None, description="'catalog' or 'live' — where this listing came from.")
+    indexed_at: Optional[str] = Field(None, description="Catalog listings: when the catalog was last indexed (UTC).")
+    catalog_files: Optional[int] = Field(None, description="Catalog listings: files in the whole catalog.")
+    matched: Optional[int] = Field(None, description="Catalog listings: files matching the filters before paging.")
+    next_cursor: Optional[str] = Field(None, description="Pass back as `cursor` for the next page. Null when complete.")
+    group_by: Optional[str] = Field(None, description="'folder' when this is a folder listing.")
+    folders: List[FolderEntry] = Field(default_factory=list, description="group_by='folder': this page of folders.")
+    folder_count: Optional[int] = Field(None, description="group_by='folder': folders matching in total, before paging.")
+    files_outside_folders: Optional[int] = Field(
+        None, description="group_by='folder': matching files above the grouped level (in no folder at that depth).",
+    )
+    persisted: bool = Field(False, description="persist=true: the full listing was saved to file_id.")
+    file_id: Optional[str] = Field(
+        None, description="persist=true: the saved CSV — pass in create_data(source_file_ids=[...]) or read_file.",
+    )
+    file_name: Optional[str] = None
+    listed_as: Optional[str] = Field(
+        None, description="persist=true: whose view was saved — 'service_account' or 'user:<id>' (per-user).",
+    )
+    row_count: Optional[int] = Field(None, description="persist=true: rows saved to the file.")
+    columns: List[str] = Field(default_factory=list, description="persist=true: the CSV's columns.")
     error: Optional[str] = None
 
 
@@ -110,12 +244,23 @@ class ReadFileInput(BaseModel):
             "(conversation attachments — leave connection_id empty), or the "
             "`id` returned by list_files/search_files for a file source (with "
             "connection_id set). A filename like 'Book 7.xlsx' is resolved as "
-            "a fallback on file sources, but the id is unambiguous."
+            "a fallback on file sources, but the id is unambiguous. "
+            "EMAIL ATTACHMENTS: an attachment of an .eml/.msg file is addressed "
+            "as `<email file id>#att:<index>:<filename>` (0-based index; the "
+            "email's read lists these ids) — pass it here with the email's "
+            "connection_id to read the attachment as a file of its own type. "
+            "A nested forwarded message chains another `#att:` segment. These "
+            "ids are for read_file only — inspect_data / create_data take the "
+            "`session_file_id` that reading the attachment returns."
         ),
     )
     sheet: Optional[str] = Field(
         None,
-        description="For Excel / Google Sheets only: sheet name. Defaults to the first sheet.",
+        description=(
+            "For Excel / Google Sheets only: the sheet to read. Defaults to the "
+            "first sheet. A workbook read returns `sheets` (every sheet name in "
+            "the file) — read another one by passing its name here."
+        ),
     )
     max_rows: int = Field(
         default=1000,
@@ -133,26 +278,40 @@ class ReadFileInput(BaseModel):
         default=None,
         ge=0,
         description=(
-            "For object-store / large files: start byte for a windowed (ranged) "
-            "read. When set, the file is NOT parsed or attached — you get a raw "
-            "byte window plus `next_cursor`/`eof` to page forward. Pass "
-            "`next_cursor` from the previous read as the next `offset` until "
-            "`eof` is true. Leave unset for a normal whole-file read."
+            "Start position for a windowed read of a LONG file — works on every "
+            "connection and on conversation attachments. When set, the file is "
+            "NOT attached; you get one window of its content plus "
+            "`next_cursor`/`eof`. Pass `next_cursor` from the previous read as "
+            "the next `offset` until `eof` is true — or fire windows at a fixed "
+            "stride (0, length, 2*length, …) in parallel; they are contiguous. "
+            "The result's `unit` says what the offsets count: 'bytes' (raw byte "
+            "windows on Files & Directories / S3 text files, adjusted by at most "
+            "3 bytes at an edge so a multi-byte character is never split) or "
+            "'chars' (characters of the extracted text — documents, SharePoint, "
+            "Drive, mail and every other source). Use 0 to start. Leave unset "
+            "for a normal whole-file read. For one specific PDF page, prefer "
+            "page_range."
         ),
     )
     length: Optional[int] = Field(
         default=None,
         ge=1,
         le=50_000_000,
-        description="For windowed reads: number of bytes to fetch from `offset`. Defaults to ~1 MiB.",
+        description=(
+            "For windowed reads: how much to return from `offset`, in the "
+            "result's `unit` (bytes or characters). Use 8000 or less so each "
+            "window reaches you in full; defaults to ~1 MiB. Lines are NOT kept "
+            "whole across a window boundary."
+        ),
     )
     page_range: Optional[str] = Field(
         default=None,
         description=(
             "For PDF documents: read ONLY these pages, e.g. '3' or '10-15' "
             "(1-based, inclusive). The result reports pages_total so you can "
-            "page through a large document deliberately — the PDF equivalent "
-            "of offset/length for text files. Mutually exclusive with offset."
+            "page through a large document deliberately — the precise way to "
+            "reach a specific page, where offset/length pages by text position. "
+            "Mutually exclusive with offset."
         ),
     )
     as_images: bool = Field(
@@ -238,6 +397,13 @@ class ReadFileOutput(BaseModel):
     rows_shown: Optional[int] = None
     col_count: Optional[int] = None
     truncated: bool = False
+    # Excel / Google Sheets: the sheet shown in `csv`, and every sheet in the
+    # workbook (in workbook order). Unset for non-workbook files.
+    sheet: Optional[str] = None
+    sheets: Optional[List[str]] = Field(
+        default=None,
+        description="Every sheet name in the workbook. Pass one as `sheet` to read it.",
+    )
     byte_count: Optional[int] = None  # for binary
     garbled: Optional[bool] = Field(
         default=None,
@@ -260,19 +426,28 @@ class ReadFileOutput(BaseModel):
     # `offset` until `eof` is true.
     windowed: bool = Field(
         default=False,
-        description="True when this was a windowed byte-range read (not a parsed/attached whole-file read).",
+        description="True when this was a windowed (offset/length) read, not a parsed/attached whole-file read.",
+    )
+    unit: Literal["bytes", "chars"] | None = Field(
+        default=None,
+        description=(
+            "What `offset`, `next_cursor` and `total_size` count for a windowed "
+            "read: 'bytes' when the source served a raw byte window, 'chars' "
+            "when the tool paged the extracted text (documents and every "
+            "connector without native ranged reads)."
+        ),
     )
     next_cursor: Optional[int] = Field(
         default=None,
-        description="Byte offset to pass as the next `offset` to continue reading. Null when eof.",
+        description="Position (in `unit`) of the first byte/character NOT returned by this window: pass it as the next `offset` to continue reading. Null when eof.",
     )
     total_size: Optional[int] = Field(
         default=None,
-        description="Total size of the object in bytes (for windowed reads).",
+        description="Total size of the content in `unit` (for windowed reads).",
     )
     eof: Optional[bool] = Field(
         default=None,
-        description="True when the window reached the end of the object.",
+        description="True when the window reached the end of the content.",
     )
     encoding: Optional[str] = Field(
         default=None,
@@ -329,9 +504,10 @@ class SearchFilesInput(BaseModel):
     deep: bool = Field(
         default=False,
         description=(
-            "Force an exhaustive live scan of every file's full contents instead "
-            "of the fast keyword index. Slower — use only when the fast search "
-            "misses a term you're sure is inside a file."
+            "Also run an exhaustive live scan and merge it with the keyword-index "
+            "hits. Slower — use only when the fast search misses a term you're "
+            "sure is inside a file. On SharePoint Server the live scan matches "
+            "filenames only; the keyword index is the content search there."
         ),
     )
     title: Optional[str] = _title_field()
@@ -344,6 +520,14 @@ class SearchFilesOutput(BaseModel):
     file_count: int = 0
     files: List[FileEntry] = Field(default_factory=list)
     error: Optional[str] = None
+    # "catalog" (keyword index or catalog name match), "live", or "catalog+live".
+    source: Optional[str] = None
+    # When the catalog was last indexed (UTC ISO), for catalog answers.
+    indexed_at: Optional[str] = None
+    # True when a live scan stopped early; stop_reason says why
+    # (deadline / cancelled / folder_limit / catalog_limit).
+    incomplete: bool = False
+    stop_reason: Optional[str] = None
 
 
 # ----------------------------------------------------------- grep_files
@@ -355,8 +539,9 @@ class GrepFilesInput(BaseModel):
         description=(
             "For files on a FILE SOURCE: the connection UUID from the `id=` "
             "attribute of the `<connection>` tag (Connection ID or "
-            "DataSource/agent ID). LEAVE EMPTY to grep the files attached to "
-            "this conversation (the <files> block) instead."
+            "DataSource/agent ID). LEAVE EMPTY to grep the files in this "
+            "conversation's <files> block instead — uploads and the agent's "
+            "library files (those carry source=\"agent\")."
         ),
     )
     pattern: str = Field(
@@ -375,7 +560,8 @@ class GrepFilesInput(BaseModel):
     file_ids: Optional[List[str]] = Field(
         None,
         description=(
-            "Explicit files to scan (ids from list_files / search_files). "
+            "Explicit files to scan (ids from the <files> block, list_files or "
+            "search_files). "
             "Mutually exclusive with name_pattern/folder_id — use this to grep "
             "a known set, or name_pattern to sweep a corpus."
         ),
@@ -404,12 +590,17 @@ class GrepFilesInput(BaseModel):
     )
     max_matches_per_file: int = Field(
         50, ge=1, le=500,
-        description="Per-file cap so one noisy file can't exhaust the whole match budget.",
+        description="Per-file match cap. Network directory/S3 returns a cursor to continue this file; other sources may truncate it.",
     )
     max_files: int = Field(500, ge=1, le=5000, description="Max files to scan this call.")
     max_bytes_per_file: int = Field(
         20_000_000, ge=1024, le=100_000_000,
-        description="Files larger than this are skipped and reported in files_skipped.",
+        description=(
+            "Network directory/S3 text: bytes scanned per file per call, resumable "
+            "with cursor; also bounded by 100 MB total per call. Budgets may "
+            "overrun to finish a line/context (1 MiB maximum line). Other sources "
+            "retain a file-size cap; email extraction is capped at 20 MB."
+        ),
     )
     cursor: Optional[str] = Field(
         None,
@@ -433,7 +624,7 @@ class GrepMatch(BaseModel):
 
 class SkippedFile(BaseModel):
     file_id: str
-    reason: Literal["too_large", "binary", "unreadable", "access_denied", "not_found"]
+    reason: Literal["too_large", "binary", "unreadable", "access_denied", "not_found", "file_changed", "line_too_long", "regex_timeout"]
 
 
 class GrepFilesOutput(BaseModel):
@@ -450,21 +641,24 @@ class GrepFilesOutput(BaseModel):
     )
     files_scanned: int = 0
     files_with_matches: int = 0
+    bytes_read: int = 0
+    verification_bytes: int = Field(0, description="Additional integrity reads for local append validation; separate from scanned-content bytes.")
+    coverage_complete: bool = True
     files_skipped: List[SkippedFile] = Field(default_factory=list)
     truncated: bool = Field(
-        False, description="True when matches were dropped due to max_matches / per-file caps."
+        False, description="True when a scan or result budget prevented completing the sweep."
     )
-    stop_reason: Literal["complete", "max_matches", "max_files", "time_budget"] = Field(
+    stop_reason: Literal["complete", "max_matches", "max_files", "time_budget", "byte_budget", "cancelled", "catalog_limit"] = Field(
         "complete",
         description=(
-            "Why the sweep ended: 'complete' = everything in scope was scanned; "
+            "Why the sweep ended: 'complete' = enumeration finished; check skipped files and coverage_complete; "
             "'max_matches' = page forward with cursor; 'max_files'/'time_budget' "
             "= narrow the scope or continue with cursor."
         ),
     )
     next_cursor: Optional[str] = Field(
         None,
-        description="Pass back as `cursor` (same pattern + scope) to continue. Null when complete.",
+        description="Pass back as `cursor` (same pattern + scope + context) to continue. Null means no continuation; check coverage_complete and skips before claiming exhaustive results.",
     )
     error: Optional[str] = None
 

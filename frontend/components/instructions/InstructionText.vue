@@ -1,21 +1,22 @@
 <template>
-  <span v-if="!markdown" dir="auto" class="whitespace-pre-wrap text-[13px] leading-relaxed text-gray-900 dark:text-white">
+  <span v-if="!markdown" :dir="plainDir" class="whitespace-pre-wrap text-sm leading-relaxed text-gray-900 dark:text-white">
     <template v-for="(segment, i) in segments" :key="i">
       <span
         v-if="segment.ref || segment.mention"
-        class="inline-flex items-center gap-0.5 px-1 py-0.5 rounded bg-indigo-50 dark:bg-indigo-400/[0.18] border border-indigo-100 dark:border-transparent text-[11px] font-sans font-medium text-indigo-700 dark:text-indigo-200 align-baseline"
+        dir="auto"
+        class="inline-flex items-center gap-0.5 px-1 py-0.5 rounded bg-indigo-50 dark:bg-indigo-400/[0.18] border border-indigo-100 dark:border-transparent text-2xs font-sans font-medium text-indigo-700 dark:text-indigo-200 align-baseline"
       >
         <template v-if="segment.ref">
           <DataSourceIcon
-            v-if="segment.ref.data_source_type || segment.ref.data_source_icon"
+            v-if="segment.ref.data_source_type || segment.ref.data_source_icon || segment.ref.data_source_icon_token"
             :type="segment.ref.data_source_type"
-            :icon="segment.ref.data_source_icon"
+            :icon-token="segment.ref.data_source_icon_token" :icon="segment.ref.data_source_icon"
             class="h-3 flex-shrink-0"
           />
           <Icon
             v-else-if="segment.ref.type === 'instruction'"
-            name="heroicons:document-text"
-            class="w-3 h-3 flex-shrink-0 text-indigo-400"
+            name="heroicons:cube"
+            class="w-3 h-3 flex-shrink-0 text-indigo-500"
           />
           <Icon
             v-else
@@ -45,9 +46,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import MarkdownIt from 'markdown-it'
+import DOMPurify from 'dompurify'
 import DataSourceIcon from '~/components/DataSourceIcon.vue'
 import DocMermaid from '~/components/dashboard/DocMermaid.vue'
-import { firstStrongDir } from '~/utils/textDirection'
+import { countDirWords, dominantTextDir, resolveDirTree, type DirNode, type DirNodeKind } from '~/utils/textDirection'
 import {
   buildMentionMatcher,
   parseMentionSegments,
@@ -69,6 +71,9 @@ interface Reference {
   type: string
   name: string | null
   data_source_type: string | null
+  // Resolved agent icon, when the chip refers to an agent.
+  data_source_icon?: string | null
+  data_source_icon_token?: string | null
 }
 
 const props = defineProps<{
@@ -84,6 +89,8 @@ const normalizedRefs = computed((): Reference[] =>
     type: r.type || r.object_type || '',
     name: r.name || r.display_text || null,
     data_source_type: r.data_source_type || null,
+    data_source_icon: (r as any).data_source_icon ?? null,
+    data_source_icon_token: (r as any).data_source_icon_token ?? null,
   }))
 )
 
@@ -117,37 +124,74 @@ const segments = computed((): Segment[] =>
   })
 )
 
+// Plain-text direction from a word vote over the typed text, mention chips
+// excluded: a Hebrew question that opens with "@Sales DB" or an English term
+// is still RTL. `auto` only when there is no letter to vote with.
+const plainDir = computed(() =>
+  dominantTextDir(segments.value.map(s => s.text || '').join(' ')) || 'auto'
+)
+
 // ─── Markdown rendering ──────────────────────────────────────────────────────
 // Mirrors InstructionEditor's pipeline so read-only and edit views render identically.
 
 const md = new MarkdownIt({ html: true, breaks: false, linkify: false })
 
-// Per-block direction, mirroring the editor's auto-dir decorations: each block
-// token gets an explicit dir from its first strong character, so RTL blocks
-// right-align and list markers / blockquote bars flip to the correct edge
-// (via the logical CSS below). Code blocks are skipped — they stay LTR.
-const DIR_OPEN_TOKENS = new Set([
-  'paragraph_open', 'heading_open', 'bullet_list_open', 'ordered_list_open', 'list_item_open', 'blockquote_open',
-])
+// Per-block direction: the same rules as chat markdown and the instruction
+// editor (resolveDirTree in utils/textDirection.ts) — one decision for the
+// whole instruction by word majority, lists and tables on one side, items and
+// cells following them, short blocks following the text around them. Each
+// block token gets an explicit dir, so RTL blocks right-align and list markers
+// / blockquote bars flip to the correct edge (via the logical CSS in
+// instruction-prose.css). Code doesn't vote and stays LTR.
+const DIR_KIND_BY_TOKEN: Record<string, DirNodeKind> = {
+  paragraph_open: 'block', heading_open: 'block', blockquote_open: 'quote',
+  bullet_list_open: 'list', ordered_list_open: 'list', list_item_open: 'item',
+  // Tables need it most: without a dir of their own an RTL table inherits the
+  // document's LTR and lays its columns out left-to-right.
+  table_open: 'table', tr_open: 'row', th_open: 'cell', td_open: 'cell',
+}
+
+// A table wider than the panel has nowhere to go: it is squeezed until every
+// cell wraps. Wrap each one in its own scroll container (the editor gets the
+// equivalent for free from the Table extension's `.tableWrapper`).
+md.renderer.rules.table_open = (tokens, idx, options, _env, self) =>
+  '<div class="md-table-wrap">' + self.renderToken(tokens, idx, options)
+md.renderer.rules.table_close = (tokens, idx, options, _env, self) =>
+  self.renderToken(tokens, idx, options) + '</div>'
 
 md.core.ruler.push('block_dir', (state) => {
-  const tokens = state.tokens
-  for (let i = 0; i < tokens.length; i++) {
-    const open = tokens[i]
-    if (!DIR_OPEN_TOKENS.has(open.type)) continue
-    let dir: 'rtl' | 'ltr' | null = null
-    for (let j = i + 1; j < tokens.length && !dir; j++) {
-      const t = tokens[j]
-      if (t.level <= open.level) break // reached the matching close token
-      if (t.type !== 'inline') continue
-      for (const child of t.children || []) {
-        if (child.type !== 'text' && child.type !== 'code_inline') continue
-        dir = firstStrongDir(child.content)
-        if (dir) break
-      }
+  const roots: DirNode<any>[] = []
+  const stack: DirNode<any>[] = []
+  const docCounts = { rtl: 0, ltr: 0 }
+  for (const token of state.tokens) {
+    const kind = DIR_KIND_BY_TOKEN[token.type]
+    if (kind) {
+      const node: DirNode<any> = { kind, counts: { rtl: 0, ltr: 0 }, text: '', children: [], ref: token }
+      ;(stack.length ? stack[stack.length - 1].children : roots).push(node)
+      stack.push(node)
+      continue
     }
-    if (dir) open.attrSet('dir', dir)
+    if (token.nesting === -1 && stack.length && token.type.replace(/_close$/, '_open') === stack[stack.length - 1].ref.type) {
+      stack.pop()
+      continue
+    }
+    if (token.type !== 'inline') continue
+    for (const child of token.children || []) {
+      if (child.type !== 'text' && child.type !== 'code_inline') continue
+      for (const node of stack) node.text += child.content
+      if (child.type === 'code_inline') continue // identifiers don't vote
+      countDirWords(child.content, docCounts)
+      for (const node of stack) countDirWords(child.content, node.counts)
+    }
   }
+  const uiDir = typeof document !== 'undefined' && document.documentElement.getAttribute('dir') === 'rtl' ? 'rtl' : null
+  resolveDirTree(roots, docCounts, { fallback: uiDir, settled: true })
+  const apply = (node: DirNode<any>) => {
+    if (node.dir) node.ref.attrSet('dir', node.dir)
+    if (node.signedNumber) node.ref.attrSet('data-bidi-num', '')
+    node.children.forEach(apply)
+  }
+  roots.forEach(apply)
 })
 
 // Same dictionary-driven parse as the plain-text branch above, so a multi-word
@@ -159,9 +203,13 @@ function preprocessMentions(text: string, matcher: MentionMatcher | null): strin
   })
 }
 
+// Instruction text is not only hand-written: instructions are drafted by the
+// agent and learned from sessions, and the renderer runs with html:true so
+// authored HTML passes through. Straight into v-html that is a script-execution
+// path, so sanitize exactly as DocViewer does before rendering markdown.
 function renderProse(text: string, matcher: MentionMatcher | null): string {
   if (!text.trim()) return ''
-  return md.render(preprocessMentions(text, matcher))
+  return DOMPurify.sanitize(md.render(preprocessMentions(text, matcher)))
 }
 
 // Split the markdown into prose blocks and ```mermaid diagram blocks, so a
@@ -212,60 +260,10 @@ const blocks = computed<Block[]>(() => {
 </script>
 
 <style scoped>
-.instruction-prose {
-  font-size: 13px;
-  line-height: 1.625;
-  color: #111827;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-  /* `start` resolves against each block's own dir (set per block from its
-   * first strong character), so RTL blocks right-align. */
-  text-align: start;
-}
-
-.instruction-prose :deep(h1) { font-size: 1.25em; font-weight: 600; margin: 0.75em 0 0.25em; color: #111827; }
-.instruction-prose :deep(h2) { font-size: 1.1em; font-weight: 600; margin: 0.6em 0 0.2em; color: #111827; }
-.instruction-prose :deep(h3) { font-size: 1em; font-weight: 600; margin: 0.5em 0 0.15em; color: #111827; }
-
-.instruction-prose :deep(p) { margin-bottom: 0.5em; }
-.instruction-prose :deep(p:last-child) { margin-bottom: 0; }
-
-.instruction-prose :deep(ul) { padding-inline-start: 1.25em; list-style: disc; margin-bottom: 0.5em; }
-.instruction-prose :deep(ol) { padding-inline-start: 1.25em; list-style: decimal; margin-bottom: 0.5em; }
-.instruction-prose :deep(li) { margin-bottom: 0.2em; }
-
-.instruction-prose :deep(code) {
-  background: #f3f4f6;
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-family: ui-monospace, monospace;
-  font-size: 0.9em;
-  color: #374151;
-}
-
-.instruction-prose :deep(pre) {
-  background: #f9fafb;
-  padding: 10px 12px;
-  border-radius: 6px;
-  margin-bottom: 0.5em;
-  overflow-x: auto;
-  /* Code always reads LTR (same policy as rtl.css). */
-  direction: ltr;
-  unicode-bidi: isolate;
-  text-align: left;
-}
-.instruction-prose :deep(pre code) {
-  background: none;
-  padding: 0;
-  font-size: 11px;
-  line-height: 1.5;
-}
-
-.instruction-prose :deep(blockquote) {
-  border-inline-start: 3px solid #e5e7eb;
-  padding-inline-start: 1em;
-  margin: 0.5em 0;
-  color: #6b7280;
-}
+/* Element typography for the rendered markdown lives in
+   assets/css/instruction-prose.css, shared with InstructionEditor's
+   `.tiptap-prose` so the read-only view and the editor cannot drift apart.
+   Only the mention chip — whose class differs between the two — stays here. */
 
 .instruction-prose :deep(.instruction-mention) {
   background-color: rgba(99, 102, 241, 0.12);
@@ -277,16 +275,9 @@ const blocks = computed<Block[]>(() => {
   white-space: nowrap;
 }
 
-/* Dark mode overrides. The `.dark` class lives on <html> (Tailwind darkMode:
-   'class'), outside this component's scope, so these rules are authored as
-   :global and matched by the unique `.instruction-prose` class. */
-:global(.dark .instruction-prose) { color: #e5e7eb; }
-:global(.dark .instruction-prose h1),
-:global(.dark .instruction-prose h2),
-:global(.dark .instruction-prose h3) { color: #f9fafb; }
-:global(.dark .instruction-prose code) { background: #374151; color: #e5e7eb; }
-:global(.dark .instruction-prose pre) { background: #1f2937; }
-:global(.dark .instruction-prose blockquote) { border-inline-start-color: #374151; color: #9ca3af; }
+/* The `.dark` class lives on <html> (Tailwind darkMode: 'class'), outside this
+   component's scope, so this is authored as :global and matched by the unique
+   `.instruction-prose` class. */
 :global(.dark .instruction-prose .instruction-mention) {
   background-color: rgba(129, 140, 248, 0.18);
   color: #c7d2fe;

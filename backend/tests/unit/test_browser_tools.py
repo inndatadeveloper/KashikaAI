@@ -15,7 +15,9 @@ from types import SimpleNamespace
 import pytest
 
 from app.ai.tools.implementations._browser_common import (
+    BrowserSessionManager,
     _is_link_local_literal,
+    _is_top_level_document,
     get_browser_connection,
     url_matches_patterns,
     validate_url_pattern,
@@ -100,6 +102,35 @@ class TestLinkLocal:
         assert not _is_link_local_literal("example.com")
 
 
+class TestTopLevelDocument:
+    """Off-allowlist iframes (reCAPTCHA, embedded maps) may load from public
+    hosts; only top-level page navigations are confined to the allowlist."""
+
+    @staticmethod
+    def _req(resource_type, parent):
+        return SimpleNamespace(resource_type=resource_type, frame=SimpleNamespace(parent_frame=parent))
+
+    def test_main_frame_navigation_is_top_level(self):
+        assert _is_top_level_document(self._req("document", None))
+
+    def test_iframe_document_is_not_top_level(self):
+        assert not _is_top_level_document(self._req("document", object()))
+
+    @pytest.mark.parametrize("rtype", ["script", "xhr", "fetch", "image", "stylesheet"])
+    def test_subresources_are_not_top_level(self, rtype):
+        assert not _is_top_level_document(self._req(rtype, None))
+
+    def test_unreadable_frame_fails_closed(self):
+        class Req:
+            resource_type = "document"
+
+            @property
+            def frame(self):
+                raise RuntimeError("frame detached")
+
+        assert _is_top_level_document(Req())
+
+
 class TestConnectionResolution:
     def _report(self, config):
         conn = SimpleNamespace(type="browser", config=config)
@@ -127,3 +158,110 @@ class TestConnectionResolution:
     def test_no_browser_connection(self):
         rep = SimpleNamespace(data_sources=[])
         assert get_browser_connection({"report": rep}) is None
+
+
+class _FakeContext:
+    def __init__(self, kwargs, rec):
+        self.kwargs = kwargs
+        self._rec = rec
+
+    async def route(self, *a, **k):
+        pass
+
+    async def route_web_socket(self, *a, **k):
+        pass
+
+    async def new_page(self):
+        return SimpleNamespace()
+
+    async def close(self):
+        pass
+
+
+class _FakeBrowser:
+    def __init__(self, rec):
+        self._rec = rec
+
+    async def new_context(self, **kwargs):
+        self._rec["context_kwargs"] = kwargs
+        return _FakeContext(kwargs, self._rec)
+
+    async def close(self):
+        pass
+
+
+class _FakeChromium:
+    def __init__(self, rec):
+        self._rec = rec
+
+    async def launch(self, **kwargs):
+        self._rec["launch_kwargs"] = kwargs
+        return _FakeBrowser(self._rec)
+
+
+class _FakePlaywright:
+    def __init__(self, rec):
+        self.chromium = _FakeChromium(rec)
+
+    async def stop(self):
+        pass
+
+
+def _install_fake_playwright(monkeypatch):
+    """Record the kwargs open() hands Chromium, without a real browser."""
+    rec: dict = {}
+    import playwright.async_api as pwapi
+
+    class _Factory:
+        async def start(self):
+            return _FakePlaywright(rec)
+
+    monkeypatch.setattr(pwapi, "async_playwright", lambda: _Factory())
+    return rec
+
+
+async def _preview_stub():
+    return SimpleNamespace(route=lambda *a, **k: None, close=_preview_stub)
+
+
+class TestPreviewCertTrust:
+    """What a user notices: whether a preview browser is launched trusting a
+    cert. These drive open(..., preview=...) and assert on the kwargs Chromium
+    actually receives -- not on a private helper (see backend/tests/AGENTS.md)."""
+
+    @pytest.mark.asyncio
+    async def test_preview_pins_the_configured_spki_and_never_blanket_disables(self, monkeypatch):
+        rec = _install_fake_playwright(monkeypatch)
+        # Spacing/blank entries prove the parse+join the operator's value goes through.
+        monkeypatch.setenv("BOW_ARTIFACT_PREVIEW_CERT_SPKI", " AAAA , , BBBB ")
+        monkeypatch.delenv("BOW_BROWSER_IGNORE_HTTPS_ERRORS", raising=False)
+        preview = SimpleNamespace(route=lambda *a, **k: None, close=_preview_stub)
+        await BrowserSessionManager().open("rep-1", [], False, preview=preview)
+        assert "--ignore-certificate-errors-spki-list=AAAA,BBBB" in rec["launch_kwargs"].get("args", [])
+        # Pinning replaces the old blanket bypass: verification is NOT turned off.
+        assert "ignore_https_errors" not in rec["context_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_preview_keeps_strict_verification_when_unset(self, monkeypatch):
+        rec = _install_fake_playwright(monkeypatch)
+        monkeypatch.delenv("BOW_ARTIFACT_PREVIEW_CERT_SPKI", raising=False)
+        monkeypatch.delenv("BOW_BROWSER_IGNORE_HTTPS_ERRORS", raising=False)
+        preview = SimpleNamespace(route=lambda *a, **k: None, close=_preview_stub)
+        await BrowserSessionManager().open("rep-2", [], False, preview=preview)
+        args = rec["launch_kwargs"].get("args", [])
+        assert not any(a.startswith("--ignore-certificate-errors") for a in args)
+        assert "ignore_https_errors" not in rec["context_kwargs"]
+
+    @pytest.mark.asyncio
+    async def test_preview_spki_does_not_leak_into_general_browsing(self, monkeypatch):
+        rec = _install_fake_playwright(monkeypatch)
+        # An external egress proxy is present, so open() skips the local egress proxy.
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:3128")
+        monkeypatch.setenv("BOW_ARTIFACT_PREVIEW_CERT_SPKI", "AAAA")
+        monkeypatch.setenv("BOW_BROWSER_IGNORE_HTTPS_ERRORS", "true")
+        await BrowserSessionManager().open("rep-3", [], False, preview=None)
+        args = rec["launch_kwargs"].get("args", [])
+        # The preview pin never applies to arbitrary external browsing...
+        assert not any(a.startswith("--ignore-certificate-errors") for a in args)
+        # ...and the dev flag still governs general browsing, unchanged.
+        assert rec["context_kwargs"].get("ignore_https_errors") is True

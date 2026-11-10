@@ -38,23 +38,26 @@ export const GROUPABLE_TOOLS = new Set<string>([
   'list_mcp_resources',
   'read_mcp_resource',
   'search_mcps',
+  'search_tools',
   'search_agents',
   'read_report',
   'search_reports',
   'read_query',
+  'run_query',
   'read_artifact',
+  'read_artifact_activity',
   'list_connections',
   'get_connection',
   'search_prompts',
   'search_evals',
   'get_eval_run',
   'get_eval_runs',
-  'list_agent_executions',
   'list_emails',
   'read_email',
   'search_email',
   'web_fetch',
   'execute_mcp',
+  'call_tool',
   'edit_note',
   // Browser navigation/reading/interaction are low-signal; a browsing run
   // collapses to one ticker line. browser_vision stays OUT so a screenshot
@@ -71,6 +74,12 @@ export const GROUPABLE_TOOLS = new Set<string>([
 export const MIN_GROUP_RUN = 2
 
 const FAILED_STATUSES = new Set(['error', 'failed', 'stopped'])
+
+/** Native MCP tools (mcp__<connection>__<tool>) group like execute_mcp,
+    which they are rewritten into. */
+function isGroupableTool(name: string | undefined): boolean {
+  return !!name && (GROUPABLE_TOOLS.has(name) || name.startsWith('mcp__'))
+}
 
 /** Whether a block failed (tool error or block error). */
 export function isBlockFailed(block: any): boolean {
@@ -118,7 +127,7 @@ export function classifyBlockError(block: any, isLast: boolean): 'handled' | 'ac
     out on its own. */
 export function isGroupableBlock(block: any): boolean {
   const te = block?.tool_execution
-  if (!te || !GROUPABLE_TOOLS.has(te.tool_name)) return false
+  if (!te || !isGroupableTool(te.tool_name)) return false
   if (FAILED_STATUSES.has(String(te.status || ''))) return false
   if (FAILED_STATUSES.has(String(block?.status || ''))) return false
   // A block that carries a user-facing message is content, never a chip.
@@ -153,22 +162,27 @@ export function humanToolLabel(toolName: string): string {
     list_mcp_resources: 'Listing resources',
     read_mcp_resource: 'Reading a resource',
     search_mcps: 'Searching tools',
+    search_tools: 'Searching tools',
     search_agents: 'Searching agents',
     read_report: 'Reading a report',
     search_reports: 'Searching reports',
     read_query: 'Reading a query',
+    run_query: 'Running a query',
     read_artifact: 'Reading the artifact',
+    read_artifact_activity: 'Checking app activity',
     execute_mcp: 'Calling a tool',
+    call_tool: 'Calling a tool',
     edit_note: 'Updating notes',
     web_fetch: 'Fetching a page',
   }
+  if (toolName?.startsWith('mcp__')) return 'Calling a tool'
   return map[toolName] || 'Working'
 }
 
 /** Verb family for the header summary ("4 reads · 2 searches"). */
 function verbFamily(toolName: string): string {
   if (!toolName) return 'steps'
-  if (toolName === 'execute_mcp') return 'tool calls'
+  if (toolName === 'execute_mcp' || toolName === 'call_tool' || toolName.startsWith('mcp__')) return 'tool calls'
   if (toolName === 'edit_note') return 'note updates'
   if (toolName === 'inspect_data') return 'inspections'
   if (toolName.startsWith('search_') || toolName === 'grep_files') return 'searches'
@@ -180,6 +194,7 @@ function verbFamily(toolName: string): string {
 }
 
 export interface BlockGroup {
+  verification?: boolean
   id: string
   blockIds: string[]
   count: number
@@ -193,6 +208,8 @@ export interface BlockGroup {
   durationComplete: boolean
   /** Handled-error members absorbed into this group (amber count on header). */
   issueCount: number
+  /** Actions still awaiting query completion, separate from findings. */
+  pendingCount: number
   /** "4 reads · 2 searches" */
   verbSummary: string
   /** LLM-generated `title` of the LAST block in the group, if any. */
@@ -267,12 +284,20 @@ function buildGroup(run: any[]): BlockGroup {
   let active = false
   let runningLabel = ''
   let issueCount = 0
+  const pendingActions = new Set<string>()
   // Wall-clock span material: earliest member start -> latest member end.
   let minStart = Infinity
   let maxEnd = -Infinity
   let startsKnown = 0
   let endsKnown = 0
   for (const b of run) {
+    if (verificationKey(b)) {
+      const result = b?.tool_execution?.result_json
+      const action = result?.action_id || b?.tool_execution?.arguments_json?.evidence_for_action_id || String(b.id)
+      const state = result?.evidence?.update_status
+      if (state === 'pending') pendingActions.add(action)
+      else if (state) pendingActions.delete(action)
+    }
     const name = b?.tool_execution?.tool_name || ''
     if (name && !toolNames.includes(name)) toolNames.push(name)
     const fam = verbFamily(name)
@@ -283,7 +308,7 @@ function buildGroup(run: any[]): BlockGroup {
     const e = memberEndMs(b)
     if (s !== null) { startsKnown += 1; if (s < minStart) minStart = s }
     if (e !== null) { endsKnown += 1; if (e > maxEnd) maxEnd = e }
-    if (isBlockFailed(b)) {
+    if (isBlockFailed(b) || verificationHasIssue(b)) {
       issueCount += 1
     } else {
       okMembers += 1
@@ -321,18 +346,32 @@ function buildGroup(run: any[]): BlockGroup {
     .map(([fam, n]) => `${n} ${n === 1 ? (SINGULAR[fam] || fam) : fam}`)
     .join(' · ')
   return {
+    verification: !!verificationKey(run[0]),
     id: String(run[0]?.id ?? ''),
     blockIds: run.map((b) => String(b?.id ?? '')),
     count: run.length,
     durationMs,
     durationComplete,
     issueCount,
+    pendingCount: pendingActions.size,
     verbSummary,
     lastTitle,
     toolNames,
     active,
     runningLabel,
   }
+}
+
+/** Internal verification is an explicit server-owned run, not generic browsing. */
+function verificationKey(block: any): string {
+  const te = block?.tool_execution
+  return te?.arguments_json?._verification_group_id || te?.result_json?.verification_group_id ||
+    (te?.tool_name === 'browser_navigate' && te?.arguments_json?.artifact_id ? 'opening-preview' : '')
+}
+function verificationHasIssue(block: any): boolean {
+  if (!verificationKey(block)) return false
+  const e = block?.tool_execution?.result_json?.evidence
+  return !!e?.errors?.length || !!e?.result_checks?.some((c: any) => c.status === 'inconclusive') || ['failed', 'parameter_mismatch', 'data_not_acknowledged', 'no_expected_request'].includes(e?.update_status)
 }
 
 /**
@@ -344,7 +383,7 @@ function buildGroup(run: any[]): BlockGroup {
  */
 export function computeBlockGroups(
   blocks: any[],
-  opts?: { minRun?: number; breakBefore?: (block: any) => boolean },
+  opts?: { minRun?: number; breakBefore?: (block: any) => boolean; executionStatus?: string },
 ): BlockGrouping {
   const minRun = opts?.minRun ?? MIN_GROUP_RUN
   const groupOf: Record<string, BlockGroup> = {}
@@ -352,7 +391,7 @@ export function computeBlockGroups(
   let run: any[] = []
 
   const flush = () => {
-    if (run.length >= minRun) {
+    if (run.length >= minRun || (run.length && verificationKey(run[0]))) {
       const g = buildGroup(run)
       headerAt[String(run[0]?.id ?? '')] = g
       for (const b of run) groupOf[String(b?.id ?? '')] = g
@@ -364,8 +403,18 @@ export function computeBlockGroups(
   for (let i = 0; i < list.length; i++) {
     const b = list[i]
     if (opts?.breakBefore?.(b)) flush()
+    const verification = verificationKey(b)
+    const previousVerification = run.length ? verificationKey(run[0]) : ''
+    if (verification) {
+      if (run.length && verification !== previousVerification) flush()
+      run.push(b)
+      continue
+    }
+    // Prose remains visible in the timeline while explicit verification tools stay grouped.
+    if (previousVerification && !b.tool_execution) continue
+    if (previousVerification) flush()
     const te = b?.tool_execution
-    const groupableTool = !!te && GROUPABLE_TOOLS.has(te.tool_name) && !blockHasMessage(b)
+    const groupableTool = !!te && isGroupableTool(te.tool_name) && !blockHasMessage(b)
     const errCls = classifyBlockError(b, i === list.length - 1)
     if (errCls === 'handled' && groupableTool) {
       // Absorbed: the run continues around a handled probe failure — it is
@@ -379,5 +428,18 @@ export function computeBlockGroups(
     }
   }
   flush()
+  for (const group of Object.values(headerAt)) {
+    if (!group.verification || !opts?.executionStatus) continue
+    if (opts.executionStatus !== 'in_progress') {
+      group.active = false
+    } else {
+      const end = list.findIndex(b => String(b.id) === group.blockIds[group.blockIds.length - 1])
+      const waitingForNextCheck = list.slice(end + 1).every(b => !b.tool_execution && !blockHasMessage(b))
+      if (waitingForNextCheck) {
+        group.active = true
+        group.runningLabel ||= group.lastTitle
+      }
+    }
+  }
   return { groupOf, headerAt }
 }

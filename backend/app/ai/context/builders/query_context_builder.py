@@ -12,7 +12,7 @@ from app.ee.encryption import envelope_marker_sql
 from app.models.step import Step
 from app.models.visualization import Visualization
 from app.ai.context.sections.queries_section import QueriesSection, QueryObservation, QueryVisualizationSummary
-from app.ai.data_preview import MAX_CELL_CHARS, clamp_scalar, clamp_stats
+from app.ai.data_preview import MAX_CELL_CHARS, clamp_scalar, clamp_stats, gate_stats_for_privacy
 from app.ai.context.summary_write_through import persist_step_context_projections
 
 from app.settings.logging_config import get_logger
@@ -73,6 +73,14 @@ def _preview_table(column_names: List[str], rows: Any) -> Optional[str]:
         return None
 
 
+def _param_dicts(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    """Declared ParamSpec dicts as stored on the Query, or None."""
+    if not isinstance(raw, list):
+        return None
+    out = [p for p in raw if isinstance(p, dict) and p.get("name")]
+    return out or None
+
+
 class QueryContextBuilder:
     def __init__(self, db: AsyncSession, organization, report):
         self.db = db
@@ -127,7 +135,7 @@ class QueryContextBuilder:
     async def _get_report_queries(self, report_id: str, max_queries: int) -> List[Dict[str, Any]]:
         try:
             res = await self.db.execute(
-                select(Query.id, Query.title, Query.default_step_id)
+                select(Query.id, Query.title, Query.default_step_id, Query.parameters)
                 .where(Query.report_id == report_id)
                 .order_by(Query.created_at.desc())
                 .limit(max_queries)
@@ -137,6 +145,7 @@ class QueryContextBuilder:
                     "id": str(row.id),
                     "title": row.title or "",
                     "default_step_id": str(row.default_step_id) if row.default_step_id else None,
+                    "parameters": _json_value(row.parameters),
                 }
                 for row in res.all()
             ]
@@ -407,6 +416,7 @@ class QueryContextBuilder:
             stats={},
             data_preview=None,
             visualizations=visualizations,
+            parameters=_param_dicts(query.get("parameters")),
         )
 
         # Populate step-derived observation fields
@@ -419,7 +429,7 @@ class QueryContextBuilder:
                 if isinstance(info, dict):
                     # describe()-derived top/min/max are verbatim cells — for a
                     # wide column that reproduces the payload the preview clamps.
-                    obs.stats = clamp_stats(info)
+                    obs.stats = clamp_stats(info if include_data_preview else gate_stats_for_privacy(info))
                     try:
                         obs.row_count = int(info.get("total_rows") or 0)
                     except Exception:

@@ -39,14 +39,27 @@ class NotifyRequest(BaseModel):
 
 class ChannelResult(BaseModel):
     channel: str
-    status: str  # "sent" or "failed"
+    status: str  # "sent", "failed" or "skipped"
     recipients: List[str] = []
     error: Optional[str] = None
+    # Which transport actually carried the mail: "org_smtp" | "global" |
+    # "ai_mailbox" | "none". Recorded so a send that silently went out via the
+    # global bow-config SMTP instead of the org's configured relay is visible
+    # in logs and API responses rather than indistinguishable from success.
+    source: Optional[str] = None
+    # Which step of the SMTP conversation failed: "config" | "connect" | "tls" |
+    # "auth" | "sender" | "recipient" | "send". Lets the UI say what to fix
+    # instead of calling every failure a rejection.
+    stage: Optional[str] = None
 
 
 class NotifyResponse(BaseModel):
     dispatched: List[ChannelResult] = []
     errors: List[ChannelResult] = []
+    # Recipients deliberately not sent to (status "skipped"): a dashboard with
+    # identity-scoped content goes only to org members who can open it, each
+    # with their own rows (services/report_bursting.py).
+    skipped: List[ChannelResult] = []
 
 
 class NotificationSubscriber(BaseModel):

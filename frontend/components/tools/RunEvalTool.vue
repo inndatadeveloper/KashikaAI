@@ -2,25 +2,25 @@
   <div class="mt-1">
     <!-- Header line -->
     <div
-      class="mb-2 flex items-center text-xs text-gray-500 dark:text-gray-400"
+      class="mb-2 flex items-center text-chat-2 text-gray-500 dark:text-gray-400"
       :class="{ 'cursor-pointer select-none': canExpand }"
       @click="canExpand && (expanded = !expanded)"
     >
       <span v-if="status === 'running' || isInProgress" class="tool-shimmer flex items-center">
-        <Spinner class="w-3 h-3 me-1 text-gray-400" />
+        <Spinner class="w-3 h-3 me-1 text-ink-muted" />
         {{ t('tools.runEval.running') }}{{ totalLabel }}
       </span>
       <span v-else-if="status === 'stopped' || progress.status === 'stopped'" class="text-gray-700 dark:text-gray-300 flex items-center">
-        <Icon name="heroicons-stop-circle" class="w-3 h-3 me-1 text-gray-400" />
+        <Icon name="heroicons-stop-circle" class="w-3 h-3 me-1 text-ink-muted" />
         <span class="align-middle">{{ t('tools.runEval.stopped') }}</span>
       </span>
       <span v-else class="text-gray-700 dark:text-gray-300 flex items-center">
-        <Icon name="heroicons-check-circle" class="w-3 h-3 me-1 text-gray-400" />
+        <Icon name="heroicons-check-circle" class="w-3 h-3 me-1 text-ink-muted" />
         <span class="align-middle">{{ t('tools.runEval.finished') }}</span>
       </span>
 
       <!-- Live counters -->
-      <span v-if="progress.total > 0" class="ms-2 text-[10px] text-gray-500 dark:text-gray-400">
+      <span v-if="progress.total > 0" class="ms-2 text-chat-3 text-gray-500 dark:text-gray-400">
         <!-- dir=ltr: keep "finished / total" from bidi-reversing under RTL -->
         <span dir="ltr">{{ progress.finished }} / {{ progress.total }}</span>
         <span v-if="progress.passed > 0" class="ms-1 text-green-700">· {{ t('tools.runEval.pass', { count: progress.passed }) }}</span><span
@@ -30,15 +30,14 @@
       <!-- Expand/collapse affordance — only when there are per-case rows -->
       <Icon
         v-if="canExpand"
-        name="heroicons-chevron-down"
-        class="w-3 h-3 ms-1 text-gray-400 transition-transform duration-200"
-        :class="{ '-rotate-90': !expanded }"
+        :name="expanded ? 'heroicons-chevron-down' : 'heroicons-chevron-right'"
+        class="w-3 h-3 ms-1 text-ink-muted"
       />
 
       <!-- Stop button (only while in-flight) -->
       <button
         v-if="canStop"
-        class="ms-auto inline-flex items-center gap-0.5 text-[10px] text-red-600 hover:text-red-800"
+        class="ms-auto inline-flex items-center gap-0.5 text-chat-2 text-red-600 hover:text-red-800"
         @click.stop="stopRun"
         :disabled="isStopping"
         :title="t('tools.runEval.stopTitle')"
@@ -61,7 +60,7 @@
     </div>
 
     <!-- Per-case rows (collapsed by default) -->
-    <ul v-if="progress.cases.length && expanded" class="text-xs text-gray-600 dark:text-gray-400 ms-1 space-y-1 leading-snug">
+    <ul v-if="progress.cases.length && expanded" class="text-chat-2 text-gray-600 dark:text-gray-400 ms-1 space-y-1 leading-snug">
       <li v-for="c in progress.cases" :key="c.case_id" class="flex items-center py-0.5 px-1 rounded">
         <!-- Static glyph in a transcript: a spinner would imply live work. -->
         <Spinner
@@ -75,8 +74,8 @@
           :class="caseIconColor(c.status)"
         />
         <span class="truncate" :title="c.case_name || c.case_id">{{ c.case_name || c.case_id }}</span>
-        <span class="ms-2 text-[10px] flex-shrink-0" :class="caseStatusColor(c.status)">{{ c.status }}</span>
-        <span v-if="c.failure_reason" class="ms-2 text-[10px] text-gray-400 truncate" :title="c.failure_reason">
+        <span class="ms-2 text-chat-3 flex-shrink-0" :class="caseStatusColor(c.status)">{{ c.status }}</span>
+        <span v-if="c.failure_reason" class="ms-2 text-chat-2 text-ink-muted truncate" :title="c.failure_reason">
           — {{ c.failure_reason }}
         </span>
       </li>
@@ -84,7 +83,7 @@
 
     <!-- Run-id link (part of the expandable detail). The run page is
          authenticated; a shared link's reader cannot open it. -->
-    <div v-if="!readonly && progress.run_id && expanded" class="mt-1 text-[10px] text-gray-400 ms-1">
+    <div v-if="!readonly && progress.run_id && expanded" class="mt-1 text-chat-2 text-ink-muted ms-1">
       <NuxtLink :to="`/evals/runs/${progress.run_id}`" class="hover:text-blue-600 inline-flex items-center gap-0.5">
         <Icon name="heroicons:arrow-top-right-on-square" class="w-3 h-3" />
         {{ t('tools.runEval.openRun') }}
@@ -95,9 +94,9 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useResponseI18n } from '~/composables/useResponseI18n'
 
-const { t } = useI18n()
+const { t } = useResponseI18n()
 
 interface ToolExecution {
   id: string
@@ -228,7 +227,7 @@ function caseIconColor(s: string): string {
   if (s === 'fail' || s === 'error') return 'text-red-500'
   if (s === 'stopped') return 'text-gray-500'
   if (s === 'in_progress') return 'text-blue-400 animate-spin-slow'
-  return 'text-gray-400'
+  return 'text-ink-muted'
 }
 function caseStatusColor(s: string): string {
   if (s === 'pass') return 'text-green-700'

@@ -8,11 +8,11 @@
       <UDropdown :items="menuItems" :popper="{ placement: 'bottom-end' }">
         <UButton color="white" trailing-icon="i-heroicons-bars-3" />
         <template #monitoring="{ item }">
-          <ActivityIcon class="w-4 h-4 text-gray-400" />
+          <ActivityIcon class="w-4 h-4 text-ink-muted" />
           <span class="truncate">{{ item.label }}</span>
         </template>
         <template #mcp="{ item }">
-          <McpIcon class="w-4 h-4 text-gray-400" />
+          <McpIcon class="w-4 h-4 text-ink-muted" />
           <span class="truncate">{{ item.label }}</span>
         </template>
       </UDropdown>
@@ -52,7 +52,7 @@
          default layout; the home page no longer renders its own duplicate. -->
 
     <div v-if="isLoading" class="flex flex-col items-center justify-center flex-grow py-20">
-      <Spinner class="h-4 w-4 text-gray-400" />
+      <Spinner class="h-4 w-4 text-ink-muted" />
       <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">{{ $t('common.loading') }}</p>
     </div>
 
@@ -71,7 +71,12 @@
           {{ greeting }} {{ $t('home.whatCanIHelpWith') }}
         </h1>
       </div>
-      <div class="w-full md:w-4/5 mx-auto mt-5 rounded-lg relative z-10">
+      <!-- Same measure as the conversation the first prompt creates. This was
+           `md:w-4/5` of a `md:w-2/3` parent and therefore uncapped — ~53% of
+           the viewport, so the composer was ~1024px on a 1920px screen and
+           then snapped to the report column the moment the report existed.
+           The box you type into should not resize when you press enter. -->
+      <div class="w-full max-w-chat mx-auto mt-5 rounded-lg relative z-20">
           <PromptBoxV2
               :textareaContent="textareaContent"
               :initialSelectedDataSources="selectedDataSources"
@@ -80,7 +85,8 @@
               @openInstructions="showInstructionsModal = true"
           />
       </div>
-      <div class="w-full mx-auto mt-0 space-x-3 space-y-3" v-if="resolvedDataSources">
+      <!-- Starter questions align to the composer's edges, not the page's. -->
+      <div class="w-full max-w-chat mx-auto mt-0 space-x-3 space-y-3" v-if="resolvedDataSources">
         <DataSourceQuestionsHome
             :data_sources="resolvedDataSources"
             @update-content="updateTextarea"
@@ -164,6 +170,7 @@
 </template>
 
 <script setup lang="ts">
+import { useModelLabels } from '~/composables/useModelLabels'
 import { useRouter } from 'vue-router';
 import { useExcel } from '~/composables/useExcel';
 import { onMounted, nextTick } from 'vue';
@@ -216,6 +223,8 @@ const onInstructionStarter = (starter: string) => {
   showInstructionsModal.value = false
 }
 
+const { rememberModels } = useModelLabels()
+
 const getModels = async () => {
   try {
     const response = await useMyFetch('/llm/models', {
@@ -228,6 +237,7 @@ const getModels = async () => {
 
     const modelsData = (response.data.value as any[]) || [];
     models.value = modelsData;
+    rememberModels(modelsData);
     return modelsData;
   } catch (error) {
     console.error('Failed to fetch models:', error);

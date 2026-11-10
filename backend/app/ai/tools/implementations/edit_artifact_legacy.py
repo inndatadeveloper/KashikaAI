@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import lazyload, selectinload
 
+from app.services.artifact_payload import row_count_fields
 from app.ai.tools.base import Tool
 from app.ai.tools.metadata import ToolMetadata
 from app.ai.tools.schemas import (
@@ -42,7 +43,8 @@ from app.ai.tools.implementations._artifact_images import load_image_bytes
 from app.ai.code_execution.pptx_executor import PptxPreviewService
 from app.ai.llm import LLM
 from app.ai.llm.types import Message, TextDeltaEvent
-from app.models.artifact import Artifact
+from app.models.artifact import ArtifactVersion
+from app.services.artifact_service import new_version
 from app.models.visualization import Visualization
 from app.models.query import Query
 from app.dependencies import async_session_maker
@@ -513,7 +515,7 @@ VISUALIZATION DATA (current visualizations in data.visualizations order — for 
 
 {viz_json}
 
-(Note: `rows`/`sample_rows` above are a sample capped at 100 rows; `row_count` is the true dataset size the live dashboard receives.)
+(Note: `rows`/`sample_rows` above are a sample capped at 100 rows. `row_count` is the query's real size; the live dashboard receives `loaded_row_count` rows, and `truncated: true` means that is only part of the result.)
 
 Apply the user's edit now:"""
 
@@ -536,7 +538,7 @@ DATA ACCESS:
 - Each viz: `{{ id, title, columns: [{{headerName, field, dtype, unique_count}}], rows: [{{...}}], view, dataModel }}`
 - Access values: `row[column.field]`, display labels: `column.headerName`
 - Column metadata includes `dtype` (pandas type) and `unique_count` — use these for filter/format decisions
-- **Sample vs full data:** `rows` in the user message are a SAMPLE (capped at 100) for editing context; at runtime the dashboard receives the FULL dataset — `row_count` rows. Never write workarounds for the sample size.
+- **Sample vs full data:** `rows` in the user message are a SAMPLE (capped at 100) for editing context; at runtime the dashboard receives `loaded_row_count` rows. Never write workarounds for the sample size. `truncated: true` means those rows are only part of the `row_count` result: never compute totals, KPIs, rankings or trends from them.
 - **NEVER hardcode data** — ALL values from the viz data payload (`vizById("<uuid>").rows`)
 - **DATA ACCESS IS ID-KEYED:** bind data with `vizById("<uuid>")` (uuids are in the VISUALIZATION DATA `id` fields). NEVER add new positional `viz[N]` references; when your edit touches a line that still uses `viz[N]`, convert it to `vizById("<uuid>")`.
 - **DEFENSIVE CODING**: Row values can be `null`/`undefined`. ALWAYS guard before string methods: `(val || '').includes('x')` or `String(val ?? '').toLowerCase()`. Never call `.includes()`, `.toLowerCase()`, `.startsWith()`, `.split()` on a potentially nullish value.
@@ -553,9 +555,10 @@ AVAILABLE COMPONENTS (convenience shortcuts — not requirements):
 - `<SectionCard>` — same theming props as KPICard. `className` replaces defaults.
 - `<FilterSelect>` — portaled dropdown. `className` replaces default theme. Built-in search at 8+ options.
 - `<FilterSearch>`, `<FilterDateRange>` — `className` replaces default theme.
+- `<FilterSearch onChange>` receives the typed text (a string), not an event: `onChange={{setQuery}}`.
 - `fmt()`, `<LoadingSpinner>`
 - All components are fully themeable. When the user's design calls for something these can't express — build custom React + Tailwind.
-- **`viz` prop:** `<KPICard>` and `<SectionCard>` accept `viz={{vizById("<uuid>")}}` — this renders a built-in "ⓘ" info popover (Data tab with rows, Code tab with the query). When adding new cards from a visualization, pass `viz={{vizById("<uuid>")}}`. When an edit touches an existing card that lacks it, add it too. If the card renders FILTERED rows (`filterRows(vizById("<uuid>").rows)`), also pass `rows={{<filtered rows>}}` so the popover's Data tab matches what's shown. If the card aggregates/derives its value, also pass `calc="<formula>"` (e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"`) — shown as a "Calculation" line in the popover. For CUSTOM markup (your own div tiles/charts/tables, not the prebuilt components), annotate each item's outer element with `data-bow-viz="N"` (index in data.visualizations order) and `data-bow-calc="<formula>"` instead — a global overlay renders the same popover on those.
+- **`viz` prop:** `<KPICard>` and `<SectionCard>` accept `viz={{vizById("<uuid>")}}` — this renders a built-in "ⓘ" info popover (Data tab with rows, Code tab with the query). When adding new cards from a visualization, pass `viz={{vizById("<uuid>")}}`. When an edit touches an existing card that lacks it, add it too. If the card renders FILTERED rows (`filterRows(vizById("<uuid>").rows)`), also pass `rows={{<filtered rows>}}` so the popover's Data tab matches what's shown. If the card aggregates/derives its value, also pass `calc="<formula>"` (e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"`) — shown as a "Calculation" line in the popover. For CUSTOM markup (your own div tiles/charts/tables, not the prebuilt components), annotate each item's outer element (the card, tile, chart or table container — never a label or short inline text) with `data-bow-viz="N"` (index in data.visualizations order) and `data-bow-calc="<formula>"` instead — a global overlay renders the same popover on those.
 
 DATA-CAPABILITY CHECK — DO THIS FIRST, BEFORE GENERATING DIFFS:
 Before producing any SEARCH/REPLACE blocks, verify the edit is achievable with the visualization data available. An edit that adds a filter/chart/KPI referencing a column that doesn't exist in any viz will silently break — surfacing the gap is far better than producing a broken diff.
@@ -708,8 +711,11 @@ Deck rules that still apply to an edit:
   category_axis/value_axis tick_labels) or they render near-black and vanish.
 - **Images**: `image(file_id)` returns a fresh stream for
   `slide.shapes.add_picture(...)`; `image_ids` lists what is available. There is
-  no filesystem access. Put a translucent scrim between a photo and any text
-  over it.
+  no filesystem access. Never put text directly on a photo: place it on a
+  solid-color band or panel drawn over the picture instead.
+- **Public python-pptx API only**: never touch `_`-prefixed internals
+  (`_element`, `_spTree`, `fill._xPr`, raw lxml). The sandbox rejects them and
+  the deck fails to build.
 
 Apply the edit now:"""
 
@@ -756,7 +762,8 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
 (replacement lines)
 >>>>>>> REPLACE"""
 
-        llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker)
+        llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker,
+                  reasoning_effort=runtime_ctx.get("reasoning_effort"))
         try:
             chunks: list[str] = []
             async for evt in llm.inference_stream_v2(
@@ -802,11 +809,11 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "loading_artifact"})
         try:
             result = await db.execute(
-                select(Artifact)
+                select(ArtifactVersion)
                 .options(lazyload("*"))
                 .where(
-                    Artifact.id == data.artifact_id,
-                    Artifact.organization_id == str(organization.id),
+                    ArtifactVersion.id == data.artifact_id,
+                    ArtifactVersion.organization_id == str(organization.id),
                 )
             )
             artifact = result.scalar_one_or_none()
@@ -895,12 +902,13 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
         if new_file_ids:
             try:
                 from app.models.file import File as _File
-                frows = await db.execute(
-                    select(_File).where(
-                        _File.id.in_([str(x) for x in new_file_ids]),
-                        _File.organization_id == str(organization.id) if organization else _File.organization_id.is_(None),
-                    )
+                from app.services.file_access_service import run_viewable_file_ids
+                # Only files the run's user may see (see create_artifact).
+                allowed = await run_viewable_file_ids(
+                    db, user=user, report=report, organization=organization,
+                    file_ids=[str(x) for x in new_file_ids],
                 )
+                frows = await db.execute(select(_File).where(_File.id.in_(list(allowed))))
                 fetched = {str(f.id): f for f in frows.scalars().all()}
             except Exception as e:
                 logger.warning(f"edit_artifact: failed to fetch files: {e}")
@@ -1039,9 +1047,9 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
                 "data_model_type": (view_dict.get("view") or {}).get("type") or view_dict.get("type"),
                 "columns": raw_columns,
                 "column_info": column_info,
-                # row_count = TRUE dataset size; rows is a 100-row sample
+                # row_count = the query's real size; rows is a 100-row sample
                 # (see create_artifact — same contract).
-                "row_count": len(_all_rows),
+                **row_count_fields(step_data),
                 "sample_row_count": len(rows),
                 "rows": rows,
                 "dataModel": data_model or {},
@@ -1151,7 +1159,8 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
 
         # Stream LLM response
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "llm_generating"})
-        llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker)
+        llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker,
+                  reasoning_effort=runtime_ctx.get("reasoning_effort"))
         buffer = ""
 
         async for evt in llm.inference_stream_v2(
@@ -1537,27 +1546,28 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "saving_artifact"})
 
         included_viz_ids = [v["id"] for v in visualizations]
-        new_version = artifact.version + 1
 
         # Accumulate generation_prompt: merge previous spec with current edit
         prev_spec = artifact.generation_prompt or ""
-        accumulated_spec = f"{prev_spec}\n+ Edit (v{new_version}): {data.edit_prompt}".strip()
 
-        new_artifact = Artifact(
-            report_id=artifact.report_id,
-            user_id=str(user.id) if user else artifact.user_id,
-            organization_id=artifact.organization_id,
+        new_artifact = await new_version(
+            db,
+            artifact,
+            user_id=str(user.id) if user else None,
             title=new_title,
-            mode=artifact.mode,
             content=(
                 {"code": new_code, "visualization_ids": included_viz_ids, "files": merged_files}
                 if merged_files
                 else {"code": new_code, "visualization_ids": included_viz_ids}
             ),
-            generation_prompt=accumulated_spec,
-            version=new_version,
-            status="completed",
         )
+        # The accumulated spec names the version that was actually minted —
+        # the factory owns the number, so it is read back, never predicted.
+        version_number = new_artifact.version
+        new_artifact.generation_prompt = (
+            f"{prev_spec}\n+ Edit (v{version_number}): {data.edit_prompt}".strip()
+        )
+        db.add(new_artifact)
         # Page mode reached here only with a validated render — persist the
         # screenshot and (non-fatal) console errors captured during validation.
         if screenshot_base64 or render_errors:
@@ -1577,6 +1587,8 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
             uploads_dir.mkdir(parents=True, exist_ok=True)
             out_path = uploads_dir / f"{new_artifact.id}.pptx"
             _shutil.move(str(_pptx_tmp_path), str(out_path))
+            from app.services import storage
+            await storage.apersist(out_path)
             new_artifact.pptx_path = str(out_path)
 
             # A preview failure costs only the preview — the deck still opens.
@@ -1613,7 +1625,7 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
             code=new_code,
             mode=new_artifact.mode,
             title=new_title,
-            version=new_version,
+            version=version_number,
             diff_applied=diff_applied,
         ).model_dump()
 
@@ -1623,7 +1635,7 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
             "artifact_id": str(new_artifact.id),
             "title": new_title or "Untitled",
             "mode": new_artifact.mode,
-            "version": new_version,
+            "version": version_number,
             "code_stats": {
                 "chars": len(new_code),
                 "lines": code_lines,
@@ -1639,7 +1651,7 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
         }
 
         # Build observation
-        summary_msg = f"Edited artifact '{new_title or 'Untitled'}' (v{new_version})"
+        summary_msg = f"Edited artifact '{new_title or 'Untitled'}' (v{version_number})"
         if diff_applied:
             summary_msg += f" — applied {num_blocks} surgical edit(s)"
             if diff_retry_used:
@@ -1684,7 +1696,7 @@ Re-emit corrected SEARCH/REPLACE blocks for the SAME edit. Copy SEARCH text exac
             "summary": summary_msg,
             "artifact_id": str(new_artifact.id),
             "mode": new_artifact.mode,
-            "version": new_version,
+            "version": version_number,
             "diff_applied": diff_applied,
             "visualization_count": len(visualizations),
             "visualization_ids": included_viz_ids,

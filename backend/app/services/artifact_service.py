@@ -1,14 +1,289 @@
-from typing import Optional, List
+from typing import Any, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer, lazyload, load_only
 
-from app.models.artifact import Artifact
-from app.models.report import Report
+from app.models.artifact import Artifact, ArtifactVersion
 from app.schemas.artifact_schema import (
     ArtifactCreate,
     ArtifactUpdate,
 )
+
+
+# ---------------------------------------------------------------------------
+# Version factory
+#
+# Every code path that inserts an artifact row goes through one of these two
+# functions — the AI tools, the MCP tools, the REST routes, forking, seeding
+# and the test fixtures. They are the only place that decides what `version`
+# a row gets, so the numbering rule lives here and nowhere else.
+#
+# Both flush + refresh and deliberately do NOT commit: callers own their
+# transaction (fork_service builds a whole report in one; the tools commit
+# once after the row and its side effects are in place).
+# ---------------------------------------------------------------------------
+
+
+def _id(value: Any) -> Optional[str]:
+    """Stringify an id (uuid / str) without turning None into "None"."""
+    return str(value) if value is not None else None
+
+
+async def follow_conversation_project(db: AsyncSession, report_ids: List[str], project_id: Optional[str]) -> None:
+    """A conversation's dashboards move to the project it moves to (phase 4).
+    Does not commit: the caller's move does."""
+    from sqlalchemy import update
+
+    if report_ids:
+        await db.execute(
+            update(Artifact)
+            .where(Artifact.report_id.in_([str(r) for r in report_ids]))
+            .values(project_id=_id(project_id))
+        )
+
+
+# ---------------------------------------------------------------------------
+# "Edited" (dashlist01): when a dashboard's content last changed
+#
+# Its writers: the factory (a completed version, a rename),
+# ArtifactService.update, finish_version (the agent tool's pending ->
+# completed), and, outside this module, publish (dashboard_publish._go_live)
+# and restore (dashboard_collab.rollback). Never a data refresh or a record
+# write -- those move updated_at only. A future status transition outside
+# finish_version would not move it.
+# ---------------------------------------------------------------------------
+
+
+async def mark_content_edited(db: AsyncSession, artifact_id: str) -> None:
+    """The dashboard's content changed now. Does not commit. updated_at is
+    kept as it is: it has writers of its own (a refresh, record writes, the
+    agent tools), and the column's onupdate would otherwise move it here."""
+    from datetime import datetime
+    from sqlalchemy import update
+
+    await db.execute(
+        update(Artifact).where(Artifact.id == str(artifact_id))
+        .values(content_updated_at=datetime.utcnow(), updated_at=Artifact.updated_at)
+    )
+
+
+async def finish_version(db: AsyncSession, version: ArtifactVersion, status: str) -> None:
+    """A pending version's outcome; a completed one moves the dashboard's
+    Edited time. Does not commit."""
+    version.status = status
+    if status == "completed":
+        await mark_content_edited(db, str(version.artifact_id))
+
+
+async def new_artifact(
+    db: AsyncSession,
+    *,
+    report_id: str,
+    organization_id: str,
+    user_id: str,
+    mode: str,
+    title: Optional[str],
+    content: dict,
+    generation_prompt: Optional[str] = None,
+    completion_id: Optional[str] = None,
+    status: str = "completed",
+    **version_fields: Any,
+) -> ArtifactVersion:
+    """Start a brand-new artifact (dashboard / deck / doc) at version 1.
+
+    Extra keyword arguments (thumbnail_path, screenshot_base64, created_at,
+    ...) are set on the version row as-is.
+
+    The dashboard is owned by its conversation's owner and sits in its
+    conversation's project (dashboards project, phase 4): the /d routes and
+    the owner's sharing controls read them from the dashboard.
+    """
+    from datetime import datetime
+    from app.models.report import Report
+
+    owner = (await db.execute(
+        select(Report.user_id, Report.project_id).where(Report.id == _id(report_id))
+    )).first()
+    now = datetime.utcnow()  # one clock read: Edited is never before Created
+    parent = Artifact(
+        created_at=now,
+        report_id=_id(report_id),
+        organization_id=_id(organization_id),
+        created_by=_id(user_id),
+        mode=mode,
+        title=title,
+        owner_id=_id(owner[0]) if owner else None,
+        project_id=_id(owner[1]) if owner else None,
+        content_updated_at=now if status == "completed" else None,
+    )
+    db.add(parent)
+    await db.flush()
+    version = ArtifactVersion(
+        artifact_id=str(parent.id),
+        report_id=_id(report_id),
+        user_id=_id(user_id),
+        organization_id=_id(organization_id),
+        content=content,
+        generation_prompt=generation_prompt,
+        completion_id=completion_id,
+        status=status,
+        version=1,
+        **version_fields,
+    )
+    db.add(version)
+    await db.flush()
+    await _snapshot_elements(db, version)
+    # refresh also resolves the title/mode read-throughs from the parent
+    await db.refresh(version)
+    _schedule_precompile(version)
+    return version
+
+
+def _schedule_precompile(version: ArtifactVersion) -> None:
+    """Compile a new page version's JSX in the background so its first view
+    can skip in-browser Babel (see app.services.artifact_precompile)."""
+    try:
+        content = version.content if isinstance(version.content, dict) else {}
+        if isinstance(content.get("code"), str):
+            from app.services.artifact_precompile import schedule_compile
+            schedule_compile(content["code"])
+    except Exception:
+        pass
+
+
+async def next_version_number(db: AsyncSession, source: ArtifactVersion) -> int:
+    """The number the next version after ``source`` gets.
+
+    max(version) over the parent artifact's rows, plus one. Soft-deleted
+    rows count too: uq_artifact_versions_artifact_version spans them, so a
+    number a deleted row still holds must never be reissued. Never derived
+    from ``source.version + 1``: editing an older version would otherwise
+    mint a number that already exists further up the chain.
+    """
+    max_version = (await db.execute(
+        select(func.max(ArtifactVersion.version)).where(
+            ArtifactVersion.artifact_id == str(source.artifact_id),
+        )
+    )).scalar() or 0
+    return max_version + 1
+
+
+# A lost numbering race is retried this many times before it surfaces.
+_MINT_ATTEMPTS = 3
+
+
+def _is_version_number_collision(exc: IntegrityError) -> bool:
+    """True when ``exc`` is uq_artifact_versions_artifact_version firing.
+
+    Postgres names the constraint; SQLite only lists its columns. Any other
+    integrity failure (a broken FK, ...) is not a race and must propagate.
+    """
+    message = str(exc.orig)
+    return (
+        "uq_artifact_versions_artifact_version" in message
+        or "artifact_versions.artifact_id, artifact_versions.version" in message
+    )
+
+
+async def new_version(
+    db: AsyncSession,
+    source: ArtifactVersion,
+    *,
+    content: dict,
+    user_id: Optional[str] = None,
+    generation_prompt: Optional[str] = None,
+    completion_id: Optional[str] = None,
+    status: str = "completed",
+    title: Optional[str] = None,
+    report_id: Optional[str] = None,
+    content_changed: bool = True,
+    **version_fields: Any,
+) -> ArtifactVersion:
+    """Append the next version to the artifact ``source`` belongs to.
+
+    The new row joins ``source``'s parent artifact — a version can never
+    move between artifacts, and mode is fixed there. ``user_id`` (the author
+    of this version) defaults to the source's; ``report_id`` (the
+    conversation it is edited in) too -- a dashboard whose conversation was
+    deleted is edited in a new one (dashboards project, phase 7). Passing ``title`` RENAMES the
+    parent, i.e. every version of this artifact at once.
+
+    Two writers can read the same max(version) at once; the loser's INSERT
+    then hits uq_artifact_versions_artifact_version. Each attempt runs in a
+    SAVEPOINT, so a lost race undoes only that INSERT — never the caller's
+    transaction — and is retried with a freshly read number.
+
+    A completed version moves the dashboard's Edited time, unless
+    ``content_changed`` is False (a copy of the content as it is: an editor
+    joining, the owner's Edit after the conversation was deleted). A rename
+    moves it either way.
+    """
+    # The lineage (collab01): a version grows from its source and stays on
+    # its draft, unless the caller says otherwise (a joining conversation).
+    version_fields.setdefault("base_version_id", str(source.id) if getattr(source, "id", None) else None)
+    version_fields.setdefault("draft_id", getattr(source, "draft_id", None))
+    fields = dict(
+        artifact_id=str(source.artifact_id),
+        report_id=_id(report_id) or _id(source.report_id),
+        user_id=_id(user_id) or _id(source.user_id),
+        organization_id=_id(source.organization_id),
+        content=content,
+        generation_prompt=generation_prompt,
+        completion_id=completion_id,
+        status=status,
+        **version_fields,
+    )
+    # A version changes the shared dashboard: its author must still be able
+    # to edit it (collab01; an agent in a removed editor's conversation too).
+    from app.services.dashboard_access import assert_may_write
+
+    await assert_may_write(db, fields["artifact_id"], fields["user_id"])
+    for attempt in range(_MINT_ATTEMPTS):
+        version = ArtifactVersion(**fields, version=await next_version_number(db, source))
+        try:
+            async with db.begin_nested():
+                db.add(version)
+                await db.flush([version])
+            break
+        except IntegrityError as exc:
+            # The savepoint rollback expunges the pending row; make sure a
+            # later flush can't retry the colliding INSERT regardless.
+            if version in db:
+                db.expunge(version)
+            if not _is_version_number_collision(exc) or attempt == _MINT_ATTEMPTS - 1:
+                raise
+    renamed = title is not None and title != source.title
+    if renamed:
+        parent = await db.get(Artifact, str(source.artifact_id))
+        if parent is not None:
+            parent.title = title
+            db.add(parent)
+    if (status == "completed" and content_changed) or renamed:
+        await mark_content_edited(db, str(source.artifact_id))
+    await db.flush()
+    await _snapshot_elements(db, version)
+    # refresh also resolves the title/mode read-throughs from the parent
+    await db.refresh(version)
+    _schedule_precompile(version)
+    return version
+
+
+async def _snapshot_elements(db: AsyncSession, version: ArtifactVersion) -> None:
+    """Each chart's fingerprint as this version shows it (collab01). Never
+    fails the version: attribution is a nicety, the version is the work."""
+    import logging
+
+    try:
+        from app.services.dashboard_collab import snapshot_elements
+
+        # A savepoint: on Postgres a failed statement would otherwise abort
+        # the caller's whole transaction.
+        async with db.begin_nested():
+            version.elements = await snapshot_elements(db, version)
+            await db.flush()
+    except Exception:
+        logging.getLogger(__name__).warning("elements not snapshotted for version %s", version.id, exc_info=True)
 
 
 class ArtifactService:
@@ -20,22 +295,20 @@ class ArtifactService:
         payload: ArtifactCreate,
         user_id: str,
         organization_id: str,
-    ) -> Artifact:
+    ) -> ArtifactVersion:
         """Create a new artifact."""
-        artifact = Artifact(
+        artifact = await new_artifact(
+            db,
             report_id=str(payload.report_id),
-            user_id=str(user_id),
             organization_id=str(organization_id),
-            title=payload.title,
+            user_id=str(user_id),
             mode=payload.mode,
+            title=payload.title,
             content=payload.content,
             generation_prompt=payload.generation_prompt,
             completion_id=payload.completion_id,
-            version=1,
         )
-        db.add(artifact)
         await db.commit()
-        await db.refresh(artifact)
         return artifact
 
     async def create_doc_version(
@@ -46,7 +319,7 @@ class ArtifactService:
         title: Optional[str],
         user_id: str,
         organization_id: str,
-    ) -> Artifact:
+    ) -> ArtifactVersion:
         """Persist a user-edited version of a doc artifact (mode='doc').
 
         Mirrors the edit_doc tool's contract: validates {{viz:...}} placeholders,
@@ -95,36 +368,30 @@ class ArtifactService:
         if problems:
             raise HTTPException(status_code=400, detail="Invalid visualization placeholders: " + "; ".join(problems))
 
-        new_artifact = Artifact(
-            report_id=str(artifact.report_id),
+        new_artifact = await new_version(
+            db,
+            artifact,
             user_id=str(user_id),
-            organization_id=str(organization_id),
-            title=title or artifact.title,
-            mode="doc",
+            title=title or None,
             content={"markdown": markdown, "visualization_ids": valid_viz_ids},
-            generation_prompt=None,
-            version=(artifact.version or 1) + 1,
-            status="completed",
         )
-        db.add(new_artifact)
         await db.commit()
-        await db.refresh(new_artifact)
         return new_artifact
 
-    async def get(self, db: AsyncSession, artifact_id: str) -> Optional[Artifact]:
+    async def get(self, db: AsyncSession, artifact_id: str) -> Optional[ArtifactVersion]:
         """Get an artifact by ID.
 
         lazyload("*"): consumers only use the artifact's own columns;
         Artifact.report would otherwise selectin-cascade the entire report
         graph (every step version's data JSON) on each fetch.
         """
-        stmt = select(Artifact).options(
+        stmt = select(ArtifactVersion).options(
             lazyload("*"),
-            defer(Artifact.screenshot_base64),
-            defer(Artifact.render_errors),
+            defer(ArtifactVersion.screenshot_base64),
+            defer(ArtifactVersion.render_errors),
         ).where(
-            Artifact.id == str(artifact_id),
-            Artifact.deleted_at.is_(None),
+            ArtifactVersion.id == str(artifact_id),
+            ArtifactVersion.deleted_at.is_(None),
         )
         res = await db.execute(stmt)
         return res.scalar_one_or_none()
@@ -134,7 +401,7 @@ class ArtifactService:
         db: AsyncSession,
         report_id: str,
         organization_id: Optional[str] = None,
-    ) -> List[Artifact]:
+    ) -> List[ArtifactVersion]:
         """List all artifacts for a report, scoped to the caller's organization.
 
         When ``organization_id`` is provided the read is constrained to that
@@ -143,34 +410,36 @@ class ArtifactService:
         this binding).
         """
         stmt = (
-            select(Artifact)
+            select(ArtifactVersion)
             .options(
                 lazyload("*"),
                 load_only(
-                    Artifact.id,
-                    Artifact.report_id,
-                    Artifact.title,
-                    Artifact.mode,
-                    Artifact.version,
-                    Artifact.status,
-                    Artifact.created_at,
-                    Artifact.updated_at,
+                    ArtifactVersion.id,
+                    ArtifactVersion.artifact_id,
+                    ArtifactVersion.report_id,
+                    ArtifactVersion.title,
+                    ArtifactVersion.mode,
+                    ArtifactVersion.version,
+                    ArtifactVersion.name,
+                    ArtifactVersion.status,
+                    ArtifactVersion.created_at,
+                    ArtifactVersion.updated_at,
                 ),
             )
             .where(
-                Artifact.report_id == str(report_id),
-                Artifact.deleted_at.is_(None),
+                ArtifactVersion.report_id == str(report_id),
+                ArtifactVersion.deleted_at.is_(None),
             )
-            .order_by(Artifact.created_at.desc())
+            .order_by(ArtifactVersion.created_at.desc())
         )
         if organization_id:
-            stmt = stmt.where(Artifact.organization_id == str(organization_id))
+            stmt = stmt.where(ArtifactVersion.organization_id == str(organization_id))
         res = await db.execute(stmt)
         return list(res.scalars().all())
 
     async def get_latest_by_report(
         self, db: AsyncSession, report_id: str, include_docs: bool = False
-    ) -> Optional[Artifact]:
+    ) -> Optional[ArtifactVersion]:
         """Get the most recent artifact for a report.
 
         By default docs (mode='doc') are excluded: every existing consumer of
@@ -178,93 +447,100 @@ class ArtifactService:
         Pass include_docs=True to consider docs too.
         """
         stmt = (
-            select(Artifact)
+            select(ArtifactVersion)
             .options(
                 lazyload("*"),
-                defer(Artifact.screenshot_base64),
-                defer(Artifact.render_errors),
+                defer(ArtifactVersion.screenshot_base64),
+                defer(ArtifactVersion.render_errors),
             )
             .where(
-                Artifact.report_id == str(report_id),
-                Artifact.deleted_at.is_(None),
+                ArtifactVersion.report_id == str(report_id),
+                ArtifactVersion.deleted_at.is_(None),
             )
-            .order_by(Artifact.created_at.desc())
+            .order_by(ArtifactVersion.created_at.desc())
             .limit(1)
         )
         if not include_docs:
-            stmt = stmt.where(Artifact.mode.in_(("page", "slides")))
+            # Explicit join beats the column_property's correlated subquery
+            # on this hot path.
+            stmt = stmt.join(
+                Artifact, Artifact.id == ArtifactVersion.artifact_id
+            ).where(Artifact.mode.in_(("page", "slides")))
         res = await db.execute(stmt)
         return res.scalar_one_or_none()
 
     async def update(
         self, db: AsyncSession, artifact_id: str, patch: ArtifactUpdate
-    ) -> Optional[Artifact]:
+    ) -> Optional[ArtifactVersion]:
         """Update an existing artifact."""
         artifact = await self.get(db, artifact_id)
         if not artifact:
             return None
 
         if patch.title is not None:
-            artifact.title = patch.title
+            # Writes to version.title are silent no-ops (column_property):
+            # a rename targets the parent — the whole artifact, on purpose.
+            parent = await db.get(Artifact, str(artifact.artifact_id))
+            if parent is not None and patch.title != parent.title:
+                parent.title = patch.title
+                db.add(parent)
+                await mark_content_edited(db, str(artifact.artifact_id))
         if patch.content is not None:
+            # In-place edit of THIS row. Version numbers are minted only by
+            # new_version(); bumping here would collide with the next row.
+            changed = patch.content != artifact.content
             artifact.content = patch.content
-            artifact.version += 1  # Increment version on content change
+            if changed and artifact.status == "completed":
+                await mark_content_edited(db, str(artifact.artifact_id))
         if patch.generation_prompt is not None:
             artifact.generation_prompt = patch.generation_prompt
 
         db.add(artifact)
         await db.commit()
         await db.refresh(artifact)
+        if patch.content is not None:
+            _schedule_precompile(artifact)
         return artifact
 
     async def delete(self, db: AsyncSession, artifact_id: str) -> bool:
-        """Soft delete an artifact."""
+        """Soft delete a version; the parent follows when nothing is left.
+
+        An artifact "exists" iff it has a live version — identity-level scans
+        (has_artifacts, artifact_mode filters, chat-summary rows) read the
+        parent table, so a parent whose last version is deleted must be
+        soft-deleted with it or those scans would keep resurrecting it.
+        """
         artifact = await self.get(db, artifact_id)
         if not artifact:
             return False
 
         from datetime import datetime
-        artifact.deleted_at = datetime.utcnow()
+        now = datetime.utcnow()
+        artifact.deleted_at = now
         db.add(artifact)
+
+        remaining = (await db.execute(
+            select(func.count(ArtifactVersion.id)).where(
+                ArtifactVersion.artifact_id == str(artifact.artifact_id),
+                ArtifactVersion.id != str(artifact.id),
+                ArtifactVersion.deleted_at.is_(None),
+            )
+        )).scalar() or 0
+        if remaining == 0:
+            parent = await db.get(Artifact, str(artifact.artifact_id))
+            if parent is not None and parent.deleted_at is None:
+                parent.deleted_at = now
+                db.add(parent)
+
         await db.commit()
         return True
-
-    async def create_new_version(
-        self,
-        db: AsyncSession,
-        artifact_id: str,
-        new_content: dict,
-        user_id: str,
-        generation_prompt: Optional[str] = None,
-        completion_id: Optional[str] = None,
-    ) -> Optional[Artifact]:
-        """Create a new version of an artifact by copying and updating content."""
-        original = await self.get(db, artifact_id)
-        if not original:
-            return None
-
-        new_artifact = Artifact(
-            report_id=original.report_id,
-            user_id=str(user_id),
-            organization_id=original.organization_id,
-            title=original.title,
-            mode=original.mode,
-            content=new_content,
-            generation_prompt=generation_prompt,
-            completion_id=completion_id,
-            version=original.version + 1,
-        )
-        db.add(new_artifact)
-        await db.commit()
-        await db.refresh(new_artifact)
-        return new_artifact
 
     async def duplicate(
         self,
         db: AsyncSession,
         artifact_id: str,
         user_id: str,
-    ) -> Optional[Artifact]:
+    ) -> Optional[ArtifactVersion]:
         """Duplicate an artifact to make it the latest version.
 
         This creates a copy of the artifact with a new timestamp,
@@ -275,26 +551,15 @@ class ArtifactService:
         if not original:
             return None
 
-        # Get the highest version for this report
-        existing = await self.list_by_report(
-            db, original.report_id, organization_id=original.organization_id
-        )
-        max_version = max((a.version for a in existing), default=0)
-
-        new_artifact = Artifact(
-            report_id=original.report_id,
+        new_artifact = await new_version(
+            db,
+            original,
             user_id=str(user_id),
-            organization_id=original.organization_id,
-            title=original.title,
-            mode=original.mode,
             content=original.content,
             generation_prompt=original.generation_prompt,
             completion_id=original.completion_id,
-            version=max_version + 1,
         )
-        db.add(new_artifact)
         await db.commit()
-        await db.refresh(new_artifact)
 
         # Copy thumbnail from original artifact if it exists, otherwise regenerate
         import asyncio

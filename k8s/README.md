@@ -13,10 +13,18 @@ helm repo update
 
 Here are a few examples of how to install or upgrade the Bag of Words Helm chart:
 
+> **Pin the chart's major version** (`--version "^3.0.0"` below, or the
+> `chartVersion` input of an Azure DevOps `HelmDeploy` task, `targetRevision`
+> in Argo CD, `version` in a Flux `HelmRelease`). Without it, `helm upgrade`
+> installs the newest chart in the repo, so a CI pipeline moves to the next
+> major version — and its breaking changes — on its next run. Read
+> [`chart/CHANGELOG.md`](chart/CHANGELOG.md) before raising the pin.
+
 ### Deploy with a bundled PostgreSQL instance
 ```bash
 helm upgrade -i --create-namespace \
  -nbowapp-1 bowapp bow/bagofwords \
+ --version "^3.0.0" \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
  --set postgresql.auth.database=<PG-DB>
@@ -26,6 +34,7 @@ helm upgrade -i --create-namespace \
 ```bash
 helm upgrade -i --create-namespace \
  -nbowapp-1 bowapp bow/bagofwords \
+ --version "^3.0.0" \
   --set host=<HOST> \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
@@ -37,6 +46,7 @@ helm upgrade -i --create-namespace \
 ```bash
 helm upgrade -i --create-namespace \
  -nbowapp-1 bowapp bow/bagofwords \
+ --version "^3.0.0" \
  --set host=<HOST> \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
@@ -59,6 +69,7 @@ When using a managed database like AWS Aurora PostgreSQL, the chart skips the bu
 ```bash
 helm upgrade -i --create-namespace \
  -nbowapp-1 bowapp bow/bagofwords \
+ --version "^3.0.0" \
  --set host=<HOST> \
  --set database.auth.provider=aws_iam \
  --set database.auth.region=us-east-1 \
@@ -74,6 +85,7 @@ For example, with a real Aurora cluster:
 ```bash
 helm upgrade -i --create-namespace \
  -nbowapp-1 bowapp bow/bagofwords \
+ --version "^3.0.0" \
  --set host=bow.example.com \
  --set database.auth.provider=aws_iam \
  --set database.auth.region=us-east-1 \
@@ -126,6 +138,7 @@ config:
 ```bash
 helm upgrade -i --create-namespace \
  -nbowapp-1 bowapp bow/bagofwords \
+ --version "^3.0.0" \
  -f aurora-values.yaml
 ```
 
@@ -192,14 +205,17 @@ stringData:
   # License
   BOW_LICENSE_KEY: "<license-key>"
 
-  # Bundled-Postgres (subchart)
+  # Bundled PostgreSQL (read via postgresql.auth.existingSecret)
   postgres-password: "<postgres-password>"
+  # ...plus the app user's password when postgresql.auth.username is set
+  # password: "<app-user-password>"
 ```
 
 3. Reference the Secret in your install:
 ```bash
 helm upgrade -i \
   bowapp bow/bagofwords \
+ --version "^3.0.0" \
  -n <namespace> \
  --set postgresql.auth.existingSecret=bowapp-secrets \
  --set config.secretRef=bowapp-secrets
@@ -208,6 +224,19 @@ helm upgrade -i \
 The `Secret` is loaded after the ConfigMap via `envFrom`, so its values
 override any plaintext defaults from the ConfigMap. You only need to include
 the keys you want to set/override.
+
+Because the `Secret` can point `BOW_DATABASE_URL` at any server, the chart stops
+assuming the bundled PostgreSQL once `postgresql.auth.existingSecret` or
+`config.secretRef` is set, and leaves `config.database.idleSessionTimeoutMs`
+unset. That timeout lets the server close pooled connections a quiet worker is
+holding but not using, so they stop occupying `max_connections` slots. It needs
+**PostgreSQL 14+** — on older servers the parameter is rejected at connect time
+and every connection fails — so set it explicitly once you know your server's
+version:
+
+```bash
+--set config.database.idleSessionTimeoutMs=600000   # 10 minutes; PostgreSQL 14+
+```
 
 ### Microsoft Entra (Azure AD) with group sync
 

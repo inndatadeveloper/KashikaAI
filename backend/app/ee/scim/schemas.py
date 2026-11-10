@@ -6,6 +6,8 @@ from typing import Optional, List, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 
+from app.schemas.base import OptionalNaiveUTCInput, OptionalUTCDatetime
+
 
 # --- SCIM Core Schemas (RFC 7643) ---
 
@@ -69,6 +71,50 @@ class ScimListResponse(BaseModel):
     Resources: List[ScimUser] = []
 
 
+# --- SCIM Group Schemas (RFC 7643 §4.2) ---
+
+SCIM_GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group"
+
+
+class ScimGroupMember(BaseModel):
+    # IdPs send `"$ref": null` (Entra) or omit it; only `value` is meaningful.
+    model_config = {"populate_by_name": True}
+
+    value: str
+    display: Optional[str] = None
+    ref: Optional[str] = Field(default=None, alias="$ref")
+    type: Optional[str] = None
+
+
+class ScimGroup(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    schemas: List[str] = [SCIM_GROUP_SCHEMA]
+    id: str
+    externalId: Optional[str] = None
+    displayName: str
+    # None (not []) when the caller excluded members, so the key is dropped
+    # from the response instead of claiming the group is empty.
+    members: Optional[List[ScimGroupMember]] = None
+    meta: Optional[ScimMeta] = None
+
+
+class ScimGroupCreate(BaseModel):
+    """POST/PUT body. Extra keys (Entra's `meta`, extension schemas) are ignored."""
+    schemas: List[str] = [SCIM_GROUP_SCHEMA]
+    externalId: Optional[str] = None
+    displayName: str = Field(min_length=1, max_length=255)
+    members: Optional[List[ScimGroupMember]] = None
+
+
+class ScimGroupListResponse(BaseModel):
+    schemas: List[str] = ["urn:ietf:params:scim:api:messages:2.0:ListResponse"]
+    totalResults: int
+    startIndex: int = 1
+    itemsPerPage: int = 100
+    Resources: List[ScimGroup] = []
+
+
 class ScimError(BaseModel):
     schemas: List[str] = ["urn:ietf:params:scim:api:messages:2.0:Error"]
     status: str
@@ -80,15 +126,15 @@ class ScimError(BaseModel):
 
 class ScimTokenCreate(BaseModel):
     name: str = "SCIM Token"
-    expires_at: Optional[datetime] = None
+    expires_at: OptionalNaiveUTCInput = None
 
 
 class ScimTokenResponse(BaseModel):
     id: str
     name: str
     token_prefix: str
-    created_at: Optional[datetime] = None
-    expires_at: Optional[datetime] = None
+    created_at: OptionalUTCDatetime = None
+    expires_at: OptionalUTCDatetime = None
     last_used_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}

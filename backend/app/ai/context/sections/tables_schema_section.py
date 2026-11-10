@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from app.ai.context.sections.base import ContextSection, xml_tag, xml_escape
 from app.schemas.data_source_schema import DataSourceSummarySchema
 from app.ai.prompt_formatters import Table as PromptTable
+from app.data_sources.routines import is_routine, routine_kind, routine_meta
 
 
 # Schema usage tracking models for context snapshots
@@ -41,10 +42,13 @@ class MCPToolItem(BaseModel):
     policy: Optional[str] = None
     # The tool's declared JSON Schema, admin-locked fields already stripped.
     # Carried so <mcp_tools> can render the argument shape inline instead of
-    # sending the agent on a search_mcps round trip for it. The block is
+    # sending the agent on a discovery round trip for it. The block is
     # rebuilt every turn, so a schema here never ages out of context — unlike
-    # a search_mcps observation, which past-observation compaction minifies.
+    # a search_tools observation, which past-observation compaction minifies.
     input_schema: Optional[dict] = None
+    # Past tools_max: not in the model's tool list, reached via search_tools +
+    # call_tool. Set by the agent once it has registered the run's tools.
+    deferred: bool = False
 
 
 class FileScopeItem(BaseModel):
@@ -59,7 +63,8 @@ class FileScopeItem(BaseModel):
     globs: List[str] = []
     index_mode: str = "content"      # none | metadata | content
     file_count: int = 0
-    capped: bool = False
+    capped: bool = False             # catalog hit the connection's Max Files cap
+    indexed_at: Optional[str] = None # last completed shared index run (UTC ISO)
     sample: List[str] = []           # a few representative file ids
     topics: List[str] = []           # aggregate keywords (content mode)
     supports_search: bool = True     # native search API OR index_mode==content
@@ -70,6 +75,9 @@ class FileScopeItem(BaseModel):
     # boundary is the user's OAuth account — for those we render no <scope> and
     # no "else denied" language, because neither would be true.
     enforces_scope: bool = True
+    # Connector-specific browsing guidance, rendered as <note> after <usage>.
+    # None for every connector without one, so their descriptors are unchanged.
+    note: Optional[str] = None
 
 
 def _render_powerbi_cloud_metadata_xml(t: PromptTable) -> str:
@@ -138,7 +146,50 @@ _TABLE_META_KEYS: dict[str, tuple[str, ...]] = {
         "modelType", "supportsDax", "preferredDialect",
         "entity_contents", "data_category",
     ),
+    # PriorityErpClient: a subform table (ORDERITEMS) has no address of its
+    # own in Priority; the client answers it through the parent's $expand. The
+    # agent queries it by name like any form, and these say where its rows
+    # come from. `shared_by` marks a subform under several parents, which has
+    # no single path and must be read via the parent the question means.
+    "priority_erp": ("title", "subform_of", "navigation", "shared_by"),
+    # MecmClient: WMI class names (SMS_FullCollectionMembership,
+    # SMS_UpdateComplianceStatus) do not say what a class holds or how its
+    # status codes read. The description is the only place that does, and
+    # `Table.description` is not persisted with the catalog.
+    "mecm": ("description",),
+    # TeradataClient: the primary index is Teradata's distribution key and the
+    # cheapest join path; `kind` says view vs table. Neither is in the name.
+    "teradata": ("kind", "primary_index", "primary_index_unique"),
 }
+
+
+# A one-line note for the agent that writes the user-facing answer, keyed by a
+# table-metadata namespace. The connector's query guide reaches only the code
+# writer (`client.description`); how to NAME things in the answer has to be
+# said where the planner reads the schema.
+_PRESENTATION_NOTES: dict[str, str] = {
+    "priority_erp": (
+        "Priority forms and columns have a technical name (ORDNAME, PORDERS) and a "
+        "title (a column's description; the title attribute on a form's priority_erp "
+        "entry). When writing to the user, call forms and columns by their titles, in "
+        "the user's language, never by technical name. Result tables are labelled with "
+        "the titles automatically: keep DataFrame column names technical in code."
+    ),
+}
+
+
+def _presentation_note_xml(tables) -> str:
+    """The presentation note for a data source whose tables carry a namespace
+    listed in `_PRESENTATION_NOTES`, or "" when none applies."""
+    try:
+        for ns, note in _PRESENTATION_NOTES.items():
+            for t in tables or []:
+                meta = getattr(t, "metadata_json", None)
+                if isinstance(meta, dict) and isinstance(meta.get(ns), dict):
+                    return xml_tag("presentation_note", xml_escape(note))
+    except Exception:
+        pass
+    return ""
 
 # Flat (non-namespaced) table metadata worth surfacing, keyed by connector.
 # Prometheus stores these at the top level of metadata_json.
@@ -169,12 +220,16 @@ _FLAT_META_KEYS: tuple[str, ...] = (
 # `relationship_key` marks a column recovered from a relationship rather than
 # from the column listing, so the agent knows it is a join key.
 #
+# `from_form` marks a Priority subform table's column that belongs to a parent
+# form (ORDERITEMS.CURDATE is the order's date), so the agent can tell a line's
+# own fields from its order's.
+#
 # This allowlist is the LAST gate before the prompt: a key absent here never
 # reaches the model no matter what discovery captured or persistence stored.
 _COLUMN_META_KEYS: tuple[str, ...] = (
     "unique_name", "returns", "hidden", "relationship_key",
     "format_string", "data_category", "display_folder", "sort_by_column",
-    "summarize_by", "contents",
+    "summarize_by", "contents", "from_form",
 )
 
 
@@ -294,6 +349,56 @@ def _render_source_metadata_xml(t: PromptTable) -> str:
         return ""
 
 
+# Said once per agent whose rendered schema holds a routine, not per routine.
+ROUTINES_NOTE = (
+    "<routine> entries are stored procedures and functions: the database's own "
+    "business logic, not tables. Never SELECT FROM a procedure and never EXEC/CALL "
+    "one (only read-only SELECTs run). When a question touches what a routine "
+    "computes (a metric definition, filters such as excluded statuses or test "
+    "accounts, a fiscal calendar), read its source with describe_tables(\"<routine "
+    "name>\") and apply the same logic in a SELECT over the underlying tables. A "
+    "function may be called inside a SELECT."
+)
+
+
+def _render_routine_xml(t: PromptTable, include_definition: bool = False) -> str:
+    """One stored procedure / function: its signature(s), and its source when
+    `include_definition` (describe_tables). The main schema context leaves the
+    source out so a large procedure never bloats every turn."""
+    block = routine_meta(t)
+    kind = routine_kind(t) or "procedure"
+    parts = [xml_tag("signature", xml_escape(sig)) for sig in (block.get("signatures") or [])]
+    if include_definition:
+        definition = block.get("definition")
+        if definition:
+            attrs = {"truncated": "true"} if block.get("definition_truncated") else None
+            parts.append(xml_tag("definition", xml_escape(definition), attrs))
+        else:
+            parts.append(xml_tag(
+                "definition",
+                "Source not visible to this connection's account. Tell the user an "
+                "admin can grant VIEW DEFINITION (or the engine's equivalent) to make "
+                "it readable. Meanwhile a function can still be called inside a SELECT "
+                "on sample inputs to observe what it returns.",
+                {"available": "false"},
+            ))
+    attrs = {"name": t.name, "kind": kind}
+    if getattr(t, "description", None):
+        attrs["description"] = t.description
+    if not block.get("definition_available", True):
+        attrs["source"] = "not_visible"
+    try:
+        if getattr(t, "referenced_instructions_count", None):
+            attrs["instructions"] = str(int(t.referenced_instructions_count))
+    except Exception:
+        pass
+    return xml_tag("routine", "\n".join(parts), attrs)
+
+
+def _routines_note_xml(tables) -> str:
+    return xml_tag("routines_note", xml_escape(ROUTINES_NOTE)) if any(is_routine(t) for t in tables or []) else ""
+
+
 class TablesSchemaContext(ContextSection):
     # "Agent" is the product name for a data source; the model-facing schema
     # context uses the same vocabulary as the roster/tools (<agents>/<agent>).
@@ -320,19 +425,19 @@ class TablesSchemaContext(ContextSection):
         # and, worse, unaware of WHICH URLs are in scope (so it guesses wrong ones).
         browser_scope: Optional[Dict[str, Any]] = None
 
-        # True when the planner registers this report's MCP tools natively, so
-        # each one already carries its schema in the request's tools array.
-        # Resolved report-wide by the builder — never recomputed here, or the two
-        # sides could disagree about where the schema lives.
-        native_mcp: bool = False
+        # MCP tools are registered natively, each carrying its schema in the
+        # request's tools array. False only when the run could not build its
+        # MCP catalog and falls back to execute_mcp (set by the context hub):
+        # the block then inlines schemas and points at execute_mcp.
+        native_mcp: bool = True
 
         # Below this many files, list them inline (cheap + lets the agent pick
         # directly); above it, emit only scope + sample + topics.
         _FILE_INLINE_THRESHOLD: ClassVar[int] = 15
 
-        # Below this many MCP/custom-API tools, inline each tool's argument
-        # schema in <mcp_tools>; above it the block would dominate the prompt
-        # every turn, so those connections keep the search_mcps discovery hop.
+        # On the execute_mcp fallback, below this many MCP/custom-API tools,
+        # inline each tool's argument schema in <mcp_tools>; above it the
+        # block would dominate the prompt every turn.
         _MCP_INLINE_SCHEMA_MAX: ClassVar[int] = 40
 
         # Short, human-readable explanations of each agent (data source)
@@ -378,7 +483,7 @@ class TablesSchemaContext(ContextSection):
 
             The name is part of the key because one physical connection can
             expose two client identities: the live source and its ``::fast``
-            sibling serving materialized custom queries. They share a
+            sibling serving materialized custom tables. They share a
             connection_id, so keying on the id alone would merge them into one
             <connection> block under whichever name sorted first — and the coder
             maps that name onto a client_key, so the merged block would point
@@ -395,6 +500,8 @@ class TablesSchemaContext(ContextSection):
 
         def _render_table_xml(self, t: PromptTable) -> str:
             """Render a single table to XML."""
+            if is_routine(t):
+                return _render_routine_xml(t)
             col_parts = []
             for c in (t.columns or []):
                 attrs = f'name="{xml_escape(c.name)}" dtype="{xml_escape(c.dtype or "")}"'
@@ -509,7 +616,7 @@ class TablesSchemaContext(ContextSection):
                 table_attrs["type"] = "semantic_view"
             if getattr(t, 'description', None):
                 table_attrs["description"] = t.description
-            # A BOW custom query is already materialized locally: querying it
+            # A BOW custom table is already materialized locally: querying it
             # costs the source nothing, so the agent should reach for it before
             # re-deriving the same figures from raw tables.
             if getattr(t, 'is_cached', False):
@@ -555,14 +662,10 @@ class TablesSchemaContext(ContextSection):
                 key = tool.connection_id or 'default'
                 groups[key].append(tool)
 
-            # Inline argument schemas when the catalog is small enough to
-            # afford it. Above the threshold the block would dominate the
-            # prompt every turn, so those fall back to search_mcps discovery.
-            #
-            # When native registration is on, each tool already carries its
-            # schema in the request's tools array. Inlining here as well would
-            # pay for the same bytes twice, every turn, so the block degrades to
-            # an index and the note points at the real tools.
+            # Native tools carry their schema in the request's tools array,
+            # so the block is an index. On the execute_mcp fallback there is
+            # no other copy: inline the schemas when the catalog is small
+            # enough to afford it.
             total_tools = sum(len(v) for v in groups.values())
             inline_schemas = (not self.native_mcp) and total_tools <= self._MCP_INLINE_SCHEMA_MAX
 
@@ -573,9 +676,9 @@ class TablesSchemaContext(ContextSection):
                 for t in tools:
                     desc = xml_escape(t.description or "")
                     policy = getattr(t, 'policy', None)
-                    policy_attr = ""
+                    policy_attr = ' deferred="true"' if getattr(t, "deferred", False) else ""
                     if policy and policy != "allow":
-                        policy_attr = f' policy="{xml_escape(policy)}"'
+                        policy_attr += f' policy="{xml_escape(policy)}"'
                         has_gated = True
                     args_xml = ""
                     if inline_schemas and getattr(t, "input_schema", None):
@@ -596,32 +699,29 @@ class TablesSchemaContext(ContextSection):
                 if conn_id != 'default':
                     conn_attrs["id"] = conn_id
                 conn_parts.append(xml_tag("connection", "\n".join(tool_xmls), conn_attrs))
-            if inline_schemas:
-                # Schemas are right here, every turn. Say so explicitly —
-                # otherwise the agent defensively calls search_mcps before each
-                # execute_mcp anyway, which is a wasted planner turn plus a
-                # wasted tool round trip per call.
-                conn_parts.append(
-                    "<note>The <arg> elements above ARE each tool's full argument schema — name, type, "
-                    "requiredness, enums and nested shape. They are authoritative and always current, so "
-                    "call execute_mcp directly; do NOT call search_mcps first. Match the declared type "
-                    "exactly: an arg typed \"string\" takes a string even when its content is JSON "
-                    "(serialize it), and an arg typed \"integer\" takes a number, not a formatted date.</note>"
+            # MCP tools are the model's own tools (mcp__<connection>__<tool>),
+            # each with its schema, up to tools_max; the rest are reached via
+            # search_tools + call_tool. This block is the index of all of them.
+            if not self.native_mcp:
+                note = (
+                    "<note>Call these tools with execute_mcp(connection_id=&lt;the connection id above&gt;, "
+                    "tool_name=&lt;the tool name&gt;, arguments={...}).</note>"
                 )
-            elif self.native_mcp:
-                conn_parts.append(
-                    "<note>Each tool above is also available to you directly as a tool named "
-                    "mcp__&lt;connection&gt;__&lt;tool&gt;, carrying its own argument schema — call it "
-                    "directly rather than going through execute_mcp, and do not call search_mcps "
-                    "for it. Use search_mcps + execute_mcp only for a tool listed here that has no "
-                    "matching mcp__ tool available.</note>"
+            elif not any(getattr(t, "deferred", False) for t in (self.mcp_tools or [])):
+                note = (
+                    "<note>Each tool above is in your tool list as mcp__&lt;connection&gt;__&lt;tool&gt;, "
+                    "carrying its own argument schema: call it directly.</note>"
                 )
             else:
-                conn_parts.append(
-                    "<note>Only tool names and descriptions are shown above, not their argument schemas. "
-                    "Call search_mcps to get a tool's full input schema (exact argument names and types) "
-                    "before calling execute_mcp — do not guess arguments.</note>"
+                note = (
+                    "<note>Tools above without deferred=\"true\" are in your tool list as "
+                    "mcp__&lt;connection&gt;__&lt;tool&gt;, each with its own argument schema: call them "
+                    "directly. Tools marked deferred=\"true\" are NOT in your tool list and their "
+                    "arguments are not shown: call search_tools to get the exact name and input schema, "
+                    "then call_tool(name=&lt;that exact name&gt;, arguments=...). Do not guess their "
+                    "arguments.</note>"
                 )
+            conn_parts.append(note)
             if has_gated:
                 conn_parts.append(
                     '<note>Tools marked policy="ask" pause the run for the user to approve the call '
@@ -656,7 +756,9 @@ class TablesSchemaContext(ContextSection):
             # Index/state (self-closing).
             inner.append(
                 f'<index mode="{xml_escape(fs.index_mode)}" files="{fs.file_count}" '
-                f'capped="{"true" if fs.capped else "false"}"/>'
+                f'capped="{"true" if fs.capped else "false"}"'
+                + (f' indexed_at="{xml_escape(fs.indexed_at)}"' if fs.indexed_at else "")
+                + "/>"
             )
             if fs.topics:
                 inner.append(xml_tag("topics", xml_escape(", ".join(fs.topics[:12]))))
@@ -683,6 +785,8 @@ class TablesSchemaContext(ContextSection):
                          "read_file to read (use offset/length for large files). "
                          "No content search on this connection — discover by filename." + denial)
             inner.append(xml_tag("usage", usage))
+            if fs.note:
+                inner.append(xml_tag("note", xml_escape(fs.note)))
             attrs = {"name": fs.name, "type": fs.type, "kind": "files"}
             if fs.connection_id:
                 attrs["id"] = fs.connection_id
@@ -722,6 +826,12 @@ class TablesSchemaContext(ContextSection):
                 content_parts.append(status_xml)
             if self.info.context:
                 content_parts.append(xml_tag("context", xml_escape(self.info.context)))
+            presentation = _presentation_note_xml(self.tables)
+            if presentation:
+                content_parts.append(presentation)
+            routines_note = _routines_note_xml(self.tables)
+            if routines_note:
+                content_parts.append(routines_note)
 
             # Check if we have multi-connection (more than one group, or the group isn't 'default')
             # File connections also count — they render as their own <connection>.
@@ -804,7 +914,7 @@ class TablesSchemaContext(ContextSection):
                     meta_parts.append(f"score: {score_str}")
                 if usage_str is not None:
                     meta_parts.append(f"usage: {usage_str}")
-                meta_parts.append(f"{cols_count} columns")
+                meta_parts.append(routine_kind(t) if is_routine(t) else f"{cols_count} columns")
                 meta_text = f"({', '.join(meta_parts)})" if meta_parts else None
 
                 attrs = {"n": t.name}
@@ -836,7 +946,7 @@ class TablesSchemaContext(ContextSection):
             payload = xml_tag("count", str(len(self.tables or []))) + xml_tag("top", ", ".join(first_five))
             return xml_tag(self.tag_name, payload, {"name": self.info.name, "type": self.info.type, "id": self.info.id})
 
-        def _render_topk_tables_full(self, top_k: int) -> str:
+        def _render_topk_tables_full(self, top_k: int, include_definitions: bool = False) -> str:
             """Render top K tables with full schema, grouped by connection if multi-connection."""
             # Cached relations are never sliced away by the cap. They rank first
             # (see schema_context_builder._cached_first), but this render path is
@@ -863,6 +973,8 @@ class TablesSchemaContext(ContextSection):
             has_multi_connection = len(conn_groups) > 1 or (len(conn_groups) == 1 and 'default' not in conn_groups)
 
             def render_table(t):
+                if is_routine(t):
+                    return _render_routine_xml(t, include_definition=include_definitions)
                 col_parts = []
                 for c in (t.columns or []):
                     col_attrs = f'name="{xml_escape(c.name)}" dtype="{xml_escape(c.dtype or "")}"'
@@ -975,6 +1087,107 @@ class TablesSchemaContext(ContextSection):
                 tables_xml = [render_table(t) for t in top_tables]
                 return xml_tag("tables", "\n".join(tables_xml))
 
+        @staticmethod
+        def _connection_key(t):
+            """Identity of the connection a table came from: (id, name).
+
+            BOTH halves are load-bearing, for opposite reasons:
+
+            * the id, because two connections can share a display name, and an
+              agent cannot tell apart — or scope describe_tables to — connections
+              it sees as one;
+            * the name, because one physical connection can expose two client
+              identities, the live source and its ``::fast`` sibling serving
+              materialized custom tables. They share a connection_id on
+              purpose, so keying on the id alone merges them under whichever
+              name comes first and points half the tables at a client that
+              cannot serve them.
+
+            Same key as `_group_tables_by_connection`, whose docstring covers
+            the second case; the two must agree or the roster names connections
+            the <connection> blocks do not.
+            """
+            cid = getattr(t, 'connection_id', None)
+            name = getattr(t, 'connection_name', None) or None
+            if not cid and not name:
+                return None
+            return (str(cid) if cid else "", name or "")
+
+        def _connection_roster(self) -> list:
+            """(id, name, type, table_count) per connection, in first-seen order.
+
+            Derived from `self.tables` — the SCOPED table set — and never from
+            the data source's connection list. A connection this caller is
+            denied contributes no tables, so it contributes no roster entry
+            either; reading the agent's connections directly would name it and
+            undo the per-user scoping the builder just applied.
+            """
+            seen: dict = {}
+            for t in (self.tables or []):
+                key = self._connection_key(t)
+                if not key:
+                    continue
+                entry = seen.get(key)
+                if entry is None:
+                    cid = getattr(t, 'connection_id', None)
+                    seen[key] = {"key": key,
+                                 "id": str(cid) if cid else "",
+                                 "name": getattr(t, 'connection_name', None) or "",
+                                 "type": getattr(t, 'connection_type', None) or "",
+                                 "count": 1,
+                                 "alias": str(len(seen) + 1)}
+                else:
+                    entry["count"] += 1
+            return list(seen.values())
+
+        def _render_connections_roster_xml(self, full_cap: int = 200) -> str:
+            """Every connection this caller can see, named, with its table count.
+
+            Only the top-K tables render inside a <connection> block and the
+            index is capped, so on a large agent both are a SAMPLE: at 100
+            connections x 100 tables the agent saw 10 connections and had no
+            way to learn the other 90 existed — it answered "1 connection" for
+            a three-connection agent and would answer "10" for a hundred. The
+            roster is the complete list, and it is what makes describe_tables
+            (which already takes connection_ids) reachable for the tail.
+
+            Mirrors <available_agents>/<more_agents>, which solves the same
+            problem one level up for agents.
+            """
+            roster = self._connection_roster()
+            if len(roster) < 2:
+                return ""   # single-connection agents already read unambiguously
+            head = roster[:full_cap]
+            lines = [f'<connections count="{len(roster)}">']
+            for c in head:
+                lines.append(
+                    f'  <connection c="{c["alias"]}" id="{xml_escape(c["id"])}" '
+                    f'name="{xml_escape(c["name"])}" '
+                    f'type="{xml_escape(c["type"])}" tables="{c["count"]}"/>'
+                )
+            tail = roster[full_cap:]
+            if tail:
+                # Past the cap: id and name only, no type or table count. The id
+                # is the half that cannot be dropped — describe_tables takes
+                # connection_ids, so a connection listed by name alone is one the
+                # agent can see but not query, which is worse than not listing
+                # it. Same trade <more_agents> makes, with the id kept.
+                lines.append(f'  <more_connections count="{len(tail)}">')
+                for c in tail:
+                    lines.append(
+                        f'    <connection c="{c["alias"]}" id="{xml_escape(c["id"])}" '
+                        f'name="{xml_escape(c["name"])}"/>'
+                    )
+                lines.append('  </more_connections>')
+            lines.append(
+                '  ALL connections on this agent are listed above; the sample and '
+                'index below are a subset. Index items carry c="N" matching the c '
+                'attribute here. Reach any connection\'s tables with '
+                'describe_tables(connection_ids=[...]) using the id attribute.'
+            )
+            lines.append("</connections>")
+            return "\n".join(lines)
+
         def _render_names_index(self, index_limit: int = 200) -> str:
             tables = list(self.tables or [])
             if not tables:
@@ -982,11 +1195,43 @@ class TablesSchemaContext(ContextSection):
             # Build nested <item> elements with minimal metrics
             items_xml: List[str] = []
             cap = max(0, index_limit)
+            # An ALIAS, not the name. Spelling the connection out on every item
+            # cost 30-52 bytes each — at the 1000-item cap that was 30-52 KB,
+            # around a third of the whole rendered context, to repeat a handful
+            # of strings a thousand times. The roster above maps c="N" back to
+            # the name once.
+            alias_by_key = {c["key"]: c["alias"] for c in self._connection_roster()}
+            name_connections = len(alias_by_key) > 1
+            if cap and len(tables) > cap and len(alias_by_key) > 1:
+                # Round-robin the cap across connections instead of taking the
+                # global top N. Rank-ordered truncation clusters: at 100
+                # connections x 100 tables the first 1000 rows all came from the
+                # same handful of connections, so ninety connections had every
+                # one of their tables cut and vanished from the agent's view
+                # entirely. Interleaving gives each connection an equal share,
+                # so a connection loses depth rather than existence. Order
+                # WITHIN each connection is preserved, so the best tables of
+                # each still come first.
+                from itertools import zip_longest
+                buckets: dict = {}
+                for t in tables:
+                    buckets.setdefault(self._connection_key(t) or "", []).append(t)
+                tables = [
+                    t for row in zip_longest(*buckets.values())
+                    for t in row if t is not None
+                ]
             for t in tables[:cap if cap > 0 else len(tables)]:
-                attrs = {
-                    "name": t.name,
-                    "cols": str(len(getattr(t, 'columns', []) or [])),
-                }
+                if is_routine(t):
+                    attrs = {"name": t.name, "kind": routine_kind(t)}
+                else:
+                    attrs = {
+                        "name": t.name,
+                        "cols": str(len(getattr(t, 'columns', []) or [])),
+                    }
+                if name_connections:
+                    alias = alias_by_key.get(self._connection_key(t))
+                    if alias:
+                        attrs["c"] = alias
                 try:
                     if getattr(t, 'score', None) is not None:
                         attrs["score"] = str(round(float(getattr(t, 'score')), 2))
@@ -1020,10 +1265,14 @@ class TablesSchemaContext(ContextSection):
             return xml_tag(self.tag_name, "".join(ds._render_digest() for ds in self.data_sources or []))
         return xml_tag(self.tag_name, "\n\n".join(ds.render() for ds in self.data_sources or []))
 
-    def render_combined(self, top_k_per_ds: int = 10, index_limit: int = 200, include_index: bool = True) -> str:
+    def render_combined(self, top_k_per_ds: int = 10, index_limit: int = 200, include_index: bool = True,
+                        include_routine_definitions: bool = False) -> str:
+        """`include_routine_definitions` adds each stored procedure's / function's
+        source to its <routine> entry (describe_tables). Off for the planner's
+        standing context, which carries signatures only."""
         ds_chunks: List[str] = []
         for ds in (self.data_sources or []):
-            sample_xml = ds._render_topk_tables_full(top_k_per_ds)
+            sample_xml = ds._render_topk_tables_full(top_k_per_ds, include_definitions=include_routine_definitions)
             index_xml = ds._render_names_index(index_limit) if include_index else ""
             # Render MCP tools for this data source
             mcp_xml = ds._render_mcp_tools_xml() if ds.mcp_tools else ""
@@ -1052,8 +1301,21 @@ class TablesSchemaContext(ContextSection):
             status_xml = ds._render_status_xml()
             if status_xml:
                 inner_parts.append(status_xml)
+            # Before the sample: the sample and index are both capped, so the
+            # roster is the only complete statement of what this agent connects
+            # to, and the model should read it before drawing conclusions from
+            # a truncated list.
+            roster_xml = ds._render_connections_roster_xml()
+            if roster_xml:
+                inner_parts.append(roster_xml)
             if getattr(ds.info, 'context', None):
                 inner_parts.append(xml_tag("description", xml_escape(ds.info.context)))
+            presentation = _presentation_note_xml(getattr(ds, 'tables', None))
+            if presentation:
+                inner_parts.append(presentation)
+            routines_note = _routines_note_xml(getattr(ds, 'tables', None))
+            if routines_note:
+                inner_parts.append(routines_note)
             if sample_xml:
                 inner_parts.append(xml_tag("sample", sample_xml, {"k": str(top_k_per_ds)}))
             if index_xml:

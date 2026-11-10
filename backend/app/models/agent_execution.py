@@ -1,5 +1,6 @@
-from sqlalchemy import Column, String, DateTime, Integer, Float, JSON, Boolean, ForeignKey
+from sqlalchemy import Column, String, DateTime, Integer, Float, JSON, Boolean, ForeignKey, Text
 from sqlalchemy.orm import relationship
+from app.ee.encryption import EncryptedText
 from .base import BaseSchema
 
 
@@ -27,6 +28,17 @@ class AgentExecution(BaseSchema):
     token_usage_json = Column(JSON, nullable=True, default=dict)
     error_json = Column(JSON, nullable=True)
     config_json = Column(JSON, nullable=True)
+    # Per-turn user-memory metadata for the trace: injected handles/sections/
+    # tiers, rendered size, memory tool refusals. See MemoryContext.trace().
+    memory_context_json = Column(JSON, nullable=True)
+
+    # Sub-agents: a child execution (mode=subagent) carries the parent run and
+    # the parent's `delegate` tool execution that launched it. NULL on every
+    # ordinary run. See app.models.sub_agent.
+    parent_agent_execution_id = Column(String(36), ForeignKey('agent_executions.id'), nullable=True, index=True)
+    # Plain id, not a FOREIGN KEY: a second FK path between tool_executions and
+    # agent_executions makes every implicit join between the two ambiguous.
+    parent_tool_execution_id = Column(String(36), nullable=True)
 
     # Build
     build_id = Column(String(36), ForeignKey('instruction_builds.id'), nullable=True)
@@ -39,6 +51,35 @@ class AgentExecution(BaseSchema):
     # the ``run_eval`` tool to refuse nested invocations and keep recursion
     # from stacking new TestRuns inside an in-flight one.
     is_eval_run = Column(Boolean, nullable=False, default=False, index=True)
+
+    # Diagnosis rollups — denormalised at run end (and on feedback / judge /
+    # late-usage events) by app.services.diagnosis.rollup.refresh_rollup so the
+    # diagnosis explorer filters and sorts on this table alone. Never written
+    # on the hot path during a run.
+    prompt_text = Column(EncryptedText, nullable=True) # first 2,000 chars of the user prompt
+    error_text = Column(Text, nullable=True)           # error_json.message, first 2,000 chars
+    platform = Column(String, nullable=True)           # web | slack | teams | email | mcp | api
+    # The outside application this run came through (app/core/request_origin.py).
+    origin_app_type = Column(String(16), nullable=True)
+    origin_app_id = Column(String(36), nullable=True)
+    feedback_direction = Column(Integer, nullable=True)  # 1 | -1 | 0 (none)
+    feedback_message = Column(Text, nullable=True)
+    judge_response_score = Column(Integer, nullable=True)      # completions.response_score
+    judge_instructions_score = Column(Integer, nullable=True)  # completions.instructions_effectiveness
+    judge_context_score = Column(Integer, nullable=True)       # completions.context_effectiveness
+    primary_model_id = Column(String, nullable=True)   # the planner's model
+    primary_provider = Column(String, nullable=True)
+    total_cost_usd = Column(Float, nullable=True)
+    prompt_tokens = Column(Integer, nullable=True)     # input, cache reads/writes included for every provider
+    completion_tokens = Column(Integer, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
+    cache_read_tokens = Column(Integer, nullable=True)  # subset of prompt_tokens; NULL = no per-call usage
+    tool_count = Column(Integer, nullable=True)
+    failed_tool_count = Column(Integer, nullable=True)
+    turn_index = Column(Integer, nullable=True)        # 1-based position of the run in its report
+    cost_is_partial = Column(Boolean, nullable=True)   # cost attributed by report+window, not by run id
+    rollup_at = Column(DateTime, nullable=True)
+    rollup_version = Column(Integer, nullable=True)  # constants.ROLLUP_VERSION when current; NULL = not indexed
 
     # Relationships (optional lazy loading)
     plan_decisions = relationship('PlanDecision', back_populates='agent_execution', lazy='select')

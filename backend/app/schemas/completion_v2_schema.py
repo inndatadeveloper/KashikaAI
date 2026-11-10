@@ -1,4 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from app.utils.reasoning_effort import normalize_effort
+from app.utils.request_metadata import validate_request_metadata
 from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 
@@ -12,10 +15,20 @@ from .file_schema import FileSchema
 
 
 class ToolExecutionDataSourceSchema(BaseModel):
-    """Lightweight data source info for display in tool execution UI."""
+    """Lightweight data source info for display in tool execution UI.
+
+    Rides along with every tool execution in every view — the report page, the
+    shared ``/c/{token}`` page and the report summary — which is why the data
+    tools read their icon from here rather than from a page-level prop the
+    shared views never passed.
+    """
     id: str
     name: Optional[str] = None
     type: Optional[str] = None  # connection type e.g. 'postgres', 'bigquery'
+    # Resolved display icon ("emoji:<grapheme>" | "type:<key>" | None), from
+    # app.schemas.agent_icon — the same token the agents list and report payload
+    # carry, so one agent draws one icon everywhere.
+    icon_token: Optional[str] = None
 
 
 class ToolExecutionUISchema(ToolExecutionSchema):
@@ -24,6 +37,11 @@ class ToolExecutionUISchema(ToolExecutionSchema):
     created_step: Optional[StepSchema] = None
     created_visualizations: Optional[list[VisualizationSchema]] = None
     data_sources: Optional[list[ToolExecutionDataSourceSchema]] = None
+    # Running tool waiting on (or past) a user review: pending|approved|denied|expired.
+    # Lets a reload rebuild the approval card the live stream showed.
+    review_state: Optional[str] = None
+    confirmation: Optional[Dict[str, Any]] = None
+    progress_stage: Optional[str] = None
 
 
 class ArtifactChangeSchema(BaseModel):
@@ -51,14 +69,45 @@ class PromptSchema(BaseModel):
     widget_id: Optional[str] = None
     step_id: Optional[str] = None
     mentions: Optional[List[dict]] = None
+    # The dashboard version open in the conversation's editor (collab01):
+    # the next edit builds on it, even when the conversation holds a newer
+    # one. None: the newest, as before.
+    artifact_version_id: Optional[str] = None
     mode: Optional[str] = 'chat'
     model_id: Optional[str] = None
     platform: Optional[str] = None  # 'excel', 'slack', 'teams', etc. None = web
     platform_context: Optional[Dict[str, Any]] = None  # Platform-specific context (e.g. Excel selection data)
-    # Per-completion override for extended-thinking effort. Resolution order:
-    #   per-completion > trigger words > LLMModel.config default > "off"
-    # Currently honored on Anthropic only; ignored on other providers.
-    reasoning_effort: Optional[str] = None  # off|low|medium|high
+    # Per-completion reasoning effort (the model picker's level). Resolution:
+    #   per-completion > report level > trigger words > LLMModel.config default > off
+    # None = Default. Each provider client clamps it to what the model accepts.
+    # Internal continuation context; only honored on machine-triggered turns.
+    response_locale: Optional[str] = None
+    response_parent_completion_id: Optional[str] = None
+    response_original_request: Optional[str] = None
+    reasoning_effort: Optional[str] = None  # off|minimal|low|medium|high|xhigh|max
+    # Free-form values the calling app attaches to this question (e.g. its chat
+    # id). Stored with the completion; merged into MCP tool-call metadata on
+    # connections with Dynamic params on. Never shown to the LLM. See
+    # app.utils.request_metadata.
+    metadata: Optional[Dict[str, Any]] = None
+    # Set only on the hidden head completion of a sub-agent (mode='subagent'):
+    # the sub_agents row this child run reports to. See app.models.sub_agent.
+    sub_agent_id: Optional[str] = None
+    # Per-request opt-outs for end-of-turn extras an API caller may not render.
+    # They can only turn things off: False skips it for this turn; None/True
+    # leaves the org setting in charge (never turns on what the org disabled).
+    follow_ups: Optional[bool] = None  # suggested next questions (completion.follow_ups)
+    suggest_instructions: Optional[bool] = None  # knowledge harness (draft instruction suggestions)
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _validate_reasoning_effort(cls, v):
+        return normalize_effort(v)
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata(cls, v):
+        return validate_request_metadata(v)
 
     class Config:
         from_attributes = True
@@ -68,11 +117,11 @@ class CompletionBase(BaseModel):
 
 class CompletionCreate(CompletionBase):
     stream: Optional[bool] = False
-    # When true and a completion is already running on the report, the prompt
-    # is persisted as a role='user' status='queued' row instead of starting a
-    # second concurrent agent run. The queue dispatcher starts it when the
-    # running turn finishes successfully.
+    # Explicit queue mode: enqueue immediately; the dispatcher starts it when idle.
     queue: Optional[bool] = False
+    # Opt-in for clients that can accept a queued JSON receipt if a concurrent
+    # parent starts before their normal direct/SSE request claims the report.
+    queue_if_busy: bool = False
 
 
 class CompactionStateSchema(BaseModel):
@@ -146,6 +195,9 @@ class CompletionV2Schema(BaseModel):
     message_type: Optional[str] = None
 
     agent_execution_id: Optional[str] = None
+    # Wall-clock time of the agent execution behind this completion, stamped when
+    # the run finishes (AgentExecution.total_duration_ms). None while in progress.
+    total_duration_ms: Optional[float] = None
 
     prompt: Optional[Dict[str, Any]] = None
 
@@ -210,6 +262,7 @@ class CompletionV2Schema(BaseModel):
 
 class CompletionsV2Response(BaseModel):
     report_id: str
+    busy_completion_id: Optional[str] = None
     completions: List[CompletionV2Schema]
     total_completions: int
     total_blocks: int

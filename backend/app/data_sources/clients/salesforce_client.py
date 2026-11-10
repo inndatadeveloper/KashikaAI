@@ -27,6 +27,7 @@ source: nested relationship payloads are flattened to dotted columns, and a
 result with no rows still carries the columns the SELECT list asked for.
 """
 from __future__ import annotations
+from app.data_sources.clients.progress import discovery_progress
 
 import json
 import logging
@@ -38,9 +39,10 @@ from typing import Any, Dict, Generator, List, Optional
 from urllib.parse import urlparse
 
 import pandas as pd
-import requests
+from app.core.egress import pinned_request, pinned_session
 from simple_salesforce import Salesforce
 
+from app.data_sources.clients.progress import IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 from app.data_sources.clients.progress import ProgressCallback, make_reporter
 from app.ai.prompt_formatters import ForeignKey, Table, TableColumn, ServiceFormatter
@@ -408,7 +410,8 @@ class SalesforceClient(DataSourceClient):
         only in the form body and in the advice worth printing on failure.
         """
         login_url = self._login_url()
-        resp = requests.post(
+        resp = pinned_request(
+            "POST",
             f"{login_url}/services/oauth2/token",
             data=payload,
             timeout=60,
@@ -482,19 +485,20 @@ class SalesforceClient(DataSourceClient):
     def sf(self) -> Salesforce:
         mode = self._auth_mode
         if mode == "token":
-            return Salesforce(instance_url=self.instance_url, session_id=self.access_token)
+            return Salesforce(instance_url=self.instance_url, session_id=self.access_token, session=pinned_session())
         if mode == "jwt":
             token, instance_url = self._jwt_access()
-            return Salesforce(instance_url=instance_url, session_id=token)
+            return Salesforce(instance_url=instance_url, session_id=token, session=pinned_session())
         if mode == "client_credentials":
             token, instance_url = self._client_credentials_access()
-            return Salesforce(instance_url=instance_url, session_id=token)
+            return Salesforce(instance_url=instance_url, session_id=token, session=pinned_session())
         if mode == "userpass":
             return Salesforce(
                 username=self.username,
                 password=self.password,
                 security_token=self.security_token or "",
                 domain=self._sf_domain(),
+                session=pinned_session(),
             )
         # Name the missing field rather than the whole menu. A half-filled
         # Connected App used to fall through to the generic message below,
@@ -605,6 +609,7 @@ class SalesforceClient(DataSourceClient):
             ordered = ordered[:MAX_INDEX_OBJECTS]
         return ordered
 
+    @discovery_progress
     def get_schemas(self, progress_callback: Optional[ProgressCallback] = None) -> List[Table]:
         """Discover object schemas dynamically (standard + custom)."""
         names = self._discover_object_names()
@@ -615,9 +620,12 @@ class SalesforceClient(DataSourceClient):
         for name in names:
             try:
                 schemas.append(self.get_schema(name))
+            except IndexingCancelled:
+                raise
             except Exception as e:
-                # A single unreadable object (field-level security, odd metadata)
-                # must not abort the whole catalog.
+                # Keep collecting diagnostics, but an omitted required object
+                # makes publication incomplete; it must not be pruned as gone.
+                self.mark_discovery_incomplete("salesforce catalog")
                 logger.warning(
                     "Skipping Salesforce object %s: %s", name, format_salesforce_error(e)
                 )

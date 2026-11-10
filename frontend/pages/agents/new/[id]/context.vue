@@ -17,19 +17,20 @@
           <div class="relative">
             <div class="border border-gray-200 dark:border-gray-700 focus-within:ring-2 focus-within:ring-blue-100 focus-within:border-blue-400">
               <!-- Loading overlay -->
-              <div v-if="loadingDraft" class="flex items-center justify-center gap-2 py-10 text-xs text-gray-400">
+              <div v-if="loadingDraft" class="flex items-center justify-center gap-2 py-10 text-xs text-ink-muted">
                 <Spinner class="w-4 h-4" />
                 <span>Generating overview instruction…</span>
               </div>
 
               <div v-else class="mention-container">
                 <!-- Highlight backdrop -->
-                <div ref="backdropRef" class="mention-backdrop" aria-hidden="true" v-html="highlightedText" />
+                <div ref="backdropRef" class="mention-backdrop" aria-hidden="true" :dir="instructionDir" v-html="highlightedText" />
 
                 <!-- Textarea -->
                 <textarea
                   ref="textareaRef"
                   v-model="instructionText"
+                  :dir="instructionDir"
                   placeholder="Describe business rules, metric definitions, or query guidelines…"
                   class="mention-textarea"
                   @input="handleTextareaInput"
@@ -81,7 +82,7 @@
                     <span class="font-mono font-medium text-gray-900 dark:text-white block">{{ item.name }}</span>
                     <div class="flex items-center gap-1 mt-0.5">
                       <DataSourceIcon v-if="item.dataSourceType && item.type !== 'connection_tool'" :type="item.dataSourceType" class="h-2.5" />
-                      <span class="text-[10px] text-gray-500 dark:text-gray-400">{{ item.dataSourceName }}</span>
+                      <span class="text-2xs text-gray-500 dark:text-gray-400">{{ item.dataSourceName }}</span>
                     </div>
                   </template>
                 </div>
@@ -91,14 +92,14 @@
         </div>
 
         <!-- Git integration — only shown when no repo is connected -->
-        <div v-if="!integration?.git_repository" class="flex items-center gap-1.5 text-xs text-gray-400">
+        <div v-if="!integration?.git_repository" class="flex items-center gap-1.5 text-xs text-ink-muted">
           <GitBranchIcon class="w-3.5 h-3.5" />
           <span>Connect a git repository for Tableau, dbt, and markdown context —</span>
           <button class="text-blue-500 hover:text-blue-600 underline-offset-2 hover:underline" @click="showGitModal = true">integrate</button>
         </div>
 
         <div class="flex justify-end pt-4">
-          <button @click="handleSave" :disabled="saving || loadingDraft" class="bg-blue-500 hover:bg-blue-600 text-white text-xs font-medium py-1.5 px-3 rounded disabled:opacity-50">
+          <button @click="handleSave" :disabled="saving || loadingDraft" class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium py-1.5 px-3 rounded disabled:opacity-50">
             <span v-if="saving">Saving...</span>
             <span v-else>Save & Continue</span>
           </button>
@@ -111,6 +112,7 @@
 </template>
 
 <script setup lang="ts">
+import { dominantTextDir } from '~/utils/textDirection'
 definePageMeta({ auth: true })
 import WizardSteps from '@/components/datasources/WizardSteps.vue'
 import GitRepoModalComponent from '@/components/GitRepoModalComponent.vue'
@@ -161,6 +163,9 @@ async function loadDraftInstruction() {
 
 // ── Instruction text ──────────────────────────────────────────────────────────
 const instructionText = ref('')
+// The highlight backdrop mirrors the textarea glyph for glyph, so both take the
+// same direction — the text's (word majority), or the UI's while empty.
+const instructionDir = computed(() => dominantTextDir(instructionText.value) || undefined)
 
 // ── @ Mention ─────────────────────────────────────────────────────────────────
 interface MentionItem {
@@ -449,7 +454,7 @@ onMounted(() => {
 
 .mention-backdrop,
 .mention-textarea {
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, ui-sans-serif, system-ui, sans-serif;
   font-size: 12px;
   line-height: 1.625;
   padding: 16px;

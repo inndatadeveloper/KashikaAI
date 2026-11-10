@@ -3,7 +3,7 @@
         <div class="p-5">
             <div class="flex items-center justify-between mb-4">
                 <h3 class="text-sm font-semibold text-gray-900 dark:text-white">Set Source Scope</h3>
-                <button @click="isOpen = false" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                <button @click="isOpen = false" class="text-ink-muted hover:text-gray-600 dark:hover:text-gray-300">
                     <UIcon name="i-heroicons-x-mark" class="w-5 h-5" />
                 </button>
             </div>
@@ -30,17 +30,17 @@
                                 <DataSourceIcon :type="getOptionType(val)" :icon="getOptionIcon(val)" class="h-3.5" />
                                 {{ getOptionLabel(val) }}
                             </span>
-                            <span v-if="selectedValues.length > 2" class="text-xs text-gray-400">
+                            <span v-if="selectedValues.length > 2" class="text-xs text-ink-muted">
                                 +{{ selectedValues.length - 2 }}
                             </span>
                         </template>
                     </div>
-                    <span v-else class="text-gray-400">Select scope</span>
+                    <span v-else class="text-ink-muted">Select scope</span>
                 </template>
                 <template #option="{ option }">
                     <div class="flex items-center gap-2">
                         <UIcon v-if="option.value === 'global'" name="i-heroicons-globe-alt" class="w-4 h-4 text-gray-500 dark:text-gray-400" />
-                        <DataSourceIcon v-else :type="option.type" :icon="option.icon" class="h-4" />
+                        <DataSourceIcon v-else :type="option.type" :icon-token="option.icon_token" :icon="option.icon" class="h-4" />
                         <span>{{ option.label }}</span>
                     </div>
                 </template>
@@ -71,6 +71,7 @@ interface DataSource {
     name: string
     type?: string
     icon?: string | null
+    icon_token?: string | null
 }
 
 interface Option {
@@ -78,6 +79,7 @@ interface Option {
     label: string
     type?: string
     icon?: string | null
+    icon_token?: string | null
 }
 
 const props = defineProps<{
@@ -104,7 +106,8 @@ const options = computed<Option[]>(() => [
         value: ds.id,
         label: ds.name,
         type: ds.type,
-        icon: ds.icon ?? null
+        icon: ds.icon ?? null,
+        icon_token: ds.icon_token ?? null
     }))
 ])
 

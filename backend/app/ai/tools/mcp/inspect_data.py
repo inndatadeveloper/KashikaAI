@@ -33,6 +33,7 @@ class InspectDataMCPTool(MCPTool):
     """
     
     name = "inspect_data"
+    read_only_hint = True
     description = (
         "Quick data inspection for exploration and debugging. "
         "Use to preview data (head/tail), check column types, understand structure, "
@@ -62,7 +63,7 @@ class InspectDataMCPTool(MCPTool):
         platform = await self._get_or_create_mcp_platform(db, organization)
 
         # Load report as ORM model (preserves Connection.get_credentials())
-        report = await self._load_report(db, input_data.report_id)
+        report = await self._load_report(db, input_data.report_id, user, organization)
         
         # Update report with external_platform_id if not set (direct DB update)
         if not report.external_platform:
@@ -86,6 +87,7 @@ class InspectDataMCPTool(MCPTool):
             report=report,
             prompt=input_data.prompt,
             explicit_tables=input_data.tables,
+            instruction_ids=input_data.instruction_ids,
         )
         
         # Check if LLM is allowed to see data
@@ -284,7 +286,7 @@ class InspectDataMCPTool(MCPTool):
                         "tool": "mcp.inspect_data",
                         "data_source_ids": _ds_ids,
                         "tables_accessed": _tables,
-                        "executed_queries": _truncate_queries(executed_queries),
+                        "executed_queries": list(executed_queries or []),
                     },
                 )
             else:

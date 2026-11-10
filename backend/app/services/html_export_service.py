@@ -28,7 +28,7 @@ from app.services.artifact_libs import (
     get_offline_host_script,
     read_pdf_worker_source,
 )
-from app.services.artifact_payload import collect_artifact_payload, collect_params
+from app.services.artifact_payload import UNSCOPED, collect_artifact_payload
 from app.services.jsx_transpile import (
     extract_babel_source,
     json_for_script,
@@ -68,8 +68,9 @@ _HTML_SHELL = """<!DOCTYPE html>
 <style>
   html, body, #root {{ height: 100%; margin: 0; padding: 0; }}
   body {{
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #fff;
+    font-family: var(--bow-font-body, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
+    background: var(--bow-bg, #fff);
+    color: var(--bow-ink, #0f172a);
   }}
   @media print {{ [data-bow-export-badge] {{ display: none !important; }} }}
 </style>
@@ -155,8 +156,12 @@ def _has_pdf(files: list[dict[str, Any]]) -> bool:
     )
 
 
-async def build_standalone_html(db, artifact) -> str:
+async def build_standalone_html(db, artifact, *, viewer: Any = UNSCOPED) -> str:
     """Render a page-mode artifact as one self-contained, offline HTML document.
+
+    `viewer`: pass the reader (None = anonymous) on share-link exports so the
+    embedded rows are exactly what the public JSON view serves them; omit for
+    the in-app export, which bakes the stored snapshot.
 
     Raises:
         ExportUnavailable: vendored libs missing, or the artifact has no report
@@ -170,13 +175,11 @@ async def build_standalone_html(db, artifact) -> str:
         raise ExportUnavailable("This dashboard has no code to export")
 
     try:
-        payload = await collect_artifact_payload(db, artifact)
+        payload = await collect_artifact_payload(db, artifact, viewer=viewer)
     except FileNotFoundError as e:
         raise ExportUnavailable(str(e)) from e
     if payload is None:
         raise ExportUnavailable("The report backing this dashboard no longer exists")
-
-    payload["params"] = await collect_params(db, artifact)
 
     code, removed = _strip_remote_references(raw_code)
     if removed:

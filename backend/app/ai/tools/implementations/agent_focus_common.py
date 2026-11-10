@@ -45,6 +45,8 @@ async def accessible_agents(db, organization: Any, user: Any) -> List[Any]:
         .order_by(DataSource.name)
     )
     rows = list((await db.execute(stmt)).scalars().all())
+    from app.services.connected_application_service import filter_agents
+    rows = await filter_agents(db, rows, organization.id)
     if user is None:
         return [ds for ds in rows if getattr(ds, "is_public", False)]
     is_admin, member_ids = await get_accessible_data_source_ids(
@@ -72,6 +74,37 @@ async def signin_required_ids(db, agents: List[Any], user: Any) -> set:
         return {str(d.id) for d in agents} - usable_ids
     except Exception:
         return set()
+
+
+def run_scope_agents(runtime_ctx: dict[str, Any]) -> list[Any]:
+    """The agents a tool call may resolve against: the run's working set plus
+    the report's own attachments, de-duplicated, attachments last.
+
+    The working set (``runtime_ctx["run_agents"]``, from AgentV2) is what Auto
+    resolves to — the running user's accessible agents — so a tool that only
+    walked ``report.data_sources`` saw nothing under Auto. Attachments are
+    added because a mid-run set_report_agents / create_agent attaches to the
+    report. Callers without a working set (standalone tool calls, tests) get
+    the attachments alone, exactly as before. No report means no scope.
+    """
+    report = runtime_ctx.get("report")
+    if report is None:
+        return []
+    out: list[Any] = []
+    seen: set = set()
+    from app.core.request_origin import current
+    run_agents = list(runtime_ctx.get("run_agents") or [])
+    attachments = list(getattr(report, "data_sources", None) or [])
+    if current() is not None and "run_agents" in runtime_ctx:
+        allowed = {str(ds.id) for ds in run_agents}
+        attachments = [ds for ds in attachments if str(ds.id) in allowed]
+    for ds in run_agents + attachments:
+        key = str(getattr(ds, "id", "") or id(ds))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ds)
+    return out
 
 
 def report_selection_is_auto(report: Any) -> bool:
@@ -108,6 +141,8 @@ async def resolve_run_agents(db, organization: Any, user: Any, report: Any) -> L
     if not attached and getattr(report, "report_type", "regular") == "artifact_chat":
         return []
     agents = attached if attached else await accessible_agents(db, organization, user)
+    from app.services.connected_application_service import filter_agents
+    agents = await filter_agents(db, agents, organization.id)
     return [ds for ds in agents if DataSourceService.is_execution_live(ds)]
 
 
@@ -206,7 +241,9 @@ async def render_agents_full(db, organization: Any, report: Any, user: Any, data
         from app.ai.context.builders.instruction_context_builder import InstructionContextBuilder
         ib = InstructionContextBuilder(db, organization, current_user=user, data_source_ids=ds_ids)
         isec = await ib.build(query=None, data_source_ids=ds_ids)
-        inst_xml = isec.render(include_catalog=False)
+        # On demand nothing smart is inlined, so the planner (which reads this
+        # and can call read_instruction) needs the catalog. Off: unchanged.
+        inst_xml = isec.render(include_catalog=isec.on_demand)
         if inst_xml and inst_xml.strip():
             parts.append(inst_xml)
     except Exception:

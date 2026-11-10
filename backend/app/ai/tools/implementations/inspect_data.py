@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 import time
 from typing import AsyncIterator, Dict, Any, Type, List, Optional
 from pydantic import BaseModel
@@ -16,6 +17,7 @@ from app.ai.tools.schemas import (
 )
 from app.ai.agents.coder.coder import Coder
 from app.ai.code_execution.code_execution import StreamingCodeExecutor
+from app.ai.tools.data_notices import attach_data_notices
 from app.ai.schemas.codegen import CodeGenRequest
 from app.ai.prompt_formatters import build_codegen_context
 from app.dependencies import async_session_maker
@@ -155,6 +157,7 @@ Queries are subject to a per-connection timeout.
                 data.tables_by_source,
                 context_hub.schema_builder,
                 db_lock=runtime_ctx.get("tool_db_lock"),
+                static_schemas=getattr(getattr(runtime_ctx.get("context_view"), "static", None), "schemas", None),
             )
 
         # 2. Build Context
@@ -175,11 +178,16 @@ Queries are subject to a per-connection timeout.
                 ds_scope = list(set(ds_ids)) if ds_ids else None
                 name_patterns = [f"(?i)(?:^|\\.){re.escape(n)}$" for n in all_resolved_names] if all_resolved_names else None
 
-                ctx = await context_hub.schema_builder.build(
-                    with_stats=True,
-                    data_source_ids=ds_scope,
-                    name_patterns=name_patterns,
-                )
+                # schema_builder reads the agent's shared session: serialize it
+                # like create_data does, or a parallel sibling's read on the same
+                # session fails this build and codegen silently gets no schema.
+                _lock = runtime_ctx.get("tool_db_lock")
+                async with (_lock if _lock is not None else nullcontext()):
+                    ctx = await context_hub.schema_builder.build(
+                        with_stats=True,
+                        data_source_ids=ds_scope,
+                        name_patterns=name_patterns,
+                    )
                 schemas_excerpt = ctx.render_combined(top_k_per_ds=10, index_limit=0, include_index=False)
             except Exception:
                 schemas_excerpt = ""
@@ -231,6 +239,9 @@ Queries are subject to a per-connection timeout.
         )
 
         coder = Coder(
+            reasoning_effort=runtime_ctx.get("reasoning_effort"),
+            reasoning_callback=runtime_ctx.get("reasoning_callback"),
+            read_session_maker=runtime_ctx.get("read_session_maker"),
             model=runtime_ctx.get("model"),
             organization_settings=organization_settings,
             context_hub=context_hub,
@@ -272,6 +283,7 @@ Queries are subject to a per-connection timeout.
         executed_queries: List[str] = []
         query_timings: List[dict] = []
         codegen_ms = None
+        codegen_reasoning_ms = None
         execution_ms = None
         execution_start = time.monotonic()
         raw_errors: List[Any] = []
@@ -329,6 +341,7 @@ Queries are subject to a per-connection timeout.
                 executed_queries = e["payload"].get("executed_queries") or []
                 query_timings = e["payload"].get("query_timings") or []
                 codegen_ms = e["payload"].get("codegen_ms")
+                codegen_reasoning_ms = getattr(coder, "reasoning_ms", None) or None
                 execution_ms = e["payload"].get("execution_ms")
                 if e["payload"].get("errors"):
                     success = False
@@ -359,7 +372,7 @@ Queries are subject to a per-connection timeout.
                     "tool": "inspect_data",
                     "data_source_ids": _ds_ids,
                     "tables_accessed": _tables,
-                    "executed_queries": _truncate_queries(executed_queries),
+                    "executed_queries": list(executed_queries or []),
                 },
             )
         else:
@@ -385,6 +398,8 @@ Queries are subject to a per-connection timeout.
             "success": success,
             "execution_duration_ms": execution_duration_ms,
         }
+        if success:
+            attach_data_notices(observation, query_timings)
         if not success and raw_errors:
             # Mirror create_data's error shape so the planner sees the real DB
             # message / failed SQL instead of a repr of list-of-tuples.
@@ -429,6 +444,7 @@ Queries are subject to a per-connection timeout.
                     "execution_duration_ms": execution_duration_ms,
                     "query_timings": query_timings,
                     "codegen_ms": codegen_ms,
+                    "codegen_reasoning_ms": codegen_reasoning_ms,
                     "execution_ms": execution_ms,
                 },
                 "observation": observation,

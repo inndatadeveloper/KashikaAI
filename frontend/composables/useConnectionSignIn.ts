@@ -1,3 +1,4 @@
+import { isSafeHttpUrl } from '~/utils/safeUrl'
 // Single entry point for "the user needs to authenticate against a
 // connection." Decides between an inline credentials modal and a direct
 // redirect to the provider's OAuth flow.
@@ -28,6 +29,24 @@ export interface SignInResult {
   error?: string
 }
 
+// The backend explains *why* a sign-in could not start in the response body's
+// `detail` ("... does not advertise a registration_endpoint", "Could not
+// discover OAuth metadata for ...", a provider's own rejection). ofetch's
+// FetchError.message is only `[GET] "<url>": 400`, so surfacing `message`
+// alone throws that explanation away and leaves a bare status code on screen —
+// the admin then has no way to tell a misconfigured URL from a server that
+// simply doesn't support automatic registration.
+export function connectionSignInError(e: any, fallback: string): string {
+  const detail = (e as any)?.data?.detail
+  if (typeof detail === 'string' && detail.trim()) return detail
+  // FastAPI request-validation errors put a list of {loc, msg} here instead.
+  if (Array.isArray(detail)) {
+    const msgs = detail.map((d: any) => d?.msg).filter(Boolean)
+    if (msgs.length) return msgs.join('; ')
+  }
+  return e?.message || fallback
+}
+
 function isOAuthOnly(conn: ConnectionLike | null | undefined): boolean {
   if (!conn || conn.auth_policy !== 'user_required') return false
   const modes = conn.allowed_user_auth_modes
@@ -52,13 +71,16 @@ export function useConnectionSignIn() {
       const { data, error } = await useMyFetch(`/connections/${conn.id}/oauth/authorize${rt}`, { method: 'GET' })
       if (error.value) throw error.value
       const result = data.value as any
+      if (result?.authorization_url && !isSafeHttpUrl(result.authorization_url)) {
+        return { redirecting: false, error: 'OAuth start returned an unsafe authorization URL' }
+      }
       if (result?.authorization_url) {
         window.location.href = result.authorization_url
         return { redirecting: true }
       }
       return { redirecting: false, error: 'OAuth start did not return an authorization URL' }
     } catch (e: any) {
-      return { redirecting: false, error: e?.message || String(e) }
+      return { redirecting: false, error: connectionSignInError(e, String(e)) }
     }
   }
 

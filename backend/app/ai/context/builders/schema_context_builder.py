@@ -2,7 +2,7 @@
 Schema Context Builder - builds TablesSchemaContext object for schemas
 """
 from typing import List, Optional, Dict, Any
-import re
+import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy import select, func, and_, or_
@@ -10,6 +10,7 @@ from app.ai.context.sections.tables_schema_section import TablesSchemaContext, M
 from app.schemas.data_source_schema import DataSourceSummarySchema
 from app.ai.prompt_formatters import Table as PromptTable, TableColumn as PromptTableColumn, ForeignKey as PromptForeignKey
 from app.models.table_stats import TableStats
+from app.utils.safe_regex import compile_bounded_all
 from app.models.organization import Organization
 from app.models.report import Report
 from app.models.data_source import DataSource
@@ -17,9 +18,10 @@ from app.models.datasource_table import DataSourceTable
 from app.models.connection_table import ConnectionTable
 from app.models.instruction_reference import InstructionReference
 from app.models.user_data_source_overlay import UserDataSourceTable, UserDataSourceColumn
+from app.ai.prompt_formatters import excluded_column_set, filter_columns, filter_fks
 
 
-# A BOW custom query is materialized to a local artifact and served by the
+# A BOW custom table is materialized to a local artifact and served by the
 # connection's ``::fast`` sibling client, NOT by the source client. The coder is
 # told to map a table's <connection name> onto the client_key suffix
 # (coder.py "Connection-Table Mapping"), so attributing a cached relation to the
@@ -57,15 +59,62 @@ def _prune_unresolvable_fks(normalized):
     removes edges leaving the emitted set.
     """
     emitted_names = {item.get("name") for item in normalized}
+    # A column the agent manager hid on the REFERENCED table must not come back
+    # through the DDL of the referencing one (`references orders(secret_col)`).
+    excluded_by_name = {
+        item.get("name"): excluded_column_set(item.get("excluded_columns"))
+        for item in normalized
+    }
+
+    def _keep(fk):
+        ref = fk.get("references_name") if isinstance(fk, dict) else getattr(fk, "references_name", None)
+        if ref not in emitted_names:
+            return False
+        ref_col = fk.get("references_column") if isinstance(fk, dict) else getattr(fk, "references_column", None)
+        ref_col_name = (ref_col.get("name") if isinstance(ref_col, dict) else getattr(ref_col, "name", None)) or ""
+        return ref_col_name.lower() not in excluded_by_name.get(ref, frozenset())
+
     for item in normalized:
         item_fks = item.get("fks") or []
         if not item_fks:
             continue
-        item["fks"] = [
-            fk for fk in item_fks
-            if (fk.get("references_name") if isinstance(fk, dict)
-                else getattr(fk, "references_name", None)) in emitted_names
-        ]
+        item["fks"] = [fk for fk in item_fks if _keep(fk)]
+
+
+# Connector bookkeeping read by the CLIENT at query time (attach_table_metadata
+# reads the DB rows directly), never needed by the prompt — and each of these
+# names columns, including ones an agent manager excluded or a member cannot
+# see: the title map, a subform table's column-origin map and access path, and
+# the mandatory-column list.
+_CLIENT_ONLY_METADATA = {"priority_erp": ("column_titles", "columns", "path", "mandatory")}
+
+# Namespaces whose column metadata `title` is a fixed label (identical for every
+# user who can open the form), safe to carry into a per-user schema.
+_FIXED_COLUMN_TITLE_NAMESPACES = ("priority_erp",)
+
+
+def _fixed_column_title(table_metadata, column_metadata):
+    """The column title a per-user schema may carry over from the canonical
+    catalog: only a connector-declared fixed label, never free text."""
+    if not isinstance(table_metadata, dict) or not isinstance(column_metadata, dict):
+        return None
+    if not any(isinstance(table_metadata.get(ns), dict) for ns in _FIXED_COLUMN_TITLE_NAMESPACES):
+        return None
+    title = column_metadata.get("title")
+    return title if isinstance(title, str) and title.strip() else None
+
+
+def _strip_client_only_metadata(metadata_json):
+    """Drop client-only keys from table metadata bound for the prompt/UI."""
+    if not isinstance(metadata_json, dict):
+        return metadata_json
+    out = None
+    for ns, keys in _CLIENT_ONLY_METADATA.items():
+        blob = metadata_json.get(ns)
+        if isinstance(blob, dict) and any(k in blob for k in keys):
+            out = dict(metadata_json) if out is None else out
+            out[ns] = {k: v for k, v in blob.items() if k not in keys}
+    return out if out is not None else metadata_json
 
 
 def _redact_source_metadata(metadata_json):
@@ -103,7 +152,7 @@ def _cached_meta_for(ct):
     """(is_cached, as_of, next_refresh, description) for a backing ConnectionTable.
 
     The description is admin-authored and is the only place the agent learns
-    what a custom query actually contains — the relation name alone rarely says
+    what a custom table actually contains — the relation name alone rarely says
     whether `revenue_summary` is per-order, per-region or per-month.
 
     `as_of` and `next_refresh` are the two halves of the same fact, and one
@@ -150,7 +199,7 @@ def _cached_first(tables):
 
     The composite score cannot do this on its own, and gets it backwards. It is
     built from usage history, feedback and FK-derived centrality/richness — a
-    freshly authored custom query has none of those (no usage, no feedback, no
+    freshly authored custom table has none of those (no usage, no feedback, no
     foreign keys), so it scores near zero and sorts BELOW the very tables it
     exists to replace. `prompt_builder_v3` tells the planner to prefer
     `cached="true"` tables; an instruction cannot help if the relation is
@@ -185,15 +234,24 @@ def _cap_keeping_cached(tables, top_k: int):
     return cached + rest[: max(0, top_k - len(cached))]
 
 
+
+logger = logging.getLogger(__name__)
+
 class SchemaContextBuilder:
     """
     Builds database schema context for agent execution as a structured object.
     """
     
-    def __init__(self, db: AsyncSession, data_sources: List[DataSource], organization: Organization, report: Report, user=None, organization_settings=None):
+    def __init__(self, db: AsyncSession, data_sources: List[DataSource], organization: Organization, report: Report, user=None, organization_settings=None, mode=None):
         self.db = db
+        # The conversation switched off "mcp" (report.tools): advertising its
+        # MCP tools would only send the planner into refused calls. Derived
+        # from the report here so every builder of this report agrees.
+        from app.schemas.report_api_settings import mcp_tools_hidden
+        self.hide_mcp_tools = mcp_tools_hidden(report)
         self.organization = organization
         self.report = report
+        self.mode = mode if mode is not None else getattr(report, "mode", None)
         self.data_sources = data_sources
         self.user = user
         # Needed to resolve native MCP registration the same way the planner
@@ -212,6 +270,7 @@ class SchemaContextBuilder:
         name_patterns: Optional[List[str]] = None,
         active_only: bool = True,
         sort: str = "score",  # "score" | "usage" | "centrality" | "alpha"
+        split_file_scopes: bool = True,
     ) -> TablesSchemaContext:
         """Return TablesSchemaContext with optional filtering and sorting.
 
@@ -224,6 +283,9 @@ class SchemaContextBuilder:
             name_patterns: Filter tables by regex patterns.
             active_only: If True (default), only return active tables. If False, include inactive.
             sort: Sort order for tables.
+            split_file_scopes: If True (default), file-source connections render
+                as scope descriptors and their per-file rows leave `tables`.
+                False keeps them as tables (for callers resolving a table by id).
         """
         ds_sections: List[TablesSchemaContext.DataSource] = []
 
@@ -233,7 +295,7 @@ class SchemaContextBuilder:
                 continue
             # Stats keyed by the row they belong to, falling back to the
             # lowercased name only for rows written before `datasource_table_id`
-            # existed. Name alone is not an identity: a custom query `album`
+            # existed. Name alone is not an identity: a custom table `album`
             # and a source table `Album` are different relations that folded
             # into one bucket, so the planner was shown one relation's usage on
             # the other — and usage is an input it ranks tables by.
@@ -274,16 +336,56 @@ class SchemaContextBuilder:
             ds_tables = ds_tables_result.scalars().all()
             canonical_by_name: Dict[str, DataSourceTable] = {getattr(t, 'name', ''): t for t in ds_tables}
 
-            # Choose source based on the user's CURRENT access to this data source.
-            # auth_policy lives on the Connection (not the DataSource), so resolve
-            # it from the linked connection — reading it off `ds` would always
-            # default to 'system_only' and silently serve the full catalog.
-            #   'user'   → this user's per-user overlay (their visible subset)
-            #   'system' → owner/admin via service account → full canonical catalog
-            #   'none'   → no proven access → no tables (don't leak the catalog)
-            effective_auth = await self._resolve_user_access(ds)
-            use_overlay = (effective_auth == "user")
-            access_denied = (effective_auth == "none")
+            # Choose the source PER CONNECTION. auth_policy, the token and the
+            # catalog all belong to a connection, not to the agent, so one
+            # verdict for the whole data source is wrong on any agent with more
+            # than one connection — and `connections[0]` decided which way it
+            # was wrong. A delegated connection sorting first replaced the whole
+            # catalog with an overlay that describes only that connection, so
+            # the agent lost every other connection's tables and told users it
+            # had one connection when it had three. A delegated connection
+            # sorting second skipped scoping altogether, putting another user's
+            # delegated tables into this user's prompt.
+            #
+            #   overlay → this user's own token on that connection: their
+            #             per-user overlay rows (which also carry column masking)
+            #   open    → system_only, or service-account/admin: canonical rows
+            #   denied  → delegated with no proven access: nothing
+            #
+            # The classification is DataSourceService.classify_connection_access,
+            # the same one the tables selector scopes with, so the agent reasons
+            # over exactly the tables the user can see in the UI.
+            from app.services.data_source_service import DataSourceService as _DSS
+            open_conn_ids, overlay_conn_ids, denied_conn_ids = (
+                await _DSS().classify_connection_access(self.db, ds, self.user)
+            )
+            if connection_ids:
+                _requested = set(str(x) for x in connection_ids)
+                open_conn_ids = [c for c in open_conn_ids if c in _requested]
+                overlay_conn_ids = [c for c in overlay_conn_ids if c in _requested]
+                denied_conn_ids = [c for c in denied_conn_ids if c in _requested]
+            use_overlay = bool(overlay_conn_ids)
+            # Unlinked canonical rows have no connection to classify. Keep the
+            # historical allowance (they are legacy name-keyed rows) only while
+            # nothing is restricted; once a delegated connection is in play they
+            # are served through the overlay branch instead, so one user's
+            # discovered tables stop reaching another user's prompt.
+            _restricted = bool(overlay_conn_ids or denied_conn_ids)
+
+            def _row_is_open(t, _open=frozenset(open_conn_ids), _restricted=_restricted):
+                """Does this canonical row belong to a connection served
+                canonically (rather than through this user's overlay)?"""
+                ct = getattr(t, 'connection_table', None)
+                cid = str(ct.connection_id) if ct is not None and getattr(ct, 'connection_id', None) else None
+                if cid is not None:
+                    return cid in _open
+                meta = getattr(t, 'metadata_json', None)
+                discovered = meta.get('discovered_connection_id') if isinstance(meta, dict) else None
+                if discovered:
+                    # A delegated user's own discovery: served by the overlay
+                    # branch for that user, and withheld from everyone else.
+                    return str(discovered) in _open
+                return not _restricted
 
             # Normalize into a common shape for downstream rendering
             # Each entry: { name, columns: [{name,dtype}], pks: [{name,dtype}], fks: [fk], metadata_json, metrics, is_active }
@@ -294,16 +396,23 @@ class SchemaContextBuilder:
             # source silently vanishing when one of several connections is down.
             unhealthy_conns: Dict[str, Dict[str, Any]] = {}
 
-            if access_denied:
-                # User has no current access — emit the data source with no tables
-                # rather than the canonical catalog they can't actually query.
-                pass
-            elif use_overlay:
+            if use_overlay:
                 overlays_q = await self.db.execute(
                     select(UserDataSourceTable).where(
                         UserDataSourceTable.data_source_id == str(ds.id),
                         UserDataSourceTable.user_id == str(self.user.id),
                         UserDataSourceTable.is_accessible == True,
+                        # Only the connections this user actually runs delegated
+                        # on. A NULL connection_id predates connection-aware
+                        # overlays (or the migration could not attribute it):
+                        # unknown provenance, which is not permission. While a
+                        # connection on this agent is DENIED, such a row may be
+                        # that connection's, so being authorized on a different
+                        # one does not justify it — same rule as the tables
+                        # selector (`_overlay_connection_predicate`).
+                        _DSS._overlay_connection_predicate(
+                            overlay_conn_ids, denied_conn_ids
+                        ),
                     )
                 )
                 overlay_tables = overlays_q.scalars().all()
@@ -333,9 +442,14 @@ class SchemaContextBuilder:
                 visible_table_names = {
                     (getattr(ot, 'table_name', '') or '') for ot in overlay_tables
                 }
+                # Only columns this user can still reach. A sync keeps the row
+                # of a column the user lost (is_accessible=False) rather than
+                # deleting it, so an unfiltered read put revoked columns back in
+                # the prompt. Same rule as read_user_data_source_schema.
                 cols_q = await self.db.execute(
                     select(UserDataSourceColumn).where(
-                        UserDataSourceColumn.user_data_source_table_id.in_(overlay_ids)
+                        UserDataSourceColumn.user_data_source_table_id.in_(overlay_ids),
+                        UserDataSourceColumn.is_accessible.is_(True),
                     )
                 )
                 cols = cols_q.scalars().all()
@@ -354,8 +468,23 @@ class SchemaContextBuilder:
                 # by name regardless of is_active rather than dropping the table.
                 overlay_names = [n for n in visible_table_names if n]
                 canonical_all_by_name: Dict[str, DataSourceTable] = dict(canonical_by_name)
+                # Canonical rows by id as well: an overlay row is linked to its
+                # canonical row by `data_source_table_id` (matched on dataset /
+                # table identity at sync time), and the two can carry different
+                # display names — a renamed Power BI dataset keeps the
+                # service-principal-indexed canonical name while the user's
+                # overlay shows the new one. The id link is the authority;
+                # the name is only a fallback for unlinked legacy overlays.
+                canonical_by_id: dict[str, DataSourceTable] = {
+                    str(t.id): t for t in canonical_by_name.values() if getattr(t, 'id', None)
+                }
+                linked_ids = {
+                    str(ot.data_source_table_id)
+                    for ot in overlay_tables if getattr(ot, 'data_source_table_id', None)
+                }
                 missing_names = [n for n in overlay_names if n not in canonical_all_by_name]
-                if missing_names:
+                missing_ids = [i for i in linked_ids if i not in canonical_by_id]
+                if missing_names or missing_ids:
                     enrich_query = (
                         select(DataSourceTable)
                         .options(
@@ -364,7 +493,10 @@ class SchemaContextBuilder:
                         )
                         .where(
                             DataSourceTable.datasource_id == str(ds.id),
-                            DataSourceTable.name.in_(missing_names),
+                            or_(
+                                DataSourceTable.name.in_(missing_names or [""]),
+                                DataSourceTable.id.in_(missing_ids or [""]),
+                            ),
                         )
                     )
                     # Honor the connection_ids contract the main query applies:
@@ -390,11 +522,47 @@ class SchemaContextBuilder:
                     # empty-string bucket collapsing distinct rows).
                     for t in enrich_q.scalars().all():
                         canonical_all_by_name.setdefault(t.name, t)
+                        canonical_by_id.setdefault(str(t.id), t)
+
+                def _canonical_for(ot, _by_id=canonical_by_id, _by_name=canonical_all_by_name):
+                    """The overlay row's canonical row: by id link first, by
+                    name for unlinked legacy overlays."""
+                    linked = getattr(ot, 'data_source_table_id', None)
+                    if linked and str(linked) in _by_id:
+                        return _by_id[str(linked)]
+                    return _by_name.get(getattr(ot, 'table_name', '') or '')
+
+                # Activation is inherited from the canonical row. The overlay
+                # answers "can this user reach the table upstream" (their own
+                # credentials); the canonical `is_active` flag answers "did the
+                # agent manager select it for this agent". A table has to pass
+                # BOTH: a user's broader upstream access must not widen the
+                # agent beyond what its manager activated. A user-discovered
+                # delegated table gets its canonical row created on sync (see
+                # DataSourceService._upsert_user_overlay), so there is always
+                # a row to activate in the tables wizard; a row that is still
+                # missing is treated as not activated.
+                if active_only:
+                    overlay_tables = [
+                        ot for ot in overlay_tables
+                        if bool(getattr(_canonical_for(ot), 'is_active', False))
+                    ]
+                    # Join targets are restricted to what survives the gate, so
+                    # a relationship never points at a table the agent hides.
+                    # Relationships name the CANONICAL table, so carry that
+                    # name too when it differs from the overlay's.
+                    visible_table_names = set()
+                    for ot in overlay_tables:
+                        visible_table_names.add(getattr(ot, 'table_name', '') or '')
+                        _c = _canonical_for(ot)
+                        if _c is not None and getattr(_c, 'name', None):
+                            visible_table_names.add(_c.name)
 
                 for ot in overlay_tables:
                     name = getattr(ot, 'table_name', '') or ''
                     overlay_cols = cols_by_table.get(str(ot.id), [])
-                    base = canonical_all_by_name.get(name)
+                    base = _canonical_for(ot)
+                    _base_meta = getattr(base, 'metadata_json', None) if base is not None else None
                     # The overlay decides WHICH columns this user may see; the
                     # canonical row describes WHAT they are. Column descriptors
                     # (measure role, hidden flag, return type) are model-level
@@ -428,7 +596,7 @@ class SchemaContextBuilder:
                                 for k in ("role", "kind", "hidden", "is_partition",
                                           "relationship_key", "returns", "format_string",
                                           "data_category", "display_folder", "sort_by_column",
-                                          "summarize_by", "contents")
+                                          "summarize_by", "contents", "from_form")
                                 if k in canon_meta
                             } or None
                         columns.append({
@@ -437,27 +605,34 @@ class SchemaContextBuilder:
                             # back to the canonical dtype so it still renders as
                             # a measure rather than an untyped column.
                             "dtype": getattr(c, 'data_type', None) or canon.get("dtype"),
-                            "description": None,
+                            # Free text stays behind (see above), but a column
+                            # TITLE a connector records as structured metadata
+                            # (Priority's form-column label, identical for every
+                            # user who can open the form) is carried across.
+                            "description": _fixed_column_title(_base_meta, canon_meta),
                             "metadata": safe_meta,
                         })
-                    # The overlay is the per-user access authority: this table
-                    # came from the is_accessible==True overlay query above, so
-                    # the user can provably query it right now. The canonical
-                    # is_active flag is unreliable for a user_required source
-                    # (service principal has no access → canonical stays
-                    # inactive), so do NOT gate the user's own accessible table
-                    # on it — that dropped every delegated-source table and left
-                    # the agent with an empty schema. Emit as active.
-                    canonical_is_active = True
+                    # Reported activation is the canonical flag (already gated
+                    # above when active_only; with active_only=False inactive
+                    # rows are emitted and flagged, mirroring the system path).
+                    canonical_is_active = bool(getattr(base, 'is_active', False)) if base is not None else False
                     pks = getattr(base, 'pks', []) if base is not None else []
                     fks = [
                         fk for fk in (getattr(base, 'fks', None) or [])
                         if (fk.get('references_name') if isinstance(fk, dict) else None)
                         in visible_table_names
                     ] if base is not None else []
-                    metadata_json = _redact_source_metadata(
+                    # Columns the agent manager hid for this agent. Applied on
+                    # top of the user's own access: a delegated user sees the
+                    # intersection of what they can reach and what the agent
+                    # exposes, never more than either.
+                    excluded = getattr(base, 'excluded_columns', None) if base is not None else None
+                    columns = filter_columns(columns, excluded)
+                    pks = filter_columns(pks, excluded)
+                    fks = filter_fks(fks, excluded)
+                    metadata_json = _strip_client_only_metadata(_redact_source_metadata(
                         getattr(base, 'metadata_json', None) if base is not None else None
-                    )
+                    ))
                     # Extract connection info from the base table
                     conn_id = None
                     conn_name = None
@@ -498,6 +673,7 @@ class SchemaContextBuilder:
                         "degree_in": getattr(base, 'degree_in', None) if base is not None else None,
                         "degree_out": getattr(base, 'degree_out', None) if base is not None else None,
                         "entity_like": getattr(base, 'entity_like', None) if base is not None else None,
+                        "excluded_columns": excluded or None,
                         "is_active": canonical_is_active,
                         "connection_id": conn_id,
                         "connection_name": conn_name,
@@ -507,13 +683,19 @@ class SchemaContextBuilder:
                         "cached_next_refresh": cached_next_refresh,
                         "description": cached_description,
                     })
-            else:
-                for t in ds_tables:
+            # Canonical rows for the OPEN connections. This runs ALONGSIDE the
+            # overlay branch above rather than instead of it — that either/or is
+            # exactly what dropped a mixed agent's warehouse tables the moment
+            # the caller had their own token on its Power BI connection.
+            _canonical_rows = [t for t in ds_tables if _row_is_open(t)]
+            if _canonical_rows:
+                for t in _canonical_rows:
                     table_is_active = bool(getattr(t, 'is_active', False))
                     # Skip inactive tables when active_only is True
                     if active_only and not table_is_active:
                         continue
-                    columns = [{"name": col.get("name"), "dtype": col.get("dtype", "unknown"), "description": col.get("description"), "metadata": col.get("metadata")} for col in (getattr(t, 'columns', []) or [])]
+                    excluded = getattr(t, 'excluded_columns', None)
+                    columns = [{"name": col.get("name"), "dtype": col.get("dtype", "unknown"), "description": col.get("description"), "metadata": col.get("metadata")} for col in filter_columns(getattr(t, 'columns', []) or [], excluded)]
 
                     # Extract connection info
                     conn_id = None
@@ -545,9 +727,10 @@ class SchemaContextBuilder:
                         "name": getattr(t, 'name', ''),
                         "table_id": str(t.id) if getattr(t, 'id', None) else None,
                         "columns": columns,
-                        "pks": getattr(t, 'pks', []) or [],
-                        "fks": getattr(t, 'fks', []) or [],
-                        "metadata_json": getattr(t, 'metadata_json', None),
+                        "pks": filter_columns(getattr(t, 'pks', []) or [], excluded),
+                        "fks": filter_fks(getattr(t, 'fks', []) or [], excluded),
+                        "excluded_columns": excluded or None,
+                        "metadata_json": _strip_client_only_metadata(getattr(t, 'metadata_json', None)),
                         "centrality_score": getattr(t, 'centrality_score', None),
                         "richness": getattr(t, 'richness', None),
                         "degree_in": getattr(t, 'degree_in', None),
@@ -609,6 +792,7 @@ class SchemaContextBuilder:
                 ]
 
                 tbl = PromptTable(
+                    id=item.get("table_id"),
                     name=item.get("name", ""),
                     columns=columns,
                     pks=pks,
@@ -628,6 +812,7 @@ class SchemaContextBuilder:
                     entity_like=item.get("entity_like"),
                     metadata_json=item.get("metadata_json"),
                     referenced_instructions_count=instruction_ref_counts.get(item.get("table_id", ""), None) or None,
+                    excluded_columns=item.get("excluded_columns"),
                 )
 
                 if with_stats:
@@ -699,21 +884,15 @@ class SchemaContextBuilder:
             # Apply table-level filters (name matching only - active filtering already done above)
             if table_names or name_patterns:
                 name_set = set((table_names or []))
-                patterns = []
-                for p in (name_patterns or []):
-                    try:
-                        patterns.append(re.compile(p))
-                    except Exception:
-                        continue
+                # name_patterns carry model-written regex (describe_tables,
+                # create_widget) — matched with a timeout, never stdlib re.
+                patterns = compile_bounded_all(name_patterns)
                 def _match(n: str) -> bool:
                     if name_set and n in name_set:
                         return True
                     for rp in patterns:
-                        try:
-                            if rp.search(n or ''):
-                                return True
-                        except Exception:
-                            continue
+                        if rp.search(n or ''):
+                            return True
                     return (not name_set) and (not patterns)
                 filtered = []
                 for t in tables:
@@ -725,7 +904,11 @@ class SchemaContextBuilder:
             # Pull file-source connections OUT of the table pool: they render as
             # compact scope descriptors, not per-file <table> rows — so they
             # never consume the top_k budget or bloat the prompt.
-            file_scopes, tables = self._build_file_scopes(ds, tables)
+            if split_file_scopes:
+                file_scopes, tables = self._build_file_scopes(ds, tables)
+                await self._stamp_index_times(file_scopes)
+            else:
+                file_scopes = []
 
             tables = _cached_first(tables)
 
@@ -734,7 +917,7 @@ class SchemaContextBuilder:
                 tables = _cap_keeping_cached(tables, top_k)
 
             # Query MCP tools for this data source's MCP/custom_api connections
-            mcp_tools = await self._build_mcp_tools(ds)
+            mcp_tools = [] if self.hide_mcp_tools else await self._build_mcp_tools(ds)
 
             ds_sections.append(
                 TablesSchemaContext.DataSource(
@@ -768,75 +951,134 @@ class SchemaContextBuilder:
                 )
             )
 
-        self._apply_native_mcp_decision(ds_sections)
+        # Built-in source is a capability of training, not a persisted agent.
+        if self.mode == "training" and self.user is not None and not connection_ids:
+            from app.core.console_access import resolve_console_scope
+            from app.services.bow_source_service import catalog, column_type
+            from app.schemas.bow_source_schema import SOURCE_ID
+            from app.data_sources.clients.bow_client import BowClient
+            try:
+                await resolve_console_scope(self.db, self.organization, self.user)
+                bow_allowed = True
+            except Exception:
+                bow_allowed = False
+            if bow_allowed and (not ds_filter or SOURCE_ID in ds_filter):
+                bow_tables = []
+                bow_patterns = compile_bounded_all(name_patterns)
+                for name, columns in catalog().items():
+                    if table_names and name not in table_names:
+                        continue
+                    if name_patterns and not any(p.search(name) for p in bow_patterns):
+                        continue
+                    bow_tables.append(PromptTable(
+                        name=name, columns=[PromptTableColumn(name=c, dtype=column_type(c)) for c in columns],
+                        pks=[], fks=[], connection_name="bow", connection_type="bow",
+                        description="One row per " + ("run" if name == "bow.runs" else "tool call") + ". " + BowClient.description,
+                    ))
+                ds_sections.append(TablesSchemaContext.DataSource(
+                    info=DataSourceSummarySchema(id=SOURCE_ID, name="BOW", type="bow", context=BowClient.description),
+                    tables=bow_tables,
+                ))
+
+        # Agent Lists: bow.<agent>.lists.<list> tables, in every mode, for lists
+        # on this report's agents that the user can view. Not gated on
+        # connection_ids: a list belongs to the agent, not to a connection, so a
+        # files-only agent (sharepoint/network_dir) or a connection-scoped
+        # rebuild must still see the lists it can read back.
+        if self.user is not None:
+            try:
+                await self._append_list_tables(ds_sections, ds_filter, table_names, name_patterns)
+            except Exception as exc:
+                logger.warning("agent list tables skipped: %s", exc)
 
         return TablesSchemaContext(data_sources=ds_sections)
 
-    def _apply_native_mcp_decision(self, ds_sections) -> bool:
-        """Tell each agent section where its MCP tools' schemas will live.
+    async def _append_list_tables(self, ds_sections, ds_filter, table_names, name_patterns) -> None:
+        from app.schemas.bow_source_schema import SOURCE_ID
+        from app.services.agent_lists.bow_lists import describe_table, list_tables
 
-        Native registration is decided once for the whole report, so the count
-        driving it has to be the report-wide one. Deciding per agent would
-        disagree with the planner whenever a report spans several agents, and
-        the tools would then carry their schema in both places or in neither.
-
-        Falls back to False (inline the schemas) on any error — a schema sent
-        twice is wasteful, a schema sent nowhere costs a discovery round trip.
-        """
-        try:
-            from app.ai.tools.mcp_tool_registry import native_tools_enabled
-            native_on = native_tools_enabled(
-                self.organization_settings,
-                sum(len(s.mcp_tools or []) for s in ds_sections),
-            )
-        except Exception:
-            native_on = False
-        for s in ds_sections:
-            s.native_mcp = native_on
-        return native_on
-
-    async def _resolve_user_access(self, ds) -> str:
-        """Classify self.user's CURRENT access to data source `ds`.
-
-        Returns 'user' (own creds → overlay), 'system' (owner/admin via service
-        account → full catalog), or 'none' (no proven access → no tables).
-
-        For non-user_required connections, or when there is no user in context,
-        returns 'system' (the canonical catalog is the right thing to serve).
-        Fails closed to 'none' for user_required so a stale overlay can't keep
-        leaking tables after a user loses access.
-        """
-        conns = list(getattr(ds, 'connections', None) or [])
-        conn = conns[0] if conns else None
-        auth_policy = (getattr(conn, 'auth_policy', None) or 'system_only') if conn else 'system_only'
-        if auth_policy != 'user_required' or self.user is None or conn is None:
-            return 'system'
-        try:
-            from app.services.user_data_source_credentials_service import UserDataSourceCredentialsService
-            status = await UserDataSourceCredentialsService().build_user_status_for_connection(
-                self.db, conn, self.user, data_source=ds, live_test=False
-            )
-            return status.effective_auth or 'none'
-        except Exception:
-            return 'none'
+        if ds_filter and SOURCE_ID not in ds_filter:
+            return
+        ds_ids = [str(getattr(d, "id", "")) for d in (self.data_sources or [])]
+        entries = await list_tables(self.db, self.user, self.organization, ds_ids)
+        tables = []
+        list_patterns = compile_bounded_all(name_patterns)
+        for e in entries:
+            if table_names and e["name"] not in table_names:
+                continue
+            if name_patterns and not any(p.search(e["name"]) for p in list_patterns):
+                continue
+            tables.append(PromptTable(
+                name=e["name"],
+                columns=[PromptTableColumn(name=c, dtype=t) for c, t in e["columns"]],
+                pks=[PromptTableColumn(name="_row_id", dtype="string")], fks=[],
+                connection_name="bow", connection_type="bow",
+                description=describe_table(e),
+                is_active=True,
+            ))
+        if not tables:
+            return
+        existing = next((s for s in ds_sections if str(s.info.id) == SOURCE_ID), None)
+        if existing is not None:
+            existing.tables = list(existing.tables or []) + tables
+            return
+        ds_sections.append(TablesSchemaContext.DataSource(
+            info=DataSourceSummarySchema(
+                id=SOURCE_ID, name="BOW", type="bow",
+                context=("Built-in BOW source. Agent Lists (records the agents saved with their submit_* tools) "
+                         "are tables here. In create_data use tables_by_source=[{data_source_id:'builtin:bow', "
+                         "tables:['bow.<agent>.lists.<list>']}] and query via ds_clients['bow'] with the table's list_id."),
+            ),
+            tables=tables,
+        ))
 
     # File-source connectors and which of them have a native search API.
     _FILE_SOURCE_TYPES = {
         "sharepoint_onprem",
+        "documentum",
         "network_dir", "s3", "sharepoint", "onedrive", "google_drive",
         "outlook_mail", "gmail_mail", "onenote",
+        "github_repo", "gitlab_repo", "bitbucket_repo",
+        "kms_lighthouse",
     }
     _NATIVE_SEARCH_TYPES = {
         "sharepoint_onprem",
+        "documentum",
         "sharepoint", "onedrive", "google_drive", "outlook_mail", "gmail_mail",
         # OneNote search is local (over the walked hierarchy), not a provider
         # call, but it is still a first-class search the agent should prefer
         # over paging the whole catalog.
         "onenote",
+        "kms_lighthouse",
     }
     # Token-scoped sources: no admin-side path/glob boundary — the user's OAuth
     # account IS the scope. Everything else enforces a path/glob scope.
     _TOKEN_SCOPED_TYPES = {"onedrive", "google_drive", "outlook_mail", "gmail_mail"}
+
+    async def _stamp_index_times(self, file_scopes) -> None:
+        """Attach each file scope's last completed shared index time, so the
+        model knows how fresh the catalog behind list_files/search_files is."""
+        ids = [fs.connection_id for fs in file_scopes if fs.connection_id]
+        if not ids:
+            return
+        try:
+            from sqlalchemy import func, select
+
+            from app.models.connection_indexing import ConnectionIndexing, ConnectionIndexingStatus
+            rows = (await self.db.execute(
+                select(ConnectionIndexing.connection_id, func.max(ConnectionIndexing.finished_at)).where(
+                    ConnectionIndexing.connection_id.in_(ids),
+                    ConnectionIndexing.user_id.is_(None),
+                    ConnectionIndexing.status == ConnectionIndexingStatus.COMPLETED.value,
+                ).group_by(ConnectionIndexing.connection_id)
+            )).all()
+        except Exception:
+            return
+        latest = {str(cid): ts for cid, ts in rows if ts is not None}
+        for fs in file_scopes:
+            ts = latest.get(str(fs.connection_id))
+            if ts is not None:
+                fs.indexed_at = ts.replace(microsecond=0).isoformat() + "Z"
 
     def _build_file_scopes(self, ds, tables):
         """Turn the data source's file-source connections into compact scope
@@ -875,13 +1117,18 @@ class SchemaContextBuilder:
                     if cfg.get("bucket") else cfg.get("root_path"))
             if c.type == "sharepoint_onprem":
                 base = " / ".join(str(cfg[k]) for k in ("site_url", "drive_name", "folder_path") if cfg.get(k))
+            elif c.type == "documentum":
+                base = " / ".join(str(cfg[k]) for k in ("rest_url", "repository", "root_path") if cfg.get(k))
+            elif c.type == "kms_lighthouse":
+                # Folder id 0 is a real id; only a missing or blank value is left out.
+                base = " / ".join(str(cfg[k]) for k in ("base_url", "root_folder_id") if cfg.get(k) not in (None, ""))
             cid = str(c.id)
             ftabs = by_conn.get(cid, [])
             sample = [t.name for t in ftabs[:5] if getattr(t, 'name', None)]
             topics, seen = [], set()
             for t in ftabs:
                 mj = getattr(t, 'metadata_json', None) or {}
-                sub = (mj.get("network_dir") or mj.get("s3") or mj.get("graph") or mj.get("sharepoint_onprem")
+                sub = (mj.get("network_dir") or mj.get("s3") or mj.get("graph") or mj.get("sharepoint_onprem") or mj.get("documentum")
                        or mj.get("google_drive") or {}) if isinstance(mj, dict) else {}
                 for kw in (sub.get("keywords") or []):
                     k = str(kw).lower()
@@ -898,12 +1145,23 @@ class SchemaContextBuilder:
             per_user = (getattr(c, "auth_policy", None) == "user_required"
                         and "oauth" in (getattr(c, "allowed_user_auth_modes", None) or []))
             enforces_scope = c.type not in self._TOKEN_SCOPED_TYPES
+            note = None
+            if c.type == "kms_lighthouse":
+                # The root folder limits browsing only (search covers the whole
+                # identity), so no "else denied" scope; the note says how to browse.
+                from app.data_sources.clients.kms_lighthouse_client import planner_scope_note
+                enforces_scope = False
+                note = planner_scope_note(cfg)
+            try:
+                cap = int(cfg.get("max_catalog_objects") or 0)
+            except (TypeError, ValueError):
+                cap = 0
             scopes.append(FileScopeItem(
                 connection_id=cid, name=c.name, type=c.type, base=base,
                 globs=globs, index_mode=index_mode, file_count=len(ftabs),
-                capped=False, sample=sample, topics=topics,
+                capped=bool(cap and len(ftabs) >= cap), sample=sample, topics=topics,
                 supports_search=supports_search, writable=bool(cfg.get("writable")),
-                per_user=bool(per_user), enforces_scope=enforces_scope,
+                per_user=bool(per_user), enforces_scope=enforces_scope, note=note,
             ))
         return scopes, remaining
 
@@ -951,7 +1209,7 @@ class SchemaContextBuilder:
 
         mcp_conn_ids = []
         for conn in (getattr(ds, 'connections', None) or []):
-            if getattr(conn, 'type', None) in ('mcp', 'custom_api'):
+            if getattr(conn, 'type', None) in ('mcp', 'custom_api', 'remote_ssh', 'remote_smb'):
                 mcp_conn_ids.append(str(conn.id))
         if not mcp_conn_ids:
             return []
@@ -984,7 +1242,8 @@ class SchemaContextBuilder:
                 if not is_enabled:
                     continue
                 admin_policy = overlay.policy if overlay else t.policy
-                effective = resolve_effective_policy(admin_policy, user_prefs.get(str(t.id)))
+                from app.services.remote_shell_policy import display_policy
+                effective = display_policy(t.connection, t.name, admin_policy, user_prefs.get(str(t.id)))
                 if effective == "deny":
                     continue
                 # Carry the argument schema through, minus admin-locked

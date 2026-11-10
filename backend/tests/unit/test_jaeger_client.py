@@ -44,6 +44,9 @@ class _FakeResponse:
 
 
 class _FakeSession:
+    def mount(self, prefix, adapter):
+        pass
+
     """Routing table keyed by path prefix. Records each call so tests can assert
     which endpoint was reached and with what params."""
 
@@ -123,7 +126,9 @@ def _sample_trace():
 
 def test_get_schemas_exposes_four_fixed_tables(monkeypatch):
     _install(monkeypatch, {"/api/services": _ok(["frontend", "cart-db"])})
-    tables = _client().get_schemas()
+    events = []
+    tables = _client().get_schemas(progress_callback=lambda *e: events.append(e))
+    assert any(e[0] == 'services' and e[2] > 0 for e in events)
     by_name = {t.name: t for t in tables}
     assert set(by_name) == {"services", "operations", "spans", "dependencies"}
 

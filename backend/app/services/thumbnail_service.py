@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.services.artifact_libs import get_inline_scripts
+from app.services.artifact_payload import row_count_fields
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +48,19 @@ class ThumbnailService:
 
         try:
             import os
-            async with async_playwright() as p:
+            from app.core.render_guard import RenderEgressProxy, RendererPolicy, guard_page_requests
+
+            # Model-authored page code runs here on the server: same guard as
+            # the PDF export — the page is set_content()'d with every library
+            # inlined, so nothing but RENDER_ASSET_HOSTS is reachable.
+            policy = RendererPolicy()
+            async with RenderEgressProxy(policy.decide, label="thumbnail render") as egress, async_playwright() as p:
                 # Optional executable override — same contract as the artifact
                 # render validation (BOW_CHROMIUM_EXECUTABLE).
                 _exe = os.environ.get("BOW_CHROMIUM_EXECUTABLE") or None
-                browser = await p.chromium.launch(headless=True, executable_path=_exe)
+                browser = await p.chromium.launch(headless=True, executable_path=_exe, **egress.launch_kwargs())
                 page = await browser.new_page(viewport={"width": 1280, "height": 720})
+                await guard_page_requests(page, policy.allows_url, allows_image=policy.allows_image, label="thumbnail render")
 
                 await page.set_content(html_content, wait_until="networkidle")
 
@@ -103,6 +111,8 @@ class ThumbnailService:
                 logger.warning("PIL not installed, saving full-size screenshot")
                 thumbnail_path.write_bytes(screenshot_bytes)
 
+            from app.services import storage
+            await storage.apersist(thumbnail_path, "image/png")
             return f"thumbnails/{artifact_id}.png"
 
         except Exception as e:
@@ -115,8 +125,9 @@ class ThumbnailService:
         Returns:
             Full filesystem path to the thumbnail, or None if it doesn't exist
         """
+        from app.services import storage
         path = self.UPLOADS_DIR / f"{artifact_id}.png"
-        if path.exists():
+        if storage.ensure_local(path):
             return path
         return None
 
@@ -126,7 +137,9 @@ class ThumbnailService:
         Returns:
             True if deleted, False if not found
         """
+        from app.services import storage
         path = self.UPLOADS_DIR / f"{artifact_id}.png"
+        storage.discard(path)
         if path.exists():
             path.unlink()
             return True
@@ -144,15 +157,15 @@ class ThumbnailService:
         Returns the number of artifacts cleared.
         """
         from app.dependencies import async_session_maker
-        from app.models.artifact import Artifact
+        from app.models.artifact import ArtifactVersion
         from sqlalchemy import select, update
 
         cleared = 0
         async with async_session_maker() as db:
             rows = (await db.execute(
-                select(Artifact.id).where(
-                    Artifact.report_id == str(report_id),
-                    Artifact.thumbnail_path.is_not(None),
+                select(ArtifactVersion.id).where(
+                    ArtifactVersion.report_id == str(report_id),
+                    ArtifactVersion.thumbnail_path.is_not(None),
                 )
             )).all()
             for (artifact_id,) in rows:
@@ -163,8 +176,8 @@ class ThumbnailService:
                 cleared += 1
             if cleared:
                 await db.execute(
-                    update(Artifact)
-                    .where(Artifact.report_id == str(report_id))
+                    update(ArtifactVersion)
+                    .where(ArtifactVersion.report_id == str(report_id))
                     .values(thumbnail_path=None)
                 )
                 await db.commit()
@@ -177,12 +190,14 @@ class ThumbnailService:
             Relative path to the new thumbnail, or None if source doesn't exist
         """
         import shutil
+        from app.services import storage
         source_path = self.UPLOADS_DIR / f"{source_artifact_id}.png"
-        if not source_path.exists():
+        if not storage.ensure_local(source_path):
             return None
 
         target_path = self.UPLOADS_DIR / f"{target_artifact_id}.png"
         shutil.copy2(source_path, target_path)
+        storage.persist(target_path, "image/png")
         return f"thumbnails/{target_artifact_id}.png"
 
     async def regenerate_for_report(self, report_id: str) -> Optional[str]:
@@ -196,7 +211,7 @@ class ThumbnailService:
         """
         try:
             from app.dependencies import async_session_maker
-            from app.models.artifact import Artifact
+            from app.models.artifact import Artifact, ArtifactVersion
             from app.models.report import Report
             from app.models.visualization import Visualization
             from app.models.query import Query
@@ -219,14 +234,16 @@ class ThumbnailService:
 
                 # Get the latest artifact for this report
                 stmt = (
-                    select(Artifact)
+                    select(ArtifactVersion)
+                    # Mode lives on the parent Artifact — explicit join.
+                    .join(Artifact, Artifact.id == ArtifactVersion.artifact_id)
                     .where(
-                        Artifact.report_id == report_id,
-                        Artifact.deleted_at.is_(None),
+                        ArtifactVersion.report_id == report_id,
+                        ArtifactVersion.deleted_at.is_(None),
                         # Report thumbnails render the dashboard, not docs
                         Artifact.mode.in_(("page", "slides")),
                     )
-                    .order_by(Artifact.created_at.desc())
+                    .order_by(ArtifactVersion.created_at.desc())
                     .limit(1)
                 )
                 result = await db.execute(stmt)
@@ -275,6 +292,7 @@ class ThumbnailService:
                         "view": viz.view or {},
                         "rows": step.data.get("rows", []) if step and step.data else [],
                         "columns": step.data.get("columns", []) if step and step.data else [],
+                        **row_count_fields(step.data if step else None),
                         "dataModel": step.data_model or {} if step else {},
                     })
 
@@ -287,6 +305,7 @@ class ThumbnailService:
                     artifact_code=artifact_code,
                     visualizations=viz_data,
                     mode=artifact.mode or "page",
+                    runtime_version=int((artifact.content or {}).get("runtime_version") or 0),
                 )
 
                 # Delete old thumbnail if exists
@@ -301,7 +320,7 @@ class ThumbnailService:
 
                 if thumbnail_path:
                     # Update artifact with new thumbnail path
-                    stmt = update(Artifact).where(Artifact.id == artifact.id).values(thumbnail_path=thumbnail_path)
+                    stmt = update(ArtifactVersion).where(ArtifactVersion.id == artifact.id).values(thumbnail_path=thumbnail_path)
                     await db.execute(stmt)
                     await db.commit()
 
@@ -309,6 +328,87 @@ class ThumbnailService:
 
         except Exception as e:
             logger.exception(f"Failed to regenerate thumbnail for report {report_id}: {e}")
+            return None
+
+    async def regenerate_for_release(self, release_id: str) -> Optional[str]:
+        """A published dashboard's thumbnail drawn from its release (phase 5):
+        the release's content over its copies' rows, saved as
+        thumbnails/release-{id}.png. None of it when a reader may not get
+        those rows, or when they are monitoring data (the image is served
+        without a user): the copied thumbnail is removed too. A deck keeps the thumbnail it was
+        published with (frozen). Runs in the background with its own session.
+        """
+        try:
+            from app.dependencies import async_session_maker
+            from app.models.artifact import Artifact
+            from app.models.artifact_release import ArtifactRelease
+            from app.models.query import Query
+            from app.models.step import Step
+            from app.models.visualization import Visualization
+            from app.services.dashboard_data import any_copy_tainted, release_snapshot_withheld
+            from sqlalchemy import select, update
+
+            async with async_session_maker() as db:
+                release = await db.get(ArtifactRelease, str(release_id))
+                if release is None or release.status != "ready":
+                    return None
+                artifact = await db.get(Artifact, str(release.artifact_id))
+                if artifact is None or artifact.mode == "doc":
+                    return None
+                stem = f"release-{release.id}"
+                # First, for a deck too (its picture is its first slide): no
+                # picture of rows a reader may not get -- it is served
+                # without a user.
+                if (release.bow_source_access
+                        or await release_snapshot_withheld(db, artifact, release)
+                        or await any_copy_tainted(db, release)):
+                    self.delete_thumbnail(stem)
+                    await db.execute(update(ArtifactRelease).where(ArtifactRelease.id == str(release.id))
+                                     .values(thumbnail_path=None))
+                    await db.commit()
+                    return None
+                if artifact.mode != "page":
+                    return None  # a deck keeps the picture it was published with (frozen)
+                content = release.content or {}
+                rows = (await db.execute(
+                    select(Visualization, Query, Step)
+                    .join(Query, Query.id == Visualization.query_id)
+                    .outerjoin(Step, Step.id == Query.default_step_id)
+                    .where(Visualization.artifact_release_id == str(release.id),
+                           Visualization.deleted_at.is_(None))
+                )).all()
+                viz_data = [{
+                    "id": str(viz.id),
+                    "title": viz.title or query.title or "Untitled",
+                    "view": viz.view or {},
+                    "rows": (step.data or {}).get("rows", []) if step is not None else [],
+                    "columns": (step.data or {}).get("columns", []) if step is not None else [],
+                    **row_count_fields(step.data if step is not None else None),
+                    "dataModel": (step.data_model or {}) if step is not None else {},
+                } for viz, query, step in rows]
+                html_content = self._build_thumbnail_html(
+                    report_id=str(artifact.id),
+                    report_title=artifact.title,
+                    report_theme=release.theme_name,
+                    artifact_code=content.get("code", ""),
+                    visualizations=viz_data,
+                    mode="page",
+                    runtime_version=int(content.get("runtime_version") or 0),
+                )
+                self.delete_thumbnail(stem)
+                thumbnail_path = await self.generate_thumbnail(artifact_id=stem, html_content=html_content,
+                                                               mode="page")
+                stored = await db.execute(update(ArtifactRelease).where(
+                    ArtifactRelease.id == str(release.id), ArtifactRelease.status == "ready",
+                ).values(thumbnail_path=thumbnail_path))
+                await db.commit()
+                if stored.rowcount != 1:
+                    # Replaced and deleted while drawing: its file goes too.
+                    self.delete_thumbnail(stem)
+                    return None
+                return thumbnail_path
+        except Exception as e:
+            logger.exception(f"Failed to regenerate thumbnail for release {release_id}: {e}")
             return None
 
     def _build_thumbnail_html(
@@ -319,6 +419,7 @@ class ThumbnailService:
         artifact_code: str,
         visualizations: list,
         mode: str = "page",
+        runtime_version: int = 0,
     ) -> str:
         """Build HTML for thumbnail screenshot."""
         artifact_data = {
@@ -331,6 +432,7 @@ class ThumbnailService:
             # Thumbnails are shared assets — always render anonymously so no
             # viewer's identity gets baked into an image other users see.
             "current_user": None,
+            "runtime": {"version": runtime_version or 0},
         }
         data_json = json.dumps(artifact_data, default=str)
 
@@ -355,6 +457,7 @@ class ThumbnailService:
 <html>
 <head>
   <meta charset="UTF-8">
+  <script>window.ARTIFACT_DATA = {data_json};</script>
   {page_scripts}
   <style>html, body, #root {{ height: 100%; margin: 0; padding: 0; }}</style>
 </head>

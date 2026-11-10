@@ -33,6 +33,75 @@ def _get_test_database_url() -> str:
     return os.environ.get("TEST_DATABASE_URL", settings.TEST_DATABASE_URL)
 
 
+# Default pool geometry for the production async engine, per uvicorn worker.
+# The effective ceiling against the database is
+# ``(pool_size + max_overflow) * workers * replicas`` — size it under the
+# server's ``max_connections - superuser_reserved_connections`` (stock Postgres
+# is 100 - 3 = 97). Exceeding it does NOT surface as a QueuePool timeout: the
+# server refuses the connect outright with "remaining connection slots are
+# reserved for roles with the SUPERUSER attribute", which then surfaces to
+# users as a failed agent run.
+DEFAULT_DB_POOL_SIZE = 20
+DEFAULT_DB_MAX_OVERFLOW = 20
+
+
+def _env_pool_int(name: str, default: int) -> int:
+    """Read a pool-geometry override from the environment.
+
+    These were hardcoded, so an operator hitting connection-slot exhaustion had
+    no lever short of editing the image. Invalid or negative values fall back to
+    the default rather than failing startup.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("%s=%d is negative; using %d", name, value, default)
+        return default
+    return value
+
+
+def _pool_size() -> int:
+    return _env_pool_int("BOW_DB_POOL_SIZE", DEFAULT_DB_POOL_SIZE)
+
+
+def _max_overflow() -> int:
+    return _env_pool_int("BOW_DB_MAX_OVERFLOW", DEFAULT_DB_MAX_OVERFLOW)
+
+
+def _idle_session_timeout_ms() -> int:
+    """Server-side idle-session reaping, in ms. 0 (the default) disables it.
+
+    A QueuePool never shrinks on its own: `pool_recycle` is applied lazily at
+    checkout and *replaces* a stale connection rather than closing it, and
+    SQLAlchemy has no idle-pool reaper. So once a burst has grown the pool to
+    `pool_size`, that many Postgres backends stay open for the life of the
+    worker. Measured here against a local PG16: after a 40-way burst the pool
+    sat at 20 open backends indefinitely under light traffic, with or without
+    `pool_use_lifo`.
+
+    Letting the *server* close sessions idle past this timeout is what actually
+    drains it; `pool_pre_ping` (enabled below) then detects the closed socket at
+    next checkout and reconnects transparently. With the timeout at 5s and one
+    query/second of traffic, the same pool settled at 4 open backends under FIFO
+    checkout and 1 under LIFO.
+
+    OFF BY DEFAULT because `idle_session_timeout` is PostgreSQL 14+, and an
+    unrecognised GUC passed as a startup parameter makes *every* connection fail
+    with `UndefinedObjectError` — so enabling it blindly would hard-break
+    deployments on older servers. Operators on 14+ opt in with
+    BOW_DB_IDLE_SESSION_TIMEOUT_MS (the Helm chart, which bundles PG 17, sets
+    it). Keep it far longer than any gap between queries on a busy worker —
+    minutes, not seconds — or the pool churns reconnects instead of draining.
+    """
+    return _env_pool_int("BOW_DB_IDLE_SESSION_TIMEOUT_MS", 0)
+
+
 def _get_database_url() -> str:
     """Resolve the database URL from config, supporting IAM auth providers."""
     db = settings.bow_config.database
@@ -166,6 +235,145 @@ def _attach_async_iam_auth_hook(engine, db_config):
     )
 
 
+class _LoopLocalPool(NullPool):
+    """Test-only pool: idle connections are kept per event loop and only ever
+    handed out again on the loop that opened them.
+
+    Every TestClient request (and every ``asyncio.run`` in a test) runs on its
+    own short-lived loop, and asyncpg binds a connection to the loop that
+    opened it — so a plain pool would pass connections across loops, which is
+    why this used to be NullPool. NullPool paid a full connect for every
+    session, and one request opens several.
+
+    A connection is never touched from a loop other than its own while that
+    loop is alive. Once its loop has closed it is abandoned: socket closed and
+    marked aborted, since nothing can talk through a dead loop. ``test_client``
+    releases the running loop's connections at the end of each request.
+    """
+
+    _MAX_IDLE_PER_LOOP = 5
+
+    def __init__(self, *args, **kwargs):
+        import threading
+
+        super().__init__(*args, **kwargs)
+        self._lock = threading.Lock()
+        self._idle = {}  # id(loop) -> (weakref to loop, [records])
+
+    def status(self) -> str:
+        return "LoopLocalPool"
+
+    @staticmethod
+    def _running_loop():
+        import asyncio
+
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+
+    @staticmethod
+    def _loop_of(record):
+        ref = record.info.get("bow_loop")
+        return ref() if ref is not None else None
+
+    @staticmethod
+    def _abandon(record):
+        """Drop a connection whose loop has closed, without using that loop."""
+        raw = getattr(record.dbapi_connection, "_connection", None)
+        sock = getattr(getattr(raw, "_transport", None), "_sock", None)
+        try:
+            if sock is not None:
+                sock.close()
+        finally:
+            if raw is not None:
+                raw._aborted = True
+                raw._protocol = None
+
+    def _sweep_closed_loops(self):
+        dead = []
+        with self._lock:
+            for key, (ref, records) in list(self._idle.items()):
+                loop = ref()
+                if loop is None or loop.is_closed():
+                    dead.extend(records)
+                    del self._idle[key]
+        for record in dead:
+            self._abandon(record)
+
+    def _do_get(self):
+        self._sweep_closed_loops()
+        loop = self._running_loop()
+        if loop is not None:
+            with self._lock:
+                entry = self._idle.get(id(loop))
+                if entry is not None and entry[0]() is loop and entry[1]:
+                    return entry[1].pop()
+        return self._create_connection()
+
+    def _do_return_conn(self, record):
+        import weakref
+
+        loop = self._loop_of(record)
+        if loop is None or loop.is_closed():
+            self._abandon(record)
+            return
+        if loop is self._running_loop():
+            with self._lock:
+                entry = self._idle.get(id(loop))
+                if entry is None or entry[0]() is not loop:
+                    entry = self._idle[id(loop)] = (weakref.ref(loop), [])
+                if len(entry[1]) < self._MAX_IDLE_PER_LOOP:
+                    entry[1].append(record)
+                    return
+        # Over the cap, or (never expected) returned off its own loop's thread:
+        # close it on the loop we are on only when that loop owns it.
+        if loop is self._running_loop():
+            record.close()
+
+    def release_running_loop(self):
+        """Close the running loop's idle connections (call before it ends)."""
+        loop = self._running_loop()
+        if loop is None:
+            return
+        with self._lock:
+            entry = self._idle.pop(id(loop), None)
+        for record in (entry[1] if entry and entry[0]() is loop else []):
+            record.close()
+
+    def dispose(self):
+        self.release_running_loop()
+        self._sweep_closed_loops()
+        # Idle connections of loops still running elsewhere are left to their
+        # loop: closing them from here would act on another thread's loop.
+
+
+def _tag_connection_loop(engine):
+    import asyncio
+    import weakref
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _remember_loop(dbapi_connection, connection_record):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        connection_record.info["bow_loop"] = weakref.ref(loop) if loop else None
+
+
+async def release_test_connections():
+    """Test-only: close the pooled connections the running loop opened, while
+    it can still close them (called at the end of each TestClient request)."""
+    engine = _async_engine_singleton
+    if engine is None:
+        return
+    pool = engine.sync_engine.pool
+    if isinstance(pool, _LoopLocalPool):
+        from sqlalchemy.util import greenlet_spawn
+
+        await greenlet_spawn(pool.release_running_loop)
+
+
 # Singleton async engine. Every call site that previously called
 # `create_async_database_engine()` (or the wrapper `create_async_session_factory()`)
 # was building a brand-new engine + 15-conn pool that never got disposed.
@@ -203,21 +411,30 @@ def _build_async_database_engine():
             ).replace(
                 "postgresql://", "postgresql+asyncpg://"
             )
-            # NullPool: no connection pooling - avoids stale connection issues with TestClient.
+            # Pooled per event loop (see _LoopLocalPool): an asyncpg
+            # connection cannot cross loops, which is why this used to be
+            # NullPool — but NullPool paid a full connect for every session,
+            # and connecting was the largest share of the Postgres e2e leg's
+            # wall time. Like NullPool it never blocks a checkout.
             # idle_in_transaction_session_timeout: if a leaked session stays idle
             # in transaction for >60s, Postgres terminates it automatically — keeps
             # a single bug from blocking DROP SCHEMA in the next test for hours.
+            # synchronous_commit=off: a commit returns without waiting for its
+            # WAL to reach disk. Visibility and isolation are unchanged; only
+            # crash durability is given up, which a test database never needs.
             engine = create_async_engine(
                 database_url,
                 echo=False,
                 future=True,
-                poolclass=NullPool,
+                poolclass=_LoopLocalPool,
                 connect_args={
                     "server_settings": {
                         "idle_in_transaction_session_timeout": "60000",
+                        "synchronous_commit": "off",
                     },
                 },
             )
+            _tag_connection_loop(engine)
     else:
         db_config = settings.bow_config.database
         database_url = _get_async_database_url()
@@ -243,6 +460,14 @@ def _build_async_database_engine():
             server_settings = connect_args.setdefault("server_settings", {})
             server_settings.setdefault("lock_timeout", "30000")
             server_settings.setdefault("idle_in_transaction_session_timeout", "300000")
+            #   - idle_session_timeout: lets the server close sessions the pool
+            #     is holding but not using, so a quiet worker's backends drain
+            #     instead of pinning `pool_size` slots forever. Off unless the
+            #     operator opts in — see `_idle_session_timeout_ms` for why
+            #     (PG 14+ only; an unknown GUC here fails every connect).
+            _idle_ms = _idle_session_timeout_ms()
+            if _idle_ms > 0:
+                server_settings.setdefault("idle_session_timeout", str(_idle_ms))
             # PostgreSQL: use connection pooling for production
             # Pool sizing assumes one uvicorn worker. Each in-flight SSE
             # completion holds the agent's primary session for its entire
@@ -253,11 +478,22 @@ def _build_async_database_engine():
             engine = create_async_engine(
                 database_url,
                 echo=False,
-                pool_size=20,          # connections per worker
-                max_overflow=20,       # extra under load
+                pool_size=_pool_size(),          # connections per worker
+                max_overflow=_max_overflow(),    # extra under load
                 pool_timeout=30,       # wait time for connection
                 pool_recycle=1800,     # recycle every 30min (avoids stale connections)
                 pool_pre_ping=True,    # check connection health before use
+                # LIFO checkout: hand back the most recently used connection
+                # instead of round-robining through the whole pool, so steady
+                # light traffic concentrates on a few connections and the tail
+                # goes genuinely idle. On its own this does NOT reduce open
+                # backends (nothing closes a pooled connection) — it multiplies
+                # what `idle_session_timeout` above can reclaim: measured on a
+                # 20-connection pool under one query/second, FIFO settled at 4
+                # open backends and LIFO at 1. Mirrors the data-source pool,
+                # which sets it for the same reason
+                # (data_sources/engine_pool.py).
+                pool_use_lifo=True,
                 connect_args=connect_args,
             )
             if db_config.uses_iam_auth:

@@ -18,10 +18,11 @@ from fastapi_users.authentication import (
     JWTStrategy,
 )
 from fastapi_users.db import SQLAlchemyUserDatabase
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, case
 from httpx_oauth.oauth2 import BaseOAuth2
 
-from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+# fastapi-mail is no longer used here: account email goes through
+# notification_service so it honours the organization's own SMTP server.
 
 from app.schemas.user_schema import UserCreate
 from app.models.organization import Organization
@@ -69,6 +70,19 @@ class UserManager(BaseUserManager[User, str]):
         """
         user = await self._do_authenticate(credentials)
         if user is None:
+            from app.ee.audit.security_events import record_security_event
+            known = None
+            try:
+                known = await self.get_by_email(credentials.username)
+            except Exception:
+                known = None
+            # A failed attempt against a known account is evidence for that
+            # account's organizations; an unknown account has none.
+            await record_security_event(
+                "auth.login_failed", user=known, outcome="failure", failure_reason="invalid_credentials",
+                method="ldap" if settings.bow_config.ldap.enabled else "password",
+                details={"email": (credentials.username or "")[:255], "account_known": known is not None},
+            )
             return None
         # Credentials are correct at this point, so naming the real reason
         # leaks nothing an attacker could not already confirm — and the
@@ -77,6 +91,11 @@ class UserManager(BaseUserManager[User, str]):
         # route would otherwise fold this into LOGIN_BAD_CREDENTIALS, so the
         # distinction has to be drawn here, before it returns.
         if not user.is_active:
+            from app.ee.audit.security_events import record_security_event
+            await record_security_event(
+                "auth.login_failed", user=user, outcome="failure", failure_reason="account_disabled",
+                method="password", details={"email": user.email},
+            )
             raise AppError(
                 ErrorCode.ACCOUNT_DISABLED,
                 "Your account has been disabled. Contact your administrator.",
@@ -85,6 +104,11 @@ class UserManager(BaseUserManager[User, str]):
         if (settings.bow_config.auth.mode == "sso_only" and
                 not getattr(user, "_directory_authenticated", False) and
                 not await self._user_can_use_local_login(user)):
+            from app.ee.audit.security_events import record_security_event
+            await record_security_event(
+                "auth.login_failed", user=user, outcome="failure", failure_reason="local_login_not_allowed",
+                method="password", details={"email": user.email},
+            )
             return None
         return user
 
@@ -161,51 +185,9 @@ class UserManager(BaseUserManager[User, str]):
             return "failed"
         if not identity or not ldap_config.organization_id:
             return "failed"
-        from pydantic import TypeAdapter, EmailStr, ValidationError
-        try:
-            email = str(TypeAdapter(EmailStr).validate_python(identity["email"]))
-        except (ValidationError, KeyError):
-            return "failed"
-        subject = identity["provider"] + ":" + identity["guid"]
-        session = self.user_db.session
-        user = (await session.execute(select(User).where(User.ldap_subject == subject))).scalar_one_or_none()
-        collision = (await session.execute(select(User).where(func.lower(User.email) == email.lower()))).scalar_one_or_none()
-        if collision is not None and (user is None or collision.id != user.id):
-            return "failed"
+        user = await admit_directory_identity(self.user_db.session, identity, ldap_config)
         if user is None:
-            if not ldap_config.auto_provision_users:
-                return "failed"
-            org = await session.get(Organization, ldap_config.organization_id)
-            if org is None:
-                return "failed"
-            from app.core.seats import seats_remaining
-            remaining = await seats_remaining(session, ldap_config.organization_id)
-            if remaining is not None and remaining <= 0:
-                return "failed"
-            from fastapi_users.password import PasswordHelper
-            ph = PasswordHelper()
-            user = User(email=email.lower(), name=identity["name"],
-                hashed_password=ph.hash(ph.generate()), is_active=True,
-                is_verified=True, is_superuser=False, ldap_subject=subject,
-                ldap_identity=identity, ldap_dn=identity["dn"])
-            session.add(user)
-            await session.flush()
-            session.add(Membership(user_id=user.id, organization_id=ldap_config.organization_id,
-                role="member", directory_provider=identity["provider"]))
-            from app.core.permission_resolver import ensure_system_role_assignment
-            await ensure_system_role_assignment(session, ldap_config.organization_id, str(user.id), "member")
-        else:
-            if not user.is_active or user.is_superuser:
-                return "failed"
-            membership = (await session.execute(select(Membership.id).where(
-                Membership.user_id == user.id, Membership.organization_id == ldap_config.organization_id,
-                Membership.deleted_at.is_(None)))).first()
-            if not membership:
-                return "failed"
-            user.email = email.lower()
-            user.ldap_identity = identity
-            user.ldap_dn = identity["dn"]
-        await session.commit()
+            return "failed"
         user._directory_authenticated = True
         return user
 
@@ -219,11 +201,25 @@ class UserManager(BaseUserManager[User, str]):
             from app.dependencies import async_session_maker
             async with async_session_maker() as session:
                 await session.execute(
-                    update(User).where(User.id == str(user.id)).values(last_login=datetime.now(timezone.utc))
+                    update(User).where(User.id == str(user.id)).values(last_login=datetime.now(timezone.utc).replace(tzinfo=None))
                 )
                 await session.commit()
         except Exception:
             pass
+
+        # The OAuth/OIDC/SAML handlers record their own auth.login with the
+        # provider; the local form (password or LDAP bind) is recorded here.
+        if not (request and request.url.path.endswith("/callback")):
+            from app.ee.audit import context as audit_context
+            from app.ee.audit.security_events import record_security_event, session_id_of
+            ctx = audit_context.current()
+            if ctx is not None:
+                audit_context.bind(ctx.with_(session_id=session_id_of(user) or ctx.session_id))
+            await record_security_event(
+                "auth.login", request=request, user=user, outcome="success",
+                method="ldap" if getattr(user, "_directory_authenticated", False) else "password",
+                details={"email": user.email},
+            )
 
         # Handle redirect for any OAuth/OIDC callback
         if request and request.url.path.endswith("/callback"):
@@ -245,12 +241,17 @@ class UserManager(BaseUserManager[User, str]):
                 raise HTTPException(status_code=303, headers={"Location": redirect_url})
 
     async def _attach_open_memberships(self, user: User, session: AsyncSession):
+        # Order by role privilege (then oldest, then id) so that when several open
+        # invites exist for one org, the most-privileged is the one CLAIMED (the
+        # surviving row's legacy `role`); the rest are retired. Deterministic, and
+        # identical to the dedup migration / claim_pending_invite ordering.
+        role_rank = case((Membership.role == "admin", 0), (Membership.role == "member", 1), else_=2)
         stmt = select(Membership).where(
             and_(
                 func.lower(Membership.email) == (user.email or "").strip().lower(),
                 Membership.user_id.is_(None)
             )
-        )
+        ).order_by(role_rank, Membership.created_at.asc(), Membership.id.asc())
         open_memberships = (await session.execute(stmt)).scalars().all()
         
         if open_memberships:
@@ -264,154 +265,91 @@ class UserManager(BaseUserManager[User, str]):
         from app.models.role import Role
         from app.models.role_assignment import RoleAssignment
 
+        from sqlalchemy.exc import IntegrityError
+        from app.core.permission_resolver import ensure_system_role_assignment
+
         for membership in open_memberships:
-            membership.user_id = user.id
-            membership_role = membership.role
-            membership.email = None  # Clear the email since we now have a user
+            org_id = membership.organization_id
+            invite_role = membership.role
+            # Try to CLAIM this invite as the user's membership. If the user
+            # already has a live row in the org (SCIM/OIDC/LDAP provisioned it, or
+            # a concurrent create wins the race below), fall back to RETIRING the
+            # invite instead: move its pending RBAC + base role onto the existing
+            # row and hard-delete the invite. Two live rows for one (user, org) is
+            # the duplicate that broke principal_belongs_to_org ("no models").
+            existing = (await session.execute(
+                select(Membership.id).where(
+                    Membership.user_id == user.id,
+                    Membership.organization_id == org_id,
+                    Membership.deleted_at.is_(None),
+                ).limit(1)
+            )).first()
 
-            # Materialize any pre-assigned (pending) RBAC roles and group
-            # memberships from the invite onto the freshly-registered user.
-            await self._materialize_pending_rbac(session, membership, user.id)
-
-            # Create the matching RBAC role_assignment so the invited user
-            # actually has permissions in the org. Mirrors
-            # OrganizationService._assign_system_role.
-            if membership_role:
+            claimed = False
+            if existing is None:
+                # SAVEPOINT: a concurrent create between the check above and here
+                # would hit the unique index; don't 500 the registration/login.
+                # Flush the caller's unrelated pending state (is_verified,
+                # reactivation, the OAuth link) FIRST, in the outer transaction —
+                # ``begin_nested()`` pre-flushes on open, so a claim stamped before
+                # the savepoint would write in the OUTER transaction and a lost
+                # race would roll back the whole registration. Stamp the claim
+                # strictly INSIDE the savepoint instead.
+                await session.flush()
                 try:
-                    role_result = await session.execute(
-                        select(Role).where(
-                            Role.name == membership_role,
-                            Role.is_system == True,
-                            Role.organization_id.is_(None),
-                            Role.deleted_at.is_(None),
-                        )
-                    )
-                    system_role = role_result.scalar_one_or_none()
-                    if system_role:
-                        existing = await session.execute(
-                            select(RoleAssignment).where(
-                                RoleAssignment.organization_id == membership.organization_id,
-                                RoleAssignment.role_id == system_role.id,
-                                RoleAssignment.principal_type == "user",
-                                RoleAssignment.principal_id == user.id,
-                                RoleAssignment.deleted_at.is_(None),
-                            )
-                        )
-                        if not existing.scalar_one_or_none():
-                            session.add(RoleAssignment(
-                                organization_id=membership.organization_id,
-                                role_id=system_role.id,
-                                principal_type="user",
-                                principal_id=user.id,
-                            ))
-                except Exception:
-                    pass
+                    async with session.begin_nested():
+                        membership.user_id = user.id
+                        membership.email = None
+                        membership.invite_token = None
+                        await session.flush([membership])
+                    claimed = True
+                except IntegrityError:
+                    # Lost the race — a live row now exists. The savepoint rolled
+                    # back only the claim; the outer transaction is still alive, so
+                    # refresh the invite and retire it onto the existing row.
+                    await session.refresh(membership)
+
+            # Move any pre-assigned (pending) RBAC and the invite's base role onto
+            # the user — needed whether we claimed the invite or are retiring it
+            # (the pre-existing row may hold a lower role than the invite granted;
+            # ensure_system_role_assignment is a no-op when already held).
+            await self._materialize_pending_rbac(session, membership, user.id)
+            if invite_role:
+                await ensure_system_role_assignment(session, org_id, str(user.id), invite_role)
+
+            if not claimed:
+                # Hard-delete the retired invite — membership removal is a hard
+                # delete everywhere else, and a soft-deleted row would reappear in
+                # the many (user, org) reads that don't filter deleted_at.
+                await session.delete(membership)
+                await session.flush()
+                continue
+
             # Telemetry: invited user accepted invite and signed up
             try:
                 await telemetry.capture(
                     "organization_member_joined_via_invite",
                     {
-                        "organization_id": str(membership.organization_id),
+                        "organization_id": str(org_id),
                         "membership_id": str(membership.id),
                         "user_id": str(user.id),
                     },
                     user_id=str(user.id),
-                    org_id=str(membership.organization_id),
+                    org_id=str(org_id),
                 )
             except Exception:
                 pass
 
-    async def _materialize_pending_rbac(self, session: AsyncSession, membership: Membership, user_id: str) -> None:
+    @staticmethod
+    async def _materialize_pending_rbac(session: AsyncSession, membership: Membership, user_id: str) -> None:
         """Rewrite pending (membership-keyed) RBAC rows onto the registered user.
 
-        An org admin can pre-assign roles and groups to an invite before the
-        user registers. Those are stored as ``RoleAssignment`` rows with
-        ``principal_type='membership'`` and ``GroupMembership`` rows with
-        ``membership_id`` set. When the invitee registers we convert them to
-        the user-keyed equivalents, de-duplicating against anything the user
-        may already have, so the resolver (which only knows 'user'/'group')
-        sees the intended permissions immediately.
+        Thin wrapper over ``permission_resolver.materialize_pending_rbac`` so the
+        invite-acceptance path and the provisioning paths (SCIM/OIDC via
+        ``claim_pending_invite``) share one implementation.
         """
-        from app.models.role_assignment import RoleAssignment
-        from app.models.group_membership import GroupMembership
-        from app.models.usage_policy import UsagePolicyAssignment
-
-        org_id = membership.organization_id
-        try:
-            # Role assignments: membership principal → user principal
-            ra_result = await session.execute(
-                select(RoleAssignment).where(
-                    RoleAssignment.organization_id == org_id,
-                    RoleAssignment.principal_type == "membership",
-                    RoleAssignment.principal_id == membership.id,
-                    RoleAssignment.deleted_at.is_(None),
-                )
-            )
-            for assignment in ra_result.scalars().all():
-                existing = await session.execute(
-                    select(RoleAssignment).where(
-                        RoleAssignment.organization_id == org_id,
-                        RoleAssignment.role_id == assignment.role_id,
-                        RoleAssignment.principal_type == "user",
-                        RoleAssignment.principal_id == user_id,
-                        RoleAssignment.deleted_at.is_(None),
-                    )
-                )
-                if existing.scalar_one_or_none():
-                    await session.delete(assignment)
-                else:
-                    assignment.principal_type = "user"
-                    assignment.principal_id = user_id
-
-            # Group memberships: membership-keyed → user-keyed
-            gm_result = await session.execute(
-                select(GroupMembership).where(
-                    GroupMembership.membership_id == membership.id,
-                    GroupMembership.deleted_at.is_(None),
-                )
-            )
-            for gm in gm_result.scalars().all():
-                existing = await session.execute(
-                    select(GroupMembership).where(
-                        GroupMembership.group_id == gm.group_id,
-                        GroupMembership.user_id == user_id,
-                    )
-                )
-                if existing.scalar_one_or_none():
-                    await session.delete(gm)
-                else:
-                    gm.user_id = user_id
-                    gm.membership_id = None
-
-            # Usage-policy (quota) assignments: membership principal → user principal
-            upa_result = await session.execute(
-                select(UsagePolicyAssignment).where(
-                    UsagePolicyAssignment.organization_id == org_id,
-                    UsagePolicyAssignment.principal_type == "membership",
-                    UsagePolicyAssignment.principal_id == membership.id,
-                    UsagePolicyAssignment.deleted_at.is_(None),
-                )
-            )
-            for upa in upa_result.scalars().all():
-                existing = await session.execute(
-                    select(UsagePolicyAssignment).where(
-                        UsagePolicyAssignment.organization_id == org_id,
-                        UsagePolicyAssignment.policy_id == upa.policy_id,
-                        UsagePolicyAssignment.principal_type == "user",
-                        UsagePolicyAssignment.principal_id == user_id,
-                        UsagePolicyAssignment.deleted_at.is_(None),
-                    )
-                )
-                if existing.scalar_one_or_none():
-                    await session.delete(upa)
-                else:
-                    upa.principal_type = "user"
-                    upa.principal_id = user_id
-            await session.flush()
-        except Exception:
-            # Never block registration if pending-RBAC tables aren't present
-            # (pre-migration) or a conversion hits a transient conflict.
-            pass
+        from app.core.permission_resolver import materialize_pending_rbac
+        await materialize_pending_rbac(session, membership, user_id)
 
     async def on_after_register(self, user: User, request: Optional[Request] = None):
         print(f"User {user.id} has registered.")
@@ -594,13 +532,16 @@ class UserManager(BaseUserManager[User, str]):
                 async with self.user_db.session as session:
                     # If uninvited signups are disabled and not first user, require invite
                     if await any_user_exists(session) and not settings.bow_config.features.allow_uninvited_signups:
-                        stmt = select(Membership).where(
+                        # Existence check only, and limited: the same address can
+                        # hold open invites in several orgs, so scalar_one_or_none()
+                        # would raise MultipleResultsFound and 500 the OAuth signup.
+                        stmt = select(Membership.id).where(
                             and_(
                                 func.lower(Membership.email) == (account_email or "").strip().lower(),
                                 Membership.user_id.is_(None)
                             )
-                        )
-                        open_membership = (await session.execute(stmt)).scalar_one_or_none()
+                        ).limit(1)
+                        open_membership = (await session.execute(stmt)).first()
                         if not open_membership and await self._has_domain_invite(account_email, session):
                             open_membership = True
                         if not open_membership:
@@ -698,11 +639,17 @@ class UserManager(BaseUserManager[User, str]):
         self, user: User, token: str, request: Optional[Request] = None
     ):
         await self._send_reset_password_email(user, token, request)
+        from app.ee.audit.security_events import record_security_event
+        await record_security_event("auth.password_reset_requested", request=request, user=user,
+                                    outcome="success", method="password", details={"email": user.email})
 
     async def on_after_reset_password(self, user: User, request: Optional[Request] = None):
         # A password reset is the one moment where the old sessions are most
         # likely the attacker's, so they must not survive it.
-        await bump_session_epoch(user.id)
+        await revoke_all_user_sessions(user.id)
+        from app.ee.audit.security_events import record_security_event
+        await record_security_event("auth.password_reset", request=request, user=user, outcome="success",
+                                    method="password", details={"email": user.email, "sessions_revoked": True})
 
     async def on_after_update(
         self,
@@ -713,31 +660,22 @@ class UserManager(BaseUserManager[User, str]):
         # Same reasoning for a self-service password change. Other profile
         # edits (name, avatar) leave sessions alone.
         if "password" in update_dict or "hashed_password" in update_dict:
-            await bump_session_epoch(user.id)
+            await revoke_all_user_sessions(user.id)
+            from app.ee.audit.security_events import record_security_event
+            await record_security_event("auth.password_changed", request=request, user=user, outcome="success",
+                                        method="password", details={"email": user.email, "sessions_revoked": True})
 
     async def _send_reset_password_email(self, user: User, token: str, request: Optional[Request] = None):
-        import asyncio
-        
         base_url = settings.bow_config.base_url
-            
         reset_url = f"{base_url}/users/reset-password?token={token}"
-        
-        message = MessageSchema(
-            subject="Reset your password",
-            recipients=[user.email],
-            body=f"Hello {user.name},<br /><br />You have requested to reset your password for Bag of words. Click the link below to reset your password:<br /><br /> <a href='{reset_url}'>{reset_url}</a><br /><br />If you didn't request this, please ignore this email.<br /><br />Best regards,<br />Bag of words team",
-            subtype="html"
+        body = (
+            f"Hello {user.name},<br /><br />You have requested to reset your password for Bag of words. "
+            f"Click the link below to reset your password:<br /><br /> "
+            f"<a href='{reset_url}'>{reset_url}</a><br /><br />"
+            f"If you didn't request this, please ignore this email.<br /><br />"
+            f"Best regards,<br />Bag of words team"
         )
-        fm = settings.email_client
-        
-        async def send_email():
-            try:
-                await fm.send_message(message)
-            except Exception as e:
-                print(f"Error sending reset password email: {e}")
-        
-        # Create task without awaiting it
-        asyncio.create_task(send_email())
+        await self._send_account_email(user, "Reset your password", body, "reset password")
 
     async def on_after_request_verify(
         self, user: User, token: str, request: Optional[Request] = None
@@ -745,28 +683,65 @@ class UserManager(BaseUserManager[User, str]):
         await self._send_verification_email(user, token, request)
 
     async def _send_verification_email(self, user: User, token: str, request: Optional[Request] = None):
-        import asyncio
-        
         base_url = settings.bow_config.base_url
-            
         verification_url = f"{base_url}/users/verify?token={token}"
-        
-        message = MessageSchema(
-            subject="Verify your email",
-            recipients=[user.email],
-            body=f"Welcome to Bag of words! You are almost ready to start using our platform. Click to verify your email: <br /> {verification_url}",
-            subtype="html"
+        body = (
+            "Welcome to Bag of words! You are almost ready to start using our platform. "
+            f"Click to verify your email: <br /> {verification_url}"
         )
-        fm = settings.email_client
-        
-        async def send_email():
+        await self._send_account_email(user, "Verify your email", body, "verification")
+
+    async def _send_account_email(self, user: User, subject: str, body: str, kind: str) -> None:
+        """Send an account email (reset / verification) via the resolved transport.
+
+        Account mail has no organization in scope — fastapi-users knows the user,
+        not the tenant — so the org is derived from the user's membership when
+        that is unambiguous. Without this these two emails always left through
+        the global bow-config SMTP, ignoring whatever the organization had
+        configured, and simply vanished when no global SMTP existed.
+
+        Fire-and-forget by design (the caller is an auth flow that must not block
+        or leak whether an address exists), but the outcome is logged rather than
+        printed, and a missing transport no longer raises inside the task.
+        """
+        import asyncio
+
+        from app.services.email_client_resolver import sole_organization_id
+        from app.services.notification_service import notification_service
+
+        # Read the ORM instance now, while its session is still open. The task
+        # below outlives the request, and touching a detached User there raises
+        # DetachedInstanceError instead of sending the mail.
+        user_id = str(user.id)
+        recipient = user.email
+
+        async def _send() -> None:
             try:
-                await fm.send_message(message)
-            except Exception as e:
-                print(f"Error sending verification email: {e}")
-        
-        # Create task without awaiting it
-        asyncio.create_task(send_email())
+                from app.dependencies import async_session_maker
+
+                async with async_session_maker() as db:
+                    organization_id = await sole_organization_id(db, user_id)
+                    result = await notification_service.send_custom_email(
+                        recipients=[recipient],
+                        subject=subject,
+                        body=body,
+                        subtype="html",
+                        retries=2,
+                        timeout=15,
+                        db=db,
+                        organization_id=organization_id,
+                        purpose="system",
+                    )
+                if result.status == "sent":
+                    logger.info("Sent %s email to %s via %s", kind, recipient, result.source)
+                else:
+                    logger.error(
+                        "Failed to send %s email to %s: %s", kind, recipient, result.error
+                    )
+            except Exception as e:  # noqa: BLE001 — must never break the auth flow
+                logger.error("Error sending %s email to %s: %s", kind, recipient, e)
+
+        asyncio.create_task(_send())
 
     async def create(
         self,
@@ -854,6 +829,64 @@ class UserManager(BaseUserManager[User, str]):
         return
 
 
+async def admit_directory_identity(session: AsyncSession, identity: dict, ldap_config) -> Optional[User]:
+    """The BOW user for a verified Active Directory identity, created when the
+    deployment auto-provisions directory users. None when it must be refused.
+
+    ``identity`` comes from LDAPConnectionManager.read_identity (an enabled,
+    unexpired object inside the admission group). Shared by password login
+    and embedded sign-in (services/host_identity.py), so both admit exactly
+    the same people: the objectGUID binds the account, an existing account
+    with the same email is never claimed, seats are enforced.
+    """
+    from pydantic import TypeAdapter, EmailStr, ValidationError
+    try:
+        email = str(TypeAdapter(EmailStr).validate_python(identity["email"]))
+    except (ValidationError, KeyError):
+        return None
+    subject = identity["provider"] + ":" + identity["guid"]
+    user = (await session.execute(select(User).where(User.ldap_subject == subject))).scalar_one_or_none()
+    collision = (await session.execute(select(User).where(func.lower(User.email) == email.lower()))).scalar_one_or_none()
+    if collision is not None and (user is None or collision.id != user.id):
+        return None
+    if user is None:
+        if not ldap_config.auto_provision_users:
+            return None
+        org = await session.get(Organization, ldap_config.organization_id)
+        if org is None:
+            return None
+        from app.core.seats import seats_remaining
+        remaining = await seats_remaining(session, ldap_config.organization_id)
+        if remaining is not None and remaining <= 0:
+            return None
+        from fastapi_users.password import PasswordHelper
+        ph = PasswordHelper()
+        user = User(email=email.lower(), name=identity["name"],
+            hashed_password=ph.hash(ph.generate()), is_active=True,
+            is_verified=True, is_superuser=False, ldap_subject=subject,
+            ldap_identity=identity, ldap_dn=identity["dn"])
+        session.add(user)
+        await session.flush()
+        from app.core.permission_resolver import ensure_system_role_assignment, insert_membership_if_absent
+        await insert_membership_if_absent(session, Membership(
+            user_id=user.id, organization_id=ldap_config.organization_id,
+            role="member", directory_provider=identity["provider"]))
+        await ensure_system_role_assignment(session, ldap_config.organization_id, str(user.id), "member")
+    else:
+        if not user.is_active or user.is_superuser:
+            return None
+        membership = (await session.execute(select(Membership.id).where(
+            Membership.user_id == user.id, Membership.organization_id == ldap_config.organization_id,
+            Membership.deleted_at.is_(None)))).first()
+        if not membership:
+            return None
+        user.email = email.lower()
+        user.ldap_identity = identity
+        user.ldap_dn = identity["dn"]
+    await session.commit()
+    return user
+
+
 async def any_user_exists(session: AsyncSession) -> bool:
     """Whether this instance has been claimed yet.
 
@@ -909,13 +942,17 @@ async def auto_provision_user_for_org(
         select(User).where(func.lower(User.email) == email_norm)
     )).scalar_one_or_none()
 
+    # Multiple open invites for one email in an org are allowed, so this must not
+    # use scalar_one_or_none() (it would raise MultipleResultsFound). It is only a
+    # presence flag here; the actual claim re-queries deterministically.
     open_invite = (await db.execute(
         select(Membership).where(
             Membership.organization_id == organization_id,
             func.lower(Membership.email) == email_norm,
             Membership.user_id.is_(None),
-        )
-    )).scalar_one_or_none()
+            Membership.deleted_at.is_(None),
+        ).limit(1)
+    )).scalars().first()
 
     policy = await _org_signup_policy(db, organization_id)
     domain = email_norm.split("@", 1)[-1]
@@ -940,10 +977,16 @@ async def auto_provision_user_for_org(
 
     if existing_user:
         if open_invite:
-            open_invite.user_id = existing_user.id
+            # Claim via the shared, savepoint-guarded primitive — a bare
+            # ``open_invite.user_id = ...`` would 500 at commit if a concurrent
+            # SCIM/OIDC provision of the same user won the race against the unique
+            # index. On a lost race it returns None (the user is already a member).
+            from app.core.permission_resolver import claim_pending_invite
+            await claim_pending_invite(db, existing_user, organization_id)
         else:
             role = str(policy.get("auto_invite_role") or "member")
-            db.add(Membership(
+            from app.core.permission_resolver import insert_membership_if_absent
+            await insert_membership_if_absent(db, Membership(
                 user_id=existing_user.id,
                 organization_id=organization_id,
                 role=role,
@@ -966,10 +1009,14 @@ async def auto_provision_user_for_org(
     await db.flush()
 
     if open_invite:
-        open_invite.user_id = user.id
+        # Claim via the shared, savepoint-guarded primitive (see the existing-user
+        # branch above) rather than a bare assignment that would 500 on a race.
+        from app.core.permission_resolver import claim_pending_invite
+        await claim_pending_invite(db, user, organization_id)
     else:
         role = str(policy.get("auto_invite_role") or "member")
-        db.add(Membership(
+        from app.core.permission_resolver import insert_membership_if_absent
+        await insert_membership_if_absent(db, Membership(
             user_id=user.id,
             organization_id=organization_id,
             role=role,
@@ -1028,6 +1075,19 @@ async def bump_session_epoch(user_id: str) -> None:
         await db.commit()
 
 
+async def revoke_all_user_sessions(user_id: str) -> None:
+    """Bump the session epoch and revoke issued OAuth codes/bearer tokens.
+
+    Used on password change/reset: OAuth access tokens are validated by hash,
+    not by session epoch, so bumping the epoch alone leaves them working.
+    """
+    from app.core.session_revocation import revoke_user_sessions
+    from app.dependencies import async_session_maker
+
+    async with async_session_maker() as db:
+        await revoke_user_sessions(db, user_id)
+
+
 class SessionEpochJWTStrategy(JWTStrategy):
     """JWTStrategy that makes its tokens revocable.
 
@@ -1045,11 +1105,21 @@ class SessionEpochJWTStrategy(JWTStrategy):
     async def write_token(self, user: User) -> str:
         from fastapi_users.jwt import generate_jwt
 
+        # Opaque per-login correlation id for audit events: random, never
+        # derived from the credential, safe to hand to a collector.
+        import uuid as _uuid
+        session_id = _uuid.uuid4().hex
+        try:
+            user._session_id = session_id
+        except Exception:
+            pass
         data = {
+            "saml_identity": getattr(user, "_saml_identity_hash", None),
             "sub": str(user.id),
             "aud": self.token_audience,
             SESSION_EPOCH_CLAIM: _session_epoch_of(user),
             "directory_subject": user.ldap_subject if getattr(user, "_directory_authenticated", False) else None,
+            "sid": session_id,
         }
         return generate_jwt(
             data, self.encode_key, self.lifetime_seconds, algorithm=self.algorithm
@@ -1075,6 +1145,28 @@ class SessionEpochJWTStrategy(JWTStrategy):
                 user.id,
             )
             return None
+
+        if claims.get("saml_identity"):
+            from app.models.saml import SAMLIdentity
+            async with user_manager.user_db.session as session:
+                identity = (await session.execute(select(SAMLIdentity).where(
+                    SAMLIdentity.identity_hash == claims["saml_identity"],
+                    SAMLIdentity.user_id == user.id, SAMLIdentity.deleted_at.is_(None),
+                ))).scalar_one_or_none()
+                if identity is None:
+                    return None
+                cfg = next((p for p in settings.bow_config.saml_providers
+                            if p.enabled and p.name == identity.provider
+                            and p.organization_id == identity.organization_id), None)
+                if cfg is None:
+                    return None
+                member = (await session.execute(select(Membership.id).where(
+                    Membership.user_id == user.id,
+                    Membership.organization_id == identity.organization_id,
+                    Membership.deleted_at.is_(None),
+                ))).first()
+                if member is None:
+                    return None
 
         if user.ldap_subject:
             if claims.get("directory_subject") != user.ldap_subject or not settings.bow_config.ldap.enabled:
@@ -1109,6 +1201,9 @@ class RevocableAuthenticationBackend(AuthenticationBackend):
 
     async def logout(self, strategy, user, token):
         await bump_session_epoch(user.id)
+        from app.ee.audit.security_events import record_security_event
+        await record_security_event("auth.logout", user=user, outcome="success", method="bearer",
+                                    details={"email": user.email, "sessions_revoked": True})
         return await super().logout(strategy, user, token)
 
 
@@ -1148,6 +1243,23 @@ async def _update_last_seen(user: User, db: AsyncSession) -> None:
         pass
 
 
+async def current_session_user(
+    jwt_user: Optional[User] = Depends(_jwt_current_user),
+) -> User:
+    """Interactive login session only: no OAuth bearer tokens, no API keys.
+
+    For endpoints that grant authority (OAuth consent). A delegated credential
+    must never be able to mint itself, or another client, a new grant.
+    """
+    if jwt_user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="An interactive login session is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return jwt_user
+
+
 async def current_user(
     request: Request,
     jwt_user: Optional[User] = Depends(_jwt_current_user),
@@ -1181,6 +1293,9 @@ async def current_user(
         )
         if context:
             request.state.oauth_token_context = context
+            from app.core.request_origin import OAUTH_APP, set_origin
+
+            set_origin(OAUTH_APP, str(context.client.id))
             return context.user
         raise HTTPException(
             status_code=401,

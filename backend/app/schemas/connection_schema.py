@@ -8,6 +8,10 @@ from pydantic import BaseModel, validator
 
 from app.schemas.base import UTCDatetime
 
+# Sanity ceilings for the per-connection query limits.
+MAX_QUERY_TIMEOUT_SECONDS = 3600
+MAX_CONCURRENT_QUERIES = 100
+
 
 class ConnectionCreate(BaseModel):
     """Schema for creating a new database connection."""
@@ -17,6 +21,8 @@ class ConnectionCreate(BaseModel):
     credentials: Optional[dict] = None
     auth_policy: str = "system_only"
     allowed_user_auth_modes: Optional[list] = None
+    # member_mapped per-user auth: {credential_field: member_attribute_key}
+    member_bindings: Optional[Dict[str, str]] = None
 
 
 class ConnectionUpdate(BaseModel):
@@ -27,6 +33,8 @@ class ConnectionUpdate(BaseModel):
     is_active: Optional[bool] = None
     auth_policy: Optional[str] = None  # system_only, user_required
     allowed_user_auth_modes: Optional[list] = None
+    # Replaces the whole set; {} clears it.
+    member_bindings: Optional[Dict[str, str]] = None
     # Scheduled auto-reindex (enterprise `scheduled_reindex` feature).
     auto_reindex_enabled: Optional[bool] = None
     reindex_interval_hours: Optional[int] = None  # legacy; superseded by minutes
@@ -40,6 +48,29 @@ class ConnectionUpdate(BaseModel):
     rate_limit_per_minute: Optional[int] = None
     rate_limit_per_hour: Optional[int] = None
     rate_limit_per_day: Optional[int] = None
+    # Per-connection query limits, overriding the org defaults. Stored in
+    # `config`; 0 (or null) clears the override so the org default applies.
+    query_timeout_seconds: Optional[int] = None
+    max_concurrent_queries: Optional[int] = None
+    # Per-connection on/off switch for down/restored alert emails, gated under
+    # the org toggle (effective = org AND this).
+    alert_emails_enabled: Optional[bool] = None
+
+    @validator("query_timeout_seconds")
+    def _validate_query_timeout(cls, v):
+        if v is not None and not (0 <= v <= MAX_QUERY_TIMEOUT_SECONDS):
+            raise ValueError(
+                f"query_timeout_seconds must be between 1 and {MAX_QUERY_TIMEOUT_SECONDS} "
+                "(0 uses the organization default)")
+        return v
+
+    @validator("max_concurrent_queries")
+    def _validate_max_concurrent(cls, v):
+        if v is not None and not (0 <= v <= MAX_CONCURRENT_QUERIES):
+            raise ValueError(
+                f"max_concurrent_queries must be between 1 and {MAX_CONCURRENT_QUERIES} "
+                "(0 uses the organization default)")
+        return v
 
     @validator("rate_limit_per_minute", "rate_limit_per_hour", "rate_limit_per_day")
     def _validate_rate_limit(cls, v):
@@ -87,9 +118,9 @@ class ConnectionSchema(BaseModel):
     organization_id: str
     table_count: int = 0
     tool_count: int = 0
-    # BOW-managed custom queries on this connection (materialized relations).
+    # BOW-managed custom tables on this connection (materialized relations).
     custom_queries_count: int = 0
-    # Whether this connection can host custom queries at all — accelerable
+    # Whether this connection can host custom tables at all — accelerable
     # connector type AND shared (system) credentials.
     custom_queries_supported: bool = False
     agent_count: int = 0
@@ -108,6 +139,8 @@ class ConnectionSchema(BaseModel):
     # Registry data_shape (tables | files | objects | tools) so the UI can pick
     # the right noun for the catalog count instead of hardcoding "Tables".
     data_shape: str = "tables"
+    # Registry catalog_nouns override ([singular, plural]), when the entry has one.
+    catalog_nouns: Optional[List[str]] = None
 
     class Config:
         from_attributes = True
@@ -122,18 +155,23 @@ class ConnectionDetailSchema(BaseModel):
     auth_policy: str
     allowed_user_auth_modes: Optional[list] = None
     config: dict  # Non-sensitive connection parameters
+    # member_mapped per-user auth: {credential_field: member_attribute_key}
+    member_bindings: Optional[Dict[str, str]] = None
     last_synced_at: Optional[str] = None
     organization_id: str
     table_count: int = 0
     tool_count: int = 0
-    # BOW-managed custom queries on this connection (materialized relations).
+    # BOW-managed custom tables on this connection (materialized relations).
     custom_queries_count: int = 0
-    # Whether this connection can host custom queries at all — accelerable
+    # Whether this connection can host custom tables at all — accelerable
     # connector type AND shared (system) credentials.
     custom_queries_supported: bool = False
     agent_count: int = 0
     agent_names: List[str] = []  # Names of linked agents (for delete confirmation)
     has_credentials: bool = False  # Whether system credentials are set
+    management_auth: str = "system"  # system | user, independent of query identity
+    last_connection_status: Optional[str] = None
+    last_connection_checked_at: Optional[str] = None
     # Non-secret credential fields, safe to send back so the edit form can
     # pre-fill them (OAuth endpoints, client_id, scopes, api_key header). Secrets
     # (client_secret, token, api_key, password) are NEVER included.
@@ -151,8 +189,21 @@ class ConnectionDetailSchema(BaseModel):
     rate_limit_per_minute: Optional[int] = None
     rate_limit_per_hour: Optional[int] = None
     rate_limit_per_day: Optional[int] = None
+    # Per-connection on/off switch for down/restored alert emails, gated under
+    # the org toggle (effective = org AND this). Default True.
+    alert_emails_enabled: bool = True
+    # The org-wide master toggle the per-connection switch sits under, so the
+    # connection panel can show it without needing manage_settings.
+    org_alert_emails_enabled: bool = True
+    # Per-connection query limits (null = inherits the org default, shown
+    # alongside so the form can say what "default" currently means).
+    query_timeout_seconds: Optional[int] = None
+    max_concurrent_queries: Optional[int] = None
+    default_query_timeout_seconds: Optional[int] = None
+    default_max_concurrent_queries: Optional[int] = None
     # Registry data_shape (tables | files | objects | tools).
     data_shape: str = "tables"
+    catalog_nouns: Optional[List[str]] = None
 
     class Config:
         from_attributes = True
@@ -163,9 +214,47 @@ class ConnectionTableSchema(BaseModel):
     id: str
     name: str
     column_count: int = 0
-    
+    # Whether GET /connections/{id}/tables/{table_id}/preview can serve this
+    # table. Only meaningful to connection managers — nobody else may call it.
+    preview_supported: bool = False
+
     class Config:
         from_attributes = True
+
+
+class ConnectionTablePreviewSchema(BaseModel):
+    """Sample rows from one introspected table."""
+    table_id: str
+    table_name: str
+    # What `sql` is written in: "sql", "dax" (Power BI) or "hogql" (PostHog).
+    language: str = "sql"
+    # The query for these rows, its row bound written in the source's syntax.
+    sql: str
+    # The same query without the bound — the starting point for a custom table.
+    base_sql: str
+    # "query" when `sql` ran; "storage" when the rows were read straight from
+    # table storage instead (BigQuery, where that read is free).
+    sampled_from: str = "query"
+    columns: List[dict] = []
+    rows: List[List[Any]] = []
+    row_limit: int
+    truncated: bool = False
+    # Row count recorded at indexing time, when the source reported one.
+    total_rows: Optional[int] = None
+
+
+class ConnectionTablePreviewSqlSchema(BaseModel):
+    """The preview query for a table, built from the catalog without running it.
+
+    Lets the preview modal show *what would run* when it opens, so the source is
+    only queried once the manager presses Run — no automatic hit on open.
+    """
+    table_id: str
+    table_name: str
+    language: str = "sql"
+    sql: str
+    base_sql: str
+    row_limit: int
 
 
 class ConnectionTestOverride(BaseModel):
@@ -222,6 +311,9 @@ class ConnectionIndexingProgress(BaseModel):
     progress_total: int = 0
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
+    # When the source last reported progress — lets the UI tell a slow run
+    # from a stuck one, which elapsed time alone cannot.
+    last_activity_at: Optional[str] = None
     error: Optional[str] = None
     stats: Optional[Dict[str, Any]] = None
     events: Optional[List[Dict[str, Any]]] = None
@@ -235,4 +327,3 @@ class ConnectionIndexingSchema(ConnectionIndexingProgress):
     connection_id: str
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
-

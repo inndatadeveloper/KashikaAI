@@ -9,6 +9,7 @@ Schema discovery reads ServiceNow's own metadata tables in bulk
 full snapshot — custom `u_*`/`x_*` tables included — is a handful of requests,
 not one per table. Reference-type fields become foreign keys.
 """
+from app.data_sources.clients.progress import discovery_progress, discovery_items, IndexingCancelled
 import io
 import json
 import re
@@ -17,13 +18,19 @@ from typing import Generator, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from app.core.egress import pinned_session
 
 from app.data_sources.clients._document_text import (
     DOC_EXTS,
     doc_text_is_usable,
     extract_document_text_from_bytes,
 )
-from app.data_sources.clients._file_source_common import DocumentText, NamedBytes
+from app.data_sources.clients._file_source_common import (
+    DocumentText,
+    NamedBytes,
+    SheetNotFoundError,
+    read_excel_sheet,
+)
 from app.data_sources.clients.base import Capability, DataSourceClient
 from app.ai.prompt_formatters import ForeignKey, Table, TableColumn, ServiceFormatter
 
@@ -256,7 +263,7 @@ class ServiceNowClient(DataSourceClient):
             raise RuntimeError(
                 "ServiceNow client has no credentials: provide username/password or sign in with OAuth."
             )
-        session = requests.Session()
+        session = pinned_session()
         session.verify = self.verify_ssl
         session.headers.update({"Accept": "application/json"})
         if self.access_token:
@@ -291,6 +298,8 @@ class ServiceNowClient(DataSourceClient):
             detail = response.text[:500]
             try:
                 detail = response.json().get("error", {}).get("message", detail)
+            except IndexingCancelled:
+                raise
             except Exception:
                 pass
             raise RuntimeError(f"ServiceNow API error ({response.status_code}): {detail}")
@@ -498,13 +507,15 @@ class ServiceNowClient(DataSourceClient):
         targets = self._targets_without_metadata()
         schemas: List[Table] = []
         failures: List[str] = []
-        for target in targets:
+        for target in discovery_items(targets, 'tables', label=str):
             try:
                 rows = self._sample_rows(session, target)
             except RuntimeError as e:
+                self.mark_discovery_incomplete("servicenow catalog")
                 failures.append(f"{target}: {e}")
                 continue
             if not rows:
+                self.mark_discovery_incomplete("servicenow table columns")
                 failures.append(
                     f"{target}: no rows returned, so no columns could be inferred "
                     "(the table may be empty or fully filtered by ACLs)"
@@ -518,7 +529,8 @@ class ServiceNowClient(DataSourceClient):
             )
         return schemas
 
-    def get_schemas(self) -> List[Table]:
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
         if self.infer_schema_from_data:
             with self.connect() as session:
                 return self._schemas_from_data(session)
@@ -545,7 +557,7 @@ class ServiceNowClient(DataSourceClient):
                 by_table.setdefault(_scalar(row.get("name")), []).append(row)
 
             schemas = []
-            for target in targets:
+            for target in discovery_items(targets, 'tables', label=str):
                 table = self._build_table(target, hierarchy, by_table)
                 if table.columns:
                     schemas.append(table)
@@ -790,7 +802,8 @@ class ServiceNowClient(DataSourceClient):
             )
         return response.content
 
-    def read_file(self, file_id: str, max_bytes: Optional[int] = None, **_ignored):
+    def read_file(self, file_id: str, max_bytes: Optional[int] = None,
+                  sheet: Optional[str] = None, **_ignored):
         """Read one attachment. Same contract as the drive clients:
         tabular → DataFrame, text → str, documents → extracted text
         (DocumentText carrying the original bytes), everything else →
@@ -817,7 +830,9 @@ class ServiceNowClient(DataSourceClient):
                     return pd.read_csv(io.BytesIO(content))
                 if ext == "tsv":
                     return pd.read_csv(io.BytesIO(content), sep="\t")
-                return pd.read_excel(io.BytesIO(content))
+                return read_excel_sheet(content, sheet, trim=False)
+            except SheetNotFoundError:
+                raise
             except Exception:
                 return NamedBytes(content, name=name, mime=mime)
         if ext == "json":

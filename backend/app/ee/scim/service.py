@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 from fastapi_users.password import PasswordHelper
 
@@ -18,6 +19,7 @@ from app.models.user import User
 from app.models.membership import Membership
 from app.models.organization import Organization
 from app.ee.scim.models import ScimToken
+from app.ee.scim.errors import ScimError
 from app.ee.scim.schemas import (
     ScimUser, ScimUserCreate, ScimPatchOp, ScimMeta, ScimName, ScimEmail,
     ScimListResponse, ScimTokenCreate, ScimTokenResponse, ScimTokenCreated,
@@ -122,6 +124,23 @@ def _parse_scim_filter(filter_str: Optional[str]) -> dict:
 
     attr, value = match.group(1), match.group(2)
     return {attr: value}
+
+
+def _scim_bool(value) -> bool:
+    """SCIM boolean from a PATCH value.
+
+    Entra apps without the `aadOptscim062020` flag send booleans as strings
+    ("False"), and bool("False") is True — which would turn a deprovisioning
+    PATCH into a no-op that leaves the user able to sign in.
+    """
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1"):
+            return True
+        if lowered in ("false", "0"):
+            return False
+        raise HTTPException(status_code=400, detail=f"Invalid boolean value: {value!r}")
+    return bool(value)
 
 
 def _user_to_scim(user: User, membership: Optional[Membership] = None, base_url: str = "") -> ScimUser:
@@ -245,13 +264,28 @@ class ScimUserService:
         if existing_user:
             # Check if already a member of this org
             membership_result = await db.execute(
-                select(Membership)
+                select(Membership.id)
                 .where(Membership.user_id == existing_user.id)
                 .where(Membership.organization_id == organization_id)
                 .where(Membership.deleted_at.is_(None))
+                .limit(1)
             )
-            if membership_result.scalar_one_or_none():
+            if membership_result.first():
                 raise HTTPException(status_code=409, detail="User already exists in this organization")
+
+            # Claim an open email invite rather than creating a SECOND membership
+            # that would collide with the user's later invite acceptance (the
+            # invite + SSO duplicate). A pending invite already counts toward the
+            # seat cap, so claiming reuses its seat and runs before enforcement.
+            from app.core.permission_resolver import claim_pending_invite
+            claimed = await claim_pending_invite(db, existing_user, organization_id)
+            if claimed is not None:
+                existing_user.is_active = data.active
+                if data.externalId:
+                    existing_user.scim_external_id = data.externalId
+                await db.commit()
+                await db.refresh(claimed)
+                return _user_to_scim(existing_user, claimed, base_url)
 
             # Enforce the license seat cap before adding a new member. Checked after
             # the duplicate guard so re-provisioning an existing member still 409s
@@ -286,12 +320,6 @@ class ScimUserService:
             await db.refresh(membership)
             return _user_to_scim(existing_user, membership, base_url)
 
-        # Enforce the license seat cap before creating a brand-new user + membership,
-        # so a full org can't be grown via SCIM provisioning (and we don't leave an
-        # orphan User with no membership).
-        from app.core.seats import enforce_seat_limit
-        await enforce_seat_limit(db, organization_id)
-
         # Create new user
         display_name = data.displayName
         if not display_name and data.name:
@@ -313,6 +341,24 @@ class ScimUserService:
         )
         db.add(user)
         await db.flush()  # Get user.id before creating membership
+
+        # The admin may have invited this address before SCIM provisioned it.
+        # Claim that open invite (reusing its seat) instead of creating a second
+        # membership that the user's later sign-in would duplicate.
+        from app.core.permission_resolver import claim_pending_invite
+        claimed = await claim_pending_invite(db, user, organization_id)
+        if claimed is not None:
+            await db.commit()
+            await db.refresh(user)
+            await db.refresh(claimed)
+            return _user_to_scim(user, claimed, base_url)
+
+        # No invite to reuse: enforce the license seat cap before adding a
+        # brand-new membership, so a full org can't be grown via SCIM
+        # provisioning. Nothing is committed until the end, so a 402 here leaves
+        # no orphan User behind.
+        from app.core.seats import enforce_seat_limit
+        await enforce_seat_limit(db, organization_id)
 
         membership = Membership(
             user_id=user.id,
@@ -374,8 +420,7 @@ class ScimUserService:
         if data.externalId is not None:
             user.scim_external_id = data.externalId
 
-        await db.commit()
-        await db.refresh(user)
+        await self._commit_user_update(db, user)
         return _user_to_scim(user, membership, base_url)
 
     async def patch_user(
@@ -409,9 +454,33 @@ class ScimUserService:
                 if op.path and op.path.lower() == "externalid":
                     user.scim_external_id = None
 
-        await db.commit()
-        await db.refresh(user)
+        await self._commit_user_update(db, user)
         return _user_to_scim(user, membership, base_url)
+
+    async def _commit_user_update(self, db: AsyncSession, user: User) -> None:
+        """Commit a PUT/PATCH, answering an email that belongs to another
+        account with 409 uniqueness (what Entra/Okta expect) instead of the
+        raw constraint error."""
+        conflict = ScimError(409, "userName is already in use by another user", "uniqueness")
+        if user.email:
+            # no_autoflush: the pending email change must not hit the unique
+            # index before we have checked it.
+            with db.no_autoflush:
+                taken = await db.scalar(
+                    select(User.id).where(
+                        func.lower(User.email) == user.email.lower(),
+                        User.id != user.id,
+                    )
+                )
+            if taken:
+                await db.rollback()
+                raise conflict
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            raise conflict
+        await db.refresh(user)
 
     def _apply_replace(self, user: User, path: Optional[str], value) -> None:
         """Apply a replace operation to user attributes."""
@@ -426,7 +495,7 @@ class ScimUserService:
         """Set a single user attribute from SCIM path/key."""
         attr_lower = attr.lower()
         if attr_lower == "active":
-            user.is_active = bool(value)
+            user.is_active = _scim_bool(value)
         elif attr_lower == "username":
             user.email = str(value)
         elif attr_lower == "displayname":
@@ -466,3 +535,8 @@ class ScimUserService:
         user, membership = row
         user.is_active = False
         await db.commit()
+        try:
+            from app.services.wait_service import wait_service
+            wait_service.cancel_waits_for_user(str(user_id))
+        except Exception:
+            logger.warning("SCIM delete: failed to cancel pending waits", exc_info=True)

@@ -1,6 +1,9 @@
+from app.data_sources.clients.progress import discovery_progress, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 from app.ai.prompt_formatters import Table, TableColumn, ServiceFormatter
+from app.core.egress import pinned_session
 
+import logging
 import pandas as pd
 import requests
 import time
@@ -8,6 +11,8 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 from app.data_sources.clients.progress import ProgressCallback
+
+logger = logging.getLogger(__name__)
 
 
 # Synthetic columns every metric "table" exposes on top of its label set.
@@ -156,7 +161,7 @@ class PrometheusClient(DataSourceClient):
 
     @contextmanager
     def connect(self):
-        session = requests.Session()
+        session = pinned_session()
         session.headers.update(self._headers())
         auth = self._auth()
         if auth is not None:
@@ -258,20 +263,35 @@ class PrometheusClient(DataSourceClient):
         ``limit`` — without them Prometheus scans the whole retention period and
         materialises one object per series ever seen, which on a churning
         instance dwarfs the live label set this is actually reading.
+
+        A batch falls back to per-metric ``/api/v1/labels`` when ``/series``
+        fails or comes back truncated: VictoriaMetrics rejects a ``/series``
+        match exceeding ``-search.maxUniqueTimeseries`` regardless of
+        ``limit``, and a truncated batch drops the labels of every metric past
+        the cut.
         """
         labels: Dict[str, set] = {n: set() for n in names}
         now = int(time.time())
         window = [
             ("start", str(now - self.discovery_lookback_s)),
             ("end", str(now)),
-            ("limit", str(self._SERIES_LIMIT)),
         ]
         for i in range(0, len(names), self._SERIES_BATCH):
             batch = names[i : i + self._SERIES_BATCH]
-            series = self._api(
-                session, "/api/v1/series",
-                params=[("match[]", n) for n in batch] + window, method="POST",
-            ) or []
+            try:
+                series = self._api(
+                    session, "/api/v1/series",
+                    params=[("match[]", n) for n in batch]
+                    + window + [("limit", str(self._SERIES_LIMIT))],
+                    method="POST",
+                ) or []
+            except (RuntimeError, requests.exceptions.HTTPError) as e:
+                logger.info("Prometheus /series discovery failed for a batch, falling back to /labels: %s", e)
+                series = None
+            if series is None or len(series) >= self._SERIES_LIMIT:
+                for name in batch:
+                    labels[name] = self._label_keys(session, name, window)
+                continue
             for s in series:
                 name = s.get("__name__")
                 if name is None:
@@ -281,6 +301,17 @@ class PrometheusClient(DataSourceClient):
                     if key != "__name__":
                         bucket.add(key)
         return labels
+
+    def _label_keys(self, session: requests.Session, name: str, window) -> set:
+        try:
+            keys = self._api(
+                session, "/api/v1/labels", params=[("match[]", name)] + window,
+            ) or []
+        except (RuntimeError, requests.exceptions.HTTPError) as e:
+            self.mark_discovery_incomplete("prometheus catalog")
+            logger.warning("Prometheus label discovery failed for metric %s: %s", name, e)
+            return set()
+        return {k for k in keys if k != "__name__"}
 
     def get_tables(self, progress_callback: Optional[ProgressCallback] = None) -> List[Table]:
         """Build one Table per metric: columns = labels + timestamp + value."""
@@ -299,7 +330,9 @@ class PrometheusClient(DataSourceClient):
                 if progress_callback:
                     done = min(i + self._SERIES_BATCH, total)
                     try:
-                        progress_callback(done, total, f"Indexed {done}/{total} metrics")
+                        progress_callback("metrics", batch[-1] if batch else None, done, total)
+                    except IndexingCancelled:
+                        raise
                     except Exception:
                         pass
 
@@ -334,6 +367,7 @@ class PrometheusClient(DataSourceClient):
                 )
             return tables
 
+    @discovery_progress
     def get_schemas(self, progress_callback: Optional[ProgressCallback] = None):
         return self.get_tables(progress_callback=progress_callback)
 
@@ -438,6 +472,8 @@ class PrometheusClient(DataSourceClient):
                 try:
                     info = self._api(session, "/api/v1/status/buildinfo") or {}
                     version = info.get("version")
+                except IndexingCancelled:
+                    raise
                 except Exception:
                     pass
                 msg = "Successfully connected to Prometheus"
@@ -446,6 +482,8 @@ class PrometheusClient(DataSourceClient):
                 return {"success": True, "message": msg}
         except requests.exceptions.RequestException as e:
             return {"success": False, "message": f"Connection error: {e}"}
+        except IndexingCancelled:
+            raise
         except Exception as e:
             return {"success": False, "message": str(e)}
 

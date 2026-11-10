@@ -22,8 +22,11 @@ _GLOB_META = re.compile(r"[\*\?\[\]]")
 # schema_context_builder._FILE_SOURCE_TYPES.
 FILE_SOURCE_TYPES = {
     "sharepoint_onprem",
+    "documentum",
     "network_dir", "s3", "sharepoint", "onedrive", "google_drive",
     "outlook_mail", "gmail_mail", "onenote",
+    "github_repo", "gitlab_repo", "bitbucket_repo",
+    "kms_lighthouse",
 }
 TOKEN_SCOPED_TYPES = {"onedrive", "google_drive", "outlook_mail", "gmail_mail"}
 

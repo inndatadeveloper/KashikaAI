@@ -288,10 +288,11 @@ def test_mcp_tools_list(
     assert "tools" in data["result"]
 
     tools = data["result"]["tools"]
-    # JSON-RPC tools/list additionally filters out tools whose
-    # required_ds_permission the caller lacks (see routes/mcp.py), so the count
-    # here is one lower than the unfiltered REST endpoint.
-    assert len(tools) == 13
+    # JSON-RPC tools/list additionally filters out tools the caller can't use
+    # (required_ds_permission, send_email without outbound mail; see
+    # routes/mcp.py), so the count here is one lower than the unfiltered REST
+    # endpoint. The caller is the org admin, so every builder tool is listed.
+    assert len(tools) == 20
 
     tool_names = [t["name"] for t in tools]
     assert "create_report" in tool_names
@@ -299,9 +300,14 @@ def test_mcp_tools_list(
     assert "inspect_data" in tool_names
     assert "create_data" in tool_names
     assert "create_artifact" in tool_names
+    assert "manage_artifact_resources" in tool_names
     assert "list_instructions" in tool_names
     assert "create_instruction" in tool_names
     assert "delete_instruction" in tool_names
+    assert "read_instruction" in tool_names
+    assert "edit_instruction" in tool_names
+    assert "describe_tables" in tool_names
+    assert "edit_schema" in tool_names
     assert "list_agent_tools" in tool_names
     assert "execute_mcp" in tool_names
     # App-only tools (hidden from LLM, used by MCP App UIs)
@@ -320,6 +326,59 @@ def test_mcp_tools_list(
     for tool in app_only_tools:
         assert "_meta" in tool
         assert tool["_meta"]["ui"]["visibility"] == ["app"]
+
+
+@pytest.mark.e2e
+def test_mcp_create_data_preview_rows_is_an_org_setting(
+    enable_mcp,
+    test_client,
+    create_api_key,
+    create_user,
+    login_user,
+    whoami,
+    get_organization_settings,
+    update_organization_settings,
+):
+    """create_data's inline row count defaults to 1000, an admin can change it,
+    and the saved value is what the MCP tool resolves."""
+    from app.ai.tools.mcp.create_data import resolve_preview_limit
+    from app.models.organization_settings import OrganizationSettings
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)['organizations'][0]['id']
+    api_key = create_api_key(user_token=user_token, org_id=org_id)["key"]
+    enable_mcp(user_token=user_token, org_id=org_id)
+
+    settings = get_organization_settings(user_token=user_token, org_id=org_id)
+    assert settings["config"]["mcp_create_data_preview_rows"]["value"] == 1000
+    assert resolve_preview_limit(OrganizationSettings(config=settings["config"]), None) == 1000
+
+    updated = update_organization_settings(
+        config={"mcp_create_data_preview_rows": {"value": 5000}},
+        user_token=user_token,
+        org_id=org_id,
+    )
+    assert updated["config"]["mcp_create_data_preview_rows"]["value"] == 5000
+    saved = OrganizationSettings(
+        config=get_organization_settings(user_token=user_token, org_id=org_id)["config"]
+    )
+    assert resolve_preview_limit(saved, None) == 5000
+    assert resolve_preview_limit(saved, 20) == 20
+    assert resolve_preview_limit(saved, 9000) == 5000
+
+    # The advertised schema leaves the default to the org, not a fixed number.
+    response = test_client.post(
+        "/api/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"X-API-Key": api_key},
+    )
+    create_data = next(t for t in response.json()["result"]["tools"] if t["name"] == "create_data")
+    limit = create_data["inputSchema"]["properties"]["limit"]
+    assert limit.get("default") is None
+    int_branch = next(b for b in limit["anyOf"] if b.get("type") == "integer")
+    assert int_branch["minimum"] == 1
+    assert int_branch["maximum"] == 10000
 
 
 @pytest.mark.e2e
@@ -420,7 +479,7 @@ def test_mcp_rest_tools_endpoint(
     assert "tools" in data
 
     tools = data["tools"]
-    assert len(tools) == 14
+    assert len(tools) == 21
 
     tool_names = [t["name"] for t in tools]
     assert "create_report" in tool_names
@@ -428,9 +487,14 @@ def test_mcp_rest_tools_endpoint(
     assert "inspect_data" in tool_names
     assert "create_data" in tool_names
     assert "create_artifact" in tool_names
+    assert "manage_artifact_resources" in tool_names
     assert "list_instructions" in tool_names
     assert "create_instruction" in tool_names
     assert "delete_instruction" in tool_names
+    assert "read_instruction" in tool_names
+    assert "edit_instruction" in tool_names
+    assert "describe_tables" in tool_names
+    assert "edit_schema" in tool_names
     assert "edit_artifact" in tool_names
     assert "list_agent_tools" in tool_names
     assert "execute_mcp" in tool_names
@@ -673,6 +737,63 @@ def test_mcp_get_context(
     assert "data_sources" in context_text
     assert "Music Store" in context_text or "music store" in context_text.lower()
     # No manual cleanup needed - database reset by run_migrations fixture
+
+
+@pytest.mark.e2e
+@pytest.mark.parametrize("tool", ["get_context", "create_data"])
+def test_mcp_tool_runs_are_indexed_when_they_finish(
+    enable_mcp,
+    test_client,
+    create_api_key,
+    create_user,
+    login_user,
+    whoami,
+    tool,
+):
+    """An MCP tool call is a tracked agent run. It must be indexed for the
+    monitoring explorer and the BOW source when it finishes (success or error),
+    like any agent-loop run, not left for the next restart's sweep."""
+    import asyncio
+    import os
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+    api_key = create_api_key(user_token=user_token, org_id=org_id)["key"]
+    enable_mcp(user_token=user_token, org_id=org_id)
+
+    def call(name, arguments):
+        response = test_client.post(
+            "/api/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}},
+            headers={"X-API-Key": api_key},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["result"]
+
+    report_id = json.loads(call("create_report", {"title": "Indexed MCP run"})["content"][0]["text"])["report_id"]
+    # create_data with no data source finishes as an error run; get_context as a success.
+    call(tool, {"report_id": report_id, "prompt": "count rows"} if tool == "create_data" else {"report_id": report_id})
+
+    async def runs():
+        from app.models.agent_execution import AgentExecution
+        url = os.environ["TEST_DATABASE_URL"].replace("sqlite://", "sqlite+aiosqlite://", 1).replace("postgresql://", "postgresql+asyncpg://", 1)
+        engine = create_async_engine(url)
+        try:
+            async with engine.connect() as conn:
+                return (await conn.execute(
+                    select(AgentExecution.status, AgentExecution.rollup_version)
+                    .where(AgentExecution.report_id == report_id)
+                )).all()
+        finally:
+            await engine.dispose()
+
+    rows = asyncio.run(runs())
+    assert rows, "the MCP call must be tracked as an agent run"
+    assert all(status != "in_progress" for status, _ in rows)
+    assert all(version is not None for _, version in rows)
 
 
 @pytest.mark.e2e
@@ -1072,3 +1193,27 @@ def test_mcp_create_artifact_no_llm(
     content_text = data["result"]["content"][0]["text"]
     # Should indicate some error (either no LLM or no visualizations)
     assert data["result"]["isError"] is True or "error" in content_text.lower() or "no" in content_text.lower()
+
+
+@pytest.mark.e2e
+def test_tools_list_publishes_read_only_and_destructive_hints(
+    enable_mcp, test_client, create_api_key, create_user, login_user, whoami
+):
+    """Clients (another BOW, Claude Desktop) decide approval from these hints."""
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+    api_key = create_api_key(user_token=user_token, org_id=org_id)["key"]
+    enable_mcp(user_token=user_token, org_id=org_id)
+
+    response = test_client.post(
+        "/api/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"X-API-Key": api_key},
+    )
+    assert response.status_code == 200, response.text
+    tools = {t["name"]: t for t in response.json()["result"]["tools"]}
+    assert tools["get_context"]["annotations"]["readOnlyHint"] is True
+    assert tools["delete_instruction"]["annotations"]["destructiveHint"] is True
+    # A tool that writes declares no read-only hint, so clients treat it as a write.
+    assert tools["create_instruction"].get("annotations", {}).get("readOnlyHint") is not True

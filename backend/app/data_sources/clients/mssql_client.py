@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import logging
@@ -14,6 +15,7 @@ from typing import Generator, List, Optional
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
 from functools import cached_property
+from app.data_sources.routines import build_routine_tables, mssql_variants, with_routines
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +54,11 @@ class MSSQLClient(DataSourceClient):
                  odbc_driver: int = 18, encrypt: bool = True, additional_params: Optional[dict] = None,
                  use_kerberos: bool = False, kerberos_principal: Optional[str] = None,
                  kerberos_impersonate: Optional[str] = None,
-                 kerberos_expected_sid: Optional[str] = None):
+                 kerberos_expected_sid: Optional[str] = None,
+                 index_routines: bool = False):
         self.host = host
+        # Opt-in routine indexing (see app.data_sources.routines).
+        self.index_routines = bool(index_routines)
         self.port = port
         self.database = database
         self.user = user
@@ -170,6 +175,8 @@ class MSSQLClient(DataSourceClient):
             # it is cached on the pooled connection, making this one round trip
             # per physical connection rather than per query.
             capture_identity(conn)
+        except IndexingCancelled:
+            raise
         except Exception as e:
             if conn is not None:
                 if self.kerberos_impersonate:
@@ -203,6 +210,8 @@ class MSSQLClient(DataSourceClient):
                     bytes(row[0]).hex().lower() != self.kerberos_expected_sid.lower()
                     or str(row[1]).upper() != "KERBEROS"):
                 raise RuntimeError("SQL authenticated identity mismatch")
+        except IndexingCancelled:
+            raise
         except Exception:
             conn.invalidate()
             raise
@@ -221,12 +230,15 @@ class MSSQLClient(DataSourceClient):
         """Get tables with graceful fallback if enriched query fails."""
         try:
             return self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             logger.exception("MSSQL enriched table introspection failed; falling back to basic query")
             return self._get_tables_basic()
 
     def _get_tables_enriched(self) -> List[Table]:
         """Get tables with column/table descriptions via extended properties. May fail on some configurations."""
+        discovery_phase('reading_columns')
         with self.connect() as conn:
             params = {"database": self.database}
             where_clauses = ["c.table_catalog = :database"]
@@ -266,7 +278,7 @@ class MSSQLClient(DataSourceClient):
             result = conn.execute(sql, params).fetchall()
 
             tables = {}
-            for row in result:
+            for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                 table_schema, table_name, column_name, data_type, col_comment, tbl_comment = row
                 key = (table_schema, table_name)
                 fqn = f"{table_schema}.{table_name}"
@@ -290,6 +302,7 @@ class MSSQLClient(DataSourceClient):
 
     def _get_tables_basic(self) -> List[Table]:
         """Get tables without comments (original query - always works)."""
+        discovery_phase('metadata_fallback')
         with self.connect() as conn:
             params = {"database": self.database}
             where_clauses = ["table_catalog = :database"]
@@ -312,7 +325,7 @@ class MSSQLClient(DataSourceClient):
             result = conn.execute(sql, params).fetchall()
 
             tables = {}
-            for row in result:
+            for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                 table_schema, table_name, column_name, data_type = row
                 key = (table_schema, table_name)
                 fqn = f"{table_schema}.{table_name}"
@@ -345,9 +358,19 @@ class MSSQLClient(DataSourceClient):
         raise NotImplementedError(
             "get_schema() is obsolete. Use get_tables() instead.")
 
-    def get_schemas(self):
-        """Get schemas for all tables in the specified database."""
-        return self.get_tables()
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
+        """Tables and views, then stored procedures and functions (see
+        app.data_sources.routines)."""
+        tables = self.get_tables()
+        return with_routines(tables, lambda: self.get_routines(t.name for t in tables), source="mssql",
+                             client=self, enabled=self.index_routines)
+
+    def get_routines(self, table_names=()) -> List[Table]:
+        """Stored procedures and functions as schema entries, named like tables."""
+        with self.connect() as conn:
+            variants = mssql_variants(conn, self._schemas or None)
+        return build_routine_tables(variants, table_names, lambda schema, name: f"{schema}.{name}")
 
     def prompt_schema(self):
         schemas = self.get_schemas()

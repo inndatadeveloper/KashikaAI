@@ -589,7 +589,7 @@ class TestIonGateway:
         )
 
         with patch(
-            "app.data_sources.clients.infor_olap_client.requests.post",
+            "app.data_sources.clients.infor_olap_client.pinned_request",
             return_value=token_response,
         ) as token_post:
             client.connect()
@@ -597,7 +597,7 @@ class TestIonGateway:
         assert client._http.auth is None
         assert client._http.headers["Authorization"] == "Bearer gateway-token"
         request = token_post.call_args
-        assert request.args[0] == "https://identity.example.com/oauth2/token"
+        assert request.args == ("POST", "https://identity.example.com/oauth2/token")
         assert request.kwargs["data"] == {
             "grant_type": "client_credentials",
             "client_id": "client-id",
@@ -634,7 +634,7 @@ class TestIonGateway:
         session.headers = {}
 
         with patch(
-            "app.data_sources.clients.infor_olap_client.requests.post",
+            "app.data_sources.clients.infor_olap_client.pinned_request",
             return_value=token_response,
         ):
             tables = client.get_schemas()
@@ -673,7 +673,7 @@ class TestIonGateway:
         )
 
         with patch(
-            "app.data_sources.clients.infor_olap_client.requests.post",
+            "app.data_sources.clients.infor_olap_client.pinned_request",
             side_effect=[first_token, second_token],
         ) as token_post:
             client.connect()
@@ -741,9 +741,14 @@ class TestFailureClassification:
         _install_post(client, [
             _make_response(DATASOURCES_ONE),
             _make_response(CATALOGS_TWO),
+            # With a catalog configured, test_connection() also lists its cubes
+            # (a third POST). The rowset carries no catalog name, so the shared
+            # cubes fixture serves Planning as well as Finance.
+            _make_response(CUBES_FINANCE),
         ])
         result = client.test_connection()
         assert result["success"] is True
+        assert result["cubes"] == 1
         assert result["worker_url"] == "http://203.0.113.5:8210/BI/APP/SOAP/OLAPDB/Planning"
         assert "Worker URL" in result["message"]
 

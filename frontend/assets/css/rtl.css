@@ -29,13 +29,15 @@
 }
 
 /* 2. Force LTR for code-shaped surfaces. Artifacts / editors output English
- *    code whose visual ordering must not flip. */
+ *    code whose visual ordering must not flip. A <pre>/<code> that carries
+ *    its own `dir` holds prose (a trace message, an email body, an
+ *    instruction diff rendered in a pre) and keeps that direction. */
 [dir="rtl"] .monaco-editor,
 [dir="rtl"] .monaco-editor *,
 [dir="rtl"] .ag-root,
 [dir="rtl"] .ag-root *,
-[dir="rtl"] pre,
-[dir="rtl"] code,
+[dir="rtl"] pre:not([dir]),
+[dir="rtl"] code:not([dir]),
 [dir="rtl"] kbd,
 [dir="rtl"] samp,
 [dir="rtl"] .force-ltr,
@@ -45,10 +47,50 @@
   text-align: left;
 }
 
+/* 2a. Grid cell VALUES are data, not code. Column order stays LTR (it is
+ *     the query's column order), but a Hebrew name or status must read and
+ *     align right-to-left — in an English UI too, where nothing forces LTR
+ *     but the cell still inherits it. `plaintext` resolves each cell's text
+ *     from its own first strong character and `start` aligns it by that
+ *     result; numbers have no strong character and keep the grid's left
+ *     alignment. Right-aligned (numeric) columns keep their alignment. */
+.ag-root .ag-cell:not(.ag-right-aligned-cell) .ag-cell-value {
+  /* A shrink-wrapped flex item inside .ag-cell-wrapper: it has to span the
+   * cell for `text-align` to have room to move the text. */
+  flex: 1 1 auto;
+  min-width: 0;
+  unicode-bidi: plaintext;
+  text-align: start;
+}
+/* The renderer's inner spans must stay plain inline: an isolated (rule 2) or
+ * plaintext inline hides its letters from the paragraph, which then sees no
+ * strong character and falls back to LTR. */
+.ag-root .ag-cell:not(.ag-right-aligned-cell) .ag-cell-value * {
+  unicode-bidi: normal;
+  direction: inherit;
+}
+
+/* 2b. Labels (titles, names, one-line rows) whose text runs in its own
+ *     direction (`dir`) but must stay aligned with the surrounding UI: a
+ *     Hebrew instruction title in an English tree row sits next to its icon,
+ *     not at the far edge. Set by `v-text-dir` (plugins/text-dir.ts) and by
+ *     render functions. Physical sides on purpose — `text-align: match-parent`
+ *     would say this, but Chromium aligns by the element's own direction. */
+html .bidi-label { text-align: left; }
+html[dir="rtl"] .bidi-label { text-align: right; }
+
 /* 3. Flip chevrons / arrows that belong to directional affordances. Apply by
- *    adding `rtl-flip` to the icon element. */
-[dir="rtl"] .rtl-flip {
-  transform: scaleX(-1);
+ *    adding `rtl-flip` to the icon element. Keyed on the element's own
+ *    direction, not <html dir> — see rule 6 for why. */
+@supports selector(:dir(rtl)) {
+  .rtl-flip:dir(rtl) {
+    transform: scaleX(-1);
+  }
+}
+@supports not selector(:dir(rtl)) {
+  [dir="rtl"] .rtl-flip {
+    transform: scaleX(-1);
+  }
 }
 
 /* 4. [removed] A blanket `[dir="rtl"] ul, ol { padding-inline-start: 2rem }`
@@ -57,7 +99,7 @@
  *    padding globally — and caused a phantom 2rem start gutter on every
  *    non-list `<ul>` under RTL (notably the chat message list). The three
  *    contexts where we actually re-enable list markers (.prose, .markstream-vue,
- *    .markdown-wrapper) are handled by rules 5, 7, and 7b below. */
+ *    .markdown-wrapper) are handled by rules 5 and 7 below. */
 
 /* 5. ProseMirror / markdown-rendered content: lists inside our prose
  *    blocks already carry `list-inside` or custom padding. Keep their
@@ -78,78 +120,213 @@
  *    and letting non-directional uses opt OUT via `.rtl-no-flip` is far
  *    cheaper than adding `rtl-flip` to 100+ call sites.
  *
- *    The @nuxt/icon module renders each icon as `<span class="iconify
- *    heroicons--chevron-left">` (or with the `name` passed through), and
- *    we also see usages of `i-heroicons-chevron-left` / `i-heroicons:…`
- *    Tailwind-style aliases. Cover all three forms. */
-[dir="rtl"] .iconify.heroicons--chevron-left,
-[dir="rtl"] .iconify.heroicons--chevron-right,
-[dir="rtl"] .iconify.heroicons--chevron-double-left,
-[dir="rtl"] .iconify.heroicons--chevron-double-right,
-[dir="rtl"] .iconify.heroicons--arrow-left,
-[dir="rtl"] .iconify.heroicons--arrow-right,
-[dir="rtl"] .iconify.heroicons--arrow-long-left,
-[dir="rtl"] .iconify.heroicons--arrow-long-right,
-[dir="rtl"] .iconify.heroicons--arrow-small-left,
-[dir="rtl"] .iconify.heroicons--arrow-small-right,
-[dir="rtl"] .iconify.heroicons--arrow-up-left,
-[dir="rtl"] .iconify.heroicons--arrow-up-right,
-[dir="rtl"] .iconify.heroicons--arrow-uturn-left,
-[dir="rtl"] .iconify.heroicons--arrow-uturn-right,
-[dir="rtl"] .i-heroicons-chevron-left,
-[dir="rtl"] .i-heroicons-chevron-right,
-[dir="rtl"] .i-heroicons-arrow-left,
-[dir="rtl"] .i-heroicons-arrow-right,
-[dir="rtl"] .i-heroicons-arrow-long-right,
-[dir="rtl"] .i-heroicons-arrow-small-right,
-[dir="rtl"] .i-heroicons-arrow-up-right {
-  transform: scaleX(-1);
+ *    The emitted class carries a COLON, not a dash. @nuxt/icon pipes every
+ *    `name` through `useResolvedName` (runtime/components/shared.js): it
+ *    strips the `i-` prefix, matches the leading segment against the known
+ *    collections (`heroicons`, per .nuxt/app.config.mjs) and rejoins with
+ *    `:`. In `css` mode — the module default, and ours — the component then
+ *    renders `<span class="iconify i-heroicons:chevron-right">`
+ *    (runtime/components/css.js). Both spellings in our source,
+ *    `<Icon name="heroicons-chevron-right">` and
+ *    `<UIcon name="i-heroicons-chevron-right">`, collapse to that one class.
+ *
+ *    So the escaped-colon selectors are the ones that actually fire. Escape
+ *    the colon as `\:` — unescaped it parses as a pseudo-class and silently
+ *    kills the whole selector list. The dash forms below are kept only for a
+ *    bare Tailwind-style `class="i-heroicons-arrow-right"`, and the
+ *    `.iconify.heroicons--…` forms only for `svg` mode; neither matches what
+ *    we render today.
+ *
+ *    The flip keys on the icon's OWN direction (`:dir(rtl)`), not on an
+ *    `[dir="rtl"]` ancestor. Chat surfaces nest `dir="auto"` / `dir="ltr"`
+ *    blocks whose row lays out LTR for English content inside a Hebrew UI
+ *    (and RTL for Hebrew content inside an English UI). An ancestor selector
+ *    only sees <html dir>, so it mirrored arrows inside LTR rows and left
+ *    them unmirrored inside `dir="auto"` RTL rows — backwards both ways.
+ *    `:dir()` follows the resolved direction, `dir="auto"` included. Browsers
+ *    without `:dir()` fall back to the old ancestor rule. */
+@supports selector(:dir(rtl)) {
+  :where(
+  /* css mode (what we actually render) */
+  .i-heroicons\:chevron-left,
+  .i-heroicons\:chevron-right,
+  .i-heroicons\:chevron-double-left,
+  .i-heroicons\:chevron-double-right,
+  .i-heroicons\:arrow-left,
+  .i-heroicons\:arrow-right,
+  .i-heroicons\:arrow-long-left,
+  .i-heroicons\:arrow-long-right,
+  .i-heroicons\:arrow-small-left,
+  .i-heroicons\:arrow-small-right,
+  .i-heroicons\:arrow-up-left,
+  .i-heroicons\:arrow-up-right,
+  .i-heroicons\:arrow-uturn-left,
+  .i-heroicons\:arrow-uturn-right,
+
+  /* svg mode */
+  .iconify.heroicons--chevron-left,
+  .iconify.heroicons--chevron-right,
+  .iconify.heroicons--chevron-double-left,
+  .iconify.heroicons--chevron-double-right,
+  .iconify.heroicons--arrow-left,
+  .iconify.heroicons--arrow-right,
+  .iconify.heroicons--arrow-long-left,
+  .iconify.heroicons--arrow-long-right,
+  .iconify.heroicons--arrow-small-left,
+  .iconify.heroicons--arrow-small-right,
+  .iconify.heroicons--arrow-up-left,
+  .iconify.heroicons--arrow-up-right,
+  .iconify.heroicons--arrow-uturn-left,
+  .iconify.heroicons--arrow-uturn-right,
+
+  /* bare Tailwind-style class, no `name` prop */
+  .i-heroicons-chevron-left,
+  .i-heroicons-chevron-right,
+  .i-heroicons-arrow-left,
+  .i-heroicons-arrow-right,
+  .i-heroicons-arrow-long-right,
+  .i-heroicons-arrow-small-right,
+  .i-heroicons-arrow-up-right,
+  /* solid size variants, css mode */
+  .i-heroicons\:chevron-left-20-solid,
+  .i-heroicons\:chevron-right-20-solid,
+  .i-heroicons\:chevron-left-16-solid,
+  .i-heroicons\:chevron-right-16-solid,
+  .i-heroicons\:arrow-left-20-solid,
+  .i-heroicons\:arrow-right-20-solid,
+  .i-heroicons\:arrow-left-16-solid,
+  .i-heroicons\:arrow-right-16-solid
+):dir(rtl):not(.rtl-own-transform) {
+    transform: scaleX(-1);
+  }
 }
-/* Escape hatch: add `rtl-no-flip` to an icon that happens to use one of
- * the classes above but is NOT directional (e.g. a decorative arrow in a
- * logo). */
-[dir="rtl"] .rtl-no-flip {
+@supports not selector(:dir(rtl)) {
+  [dir="rtl"] :where(
+  /* css mode (what we actually render) */
+  .i-heroicons\:chevron-left,
+  .i-heroicons\:chevron-right,
+  .i-heroicons\:chevron-double-left,
+  .i-heroicons\:chevron-double-right,
+  .i-heroicons\:arrow-left,
+  .i-heroicons\:arrow-right,
+  .i-heroicons\:arrow-long-left,
+  .i-heroicons\:arrow-long-right,
+  .i-heroicons\:arrow-small-left,
+  .i-heroicons\:arrow-small-right,
+  .i-heroicons\:arrow-up-left,
+  .i-heroicons\:arrow-up-right,
+  .i-heroicons\:arrow-uturn-left,
+  .i-heroicons\:arrow-uturn-right,
+
+  /* svg mode */
+  .iconify.heroicons--chevron-left,
+  .iconify.heroicons--chevron-right,
+  .iconify.heroicons--chevron-double-left,
+  .iconify.heroicons--chevron-double-right,
+  .iconify.heroicons--arrow-left,
+  .iconify.heroicons--arrow-right,
+  .iconify.heroicons--arrow-long-left,
+  .iconify.heroicons--arrow-long-right,
+  .iconify.heroicons--arrow-small-left,
+  .iconify.heroicons--arrow-small-right,
+  .iconify.heroicons--arrow-up-left,
+  .iconify.heroicons--arrow-up-right,
+  .iconify.heroicons--arrow-uturn-left,
+  .iconify.heroicons--arrow-uturn-right,
+
+  /* bare Tailwind-style class, no `name` prop */
+  .i-heroicons-chevron-left,
+  .i-heroicons-chevron-right,
+  .i-heroicons-arrow-left,
+  .i-heroicons-arrow-right,
+  .i-heroicons-arrow-long-right,
+  .i-heroicons-arrow-small-right,
+  .i-heroicons-arrow-up-right,
+  /* solid size variants, css mode */
+  .i-heroicons\:chevron-left-20-solid,
+  .i-heroicons\:chevron-right-20-solid,
+  .i-heroicons\:chevron-left-16-solid,
+  .i-heroicons\:chevron-right-16-solid,
+  .i-heroicons\:arrow-left-20-solid,
+  .i-heroicons\:arrow-right-20-solid,
+  .i-heroicons\:arrow-left-16-solid,
+  .i-heroicons\:arrow-right-16-solid
+):not(.rtl-own-transform) {
+    transform: scaleX(-1);
+  }
+}
+/* Escape hatches, two of them:
+ *
+ *  - `rtl-no-flip` — the element uses one of the classes above but is NOT
+ *    directional (e.g. a decorative arrow in a logo). Kills the transform
+ *    outright.
+ *  - `rtl-own-transform` — the element IS directional but drives its own
+ *    `transform`, so the auto-flip must step aside rather than override it.
+ *    The disclosure-chevron idiom is the case: `chevron-right` rotated 90°
+ *    when open, mirrored when closed. Rule 6 outranks a bare `.rotate-90`
+ *    utility (0,2,0 vs 0,1,0) and would pin the open chevron sideways, so
+ *    those call sites opt out for the open state only. Tailwind's `!`
+ *    important modifier is NOT an alternative here — it produces no output
+ *    in this build. */
+.rtl-no-flip:dir(rtl) {
   transform: none !important;
+}
+@supports not selector(:dir(rtl)) {
+  [dir="rtl"] .rtl-no-flip {
+    transform: none !important;
+  }
 }
 
 /* 7. markstream-vue (the chat-message markdown renderer) ships its OWN CSS
- *    with physical `padding-left` on list elements and `text-left/right`
- *    utility classes. Under RTL those don't flip, so list markers render
- *    on the left (wrong edge) and text is force-aligned LTR. Override by
- *    swapping physical → logical on the library's scope.
- *    This is why a previous "fix the markdown CSS" pass didn't help: the
- *    offending rules don't live in our codebase at all. */
-[dir="rtl"] .markstream-vue ol,
-[dir="rtl"] .markstream-vue ul,
-[dir="rtl"] .markstream-vue .list-decimal,
-[dir="rtl"] .markstream-vue .list-disc {
+ *    with physical sides: `padding-left` on lists, `pl-1.5` on items,
+ *    `border-left` + `padding-left` on quotes, `text-left` on table cells.
+ *    None of that flips, and the offending rules don't live in our codebase.
+ *
+ *    Lists: the marker gutter moves from the <ul>/<ol> onto each <li>, as a
+ *    logical margin. A list marker sits on its ITEM's start side, so keying
+ *    the gutter on the list (or on an `[dir="rtl"]` ancestor, as this rule
+ *    used to) clipped the marker whenever the two disagreed — an English list
+ *    inside a Hebrew answer, a Hebrew list in an English UI, a nested list.
+ *    useMarkdownAutoDir gives every item its list's direction; this rule
+ *    only has to follow the item. `!important` beats the library's
+ *    `.markstream-vue .list-disc` / `.list-node[data-v]` padding. */
+.markstream-vue :is(ol, ul) {
   padding-left: 0 !important;
-  padding-right: 1.625em !important;
-}
-[dir="rtl"] .markstream-vue .text-left { text-align: start; }
-[dir="rtl"] .markstream-vue .text-right { text-align: end; }
-
-/* 7b. Mixed-locale markdown: UI locale is LTR but the assistant answered
- *     in Hebrew/Arabic (or vice-versa). The <li>/<ol> can't see through
- *     nested `dir="auto"` descendants per the HTML spec's auto-directionality
- *     algorithm — so markers stay on the LTR edge. There is no pure-CSS fix
- *     (`:dir()` follows the same spec rule). The `useMarkdownAutoDir`
- *     composable estimates each block's dominant direction from its text and
- *     sets an explicit `dir="rtl"` / `dir="ltr"` on markdown block elements
- *     inside `.markdown-wrapper` / `.markdown-content` (the latter covers
- *     thinking/reasoning boxes); these rules swap list padding to the correct
- *     edge based on that attribute regardless of the document direction. */
-.markdown-wrapper ol[dir="rtl"],
-.markdown-wrapper ul[dir="rtl"],
-.markdown-content ol[dir="rtl"],
-.markdown-content ul[dir="rtl"] {
-  padding-left: 0 !important;
-  padding-right: 1.625em !important;
-}
-.markdown-wrapper ol[dir="ltr"],
-.markdown-wrapper ul[dir="ltr"],
-.markdown-content ol[dir="ltr"],
-.markdown-content ul[dir="ltr"] {
-  padding-left: 1.625em !important;
   padding-right: 0 !important;
 }
+.markstream-vue li {
+  margin-inline-start: 1.625em;
+}
+.markstream-vue li.list-item {
+  padding-left: 0;
+  padding-right: 0;
+  padding-inline-start: 0.375em;
+}
+.markstream-vue blockquote.blockquote {
+  border-left: 0;
+  border-right: 0;
+  padding-left: 0;
+  padding-right: 0;
+  border-inline-start: 0.25rem solid var(--blockquote-border-color, #e2e8f0);
+  padding-inline-start: 1em;
+}
+
+/* 7a. Table cells: markstream tags every cell with no explicit column
+ *     alignment as `.text-left`. `start` follows the cell's direction, which
+ *     useMarkdownAutoDir sets to its table's. `:is(th, td)` beats the
+ *     library's `.markstream-vue .text-left`, which loads after this sheet. */
+.markstream-vue :is(th, td).text-left { text-align: start; }
+/* A signed number ("+12%") in an RTL table is laid out LTR so its sign stays
+ * in front (useMarkdownAutoDir marks it); keep it on the table's right edge. */
+.markstream-vue :is(th, td).text-left[data-bidi-num] { text-align: right; }
+/* Markdown's right-aligned column (`---:`) means the column's end edge, so it
+ * follows the cell's own direction, not the UI's. */
+.markstream-vue :is(th, td).text-right { text-align: end; }
+
+/* ag-grid's paging footer, translated in RTL locales: lay it out right to
+ * left so "1 עד 50 מתוך 236" reads in order. The grid itself (columns)
+ * keeps ag-grid's own direction (enableRtl is a separate decision). */
+html[dir="rtl"] .ag-paging-panel { direction: rtl; }
+/* The first/previous/next/last buttons swap sides with it; mirror their
+ * arrows so each still points the way it moves. */
+html[dir="rtl"] .ag-paging-panel .ag-icon { transform: scaleX(-1); }

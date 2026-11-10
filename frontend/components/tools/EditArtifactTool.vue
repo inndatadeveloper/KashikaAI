@@ -1,55 +1,56 @@
 <template>
   <div class="mb-2">
     <!-- Main Header -->
-    <div class="flex items-center text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleCollapsed">
-      <Icon :name="isCollapsed ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-3 h-3 me-1.5 text-gray-400 dark:text-gray-500 rtl-flip" />
-      <Spinner v-if="status === 'running'" class="w-3 h-3 me-1.5 text-gray-400 dark:text-gray-500" />
+    <div class="flex items-center text-chat-2 text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleCollapsed">
+      <Icon :name="isCollapsed ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-3 h-3 me-1.5 text-ink-muted rtl-flip" />
+      <Spinner v-if="status === 'running'" class="w-3 h-3 me-1.5 text-ink-muted" />
       <Icon v-else-if="status === 'success'" name="heroicons-check" class="w-3 h-3 me-1.5 text-green-500" />
-      <Icon v-else-if="status === 'stopped'" name="heroicons-stop-circle" class="w-3 h-3 me-1.5 text-gray-400 dark:text-gray-500" />
+      <Icon v-else-if="status === 'stopped'" name="heroicons-stop-circle" class="w-3 h-3 me-1.5 text-ink-muted" />
       <Icon v-else-if="status === 'error'" name="heroicons-exclamation-circle" class="w-3 h-3 me-1.5 text-amber-500" />
 
-      <span v-if="status === 'running'" class="tool-shimmer">{{ $t('tools.editArtifact.editing') }}</span>
-      <span v-else-if="status === 'success'" class="text-gray-700 dark:text-gray-300">{{ $t('tools.editArtifact.edited') }}</span>
-      <span v-else-if="status === 'stopped'" class="text-gray-700 dark:text-gray-300 italic">{{ $t('tools.editArtifact.editing') }}</span>
-      <span v-else-if="status === 'error'" class="text-gray-700 dark:text-gray-300">{{ $t('tools.editArtifact.failed') }}</span>
-      <span v-else class="text-gray-700 dark:text-gray-300">{{ $t('tools.editArtifact.edit') }}</span>
+      <span v-if="status === 'running'" class="tool-shimmer">{{ t('tools.editArtifact.editing') }}</span>
+      <span v-else-if="status === 'success'" class="text-gray-700 dark:text-gray-300">{{ t('tools.editArtifact.edited') }}</span>
+      <span v-else-if="status === 'stopped'" class="text-ink-muted">{{ t('tools.editArtifact.editing') }}</span>
+      <span v-else-if="status === 'error'" class="text-gray-700 dark:text-gray-300">{{ t('tools.editArtifact.failed') }}</span>
+      <span v-else class="text-gray-700 dark:text-gray-300">{{ t('tools.editArtifact.edit') }}</span>
+      <span v-if="status === 'stopped'" class="ms-1.5 text-chat-3 text-ink-muted">· {{ t('reportView.stopped') }}</span>
 
       <!-- Diff badge -->
       <span
         v-if="status === 'success' && diffApplied !== null"
         :class="[
-          'ms-2 px-1.5 py-0.5 rounded text-[10px] font-medium',
+          'ms-2 px-1.5 py-0.5 rounded text-chat-3 font-medium',
           diffApplied
             ? 'bg-green-100 text-green-700'
             : 'bg-amber-100 text-amber-700'
         ]"
       >
-        {{ diffApplied ? $t('tools.editArtifact.diff') : $t('tools.editArtifact.rewrite') }}
+        {{ diffApplied ? t('tools.editArtifact.diff') : t('tools.editArtifact.rewrite') }}
       </span>
 
       <!-- Version badge -->
       <span
         v-if="artifactVersion"
-        class="ms-1.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400"
+        class="ms-1.5 px-1.5 py-0.5 rounded text-chat-3 font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400"
       >
         v{{ artifactVersion }}
       </span>
 
-      <span v-if="formatDuration" class="ms-1.5 text-gray-400 dark:text-gray-500">{{ formatDuration }}</span>
+      <span v-if="formatDuration" class="ms-1.5 text-ink-muted">{{ formatDuration }}</span>
     </div>
 
     <!-- Expanded content -->
     <template v-if="!isCollapsed">
       <!-- Plan prompt -->
-      <div v-if="editInstruction" class="mt-0.5 ms-[18px] text-xs text-gray-400 dark:text-gray-500 max-w-lg">
-        <span>{{ $t('tools.editArtifact.plan') }}</span>
+      <div v-if="editInstruction" class="mt-0.5 ms-[18px] text-chat-2 text-ink-muted max-w-lg">
+        <span>{{ t('tools.editArtifact.plan') }}</span>
         <span :class="{ 'line-clamp-1': !promptExpanded }">{{ editInstruction }}</span>
         <button
           v-if="editInstruction.length > 80"
-          class="ms-1 text-blue-400 hover:text-blue-600 text-[11px]"
+          class="ms-1 text-blue-400 hover:text-blue-600 text-chat-2"
           @click="promptExpanded = !promptExpanded"
         >
-          {{ promptExpanded ? $t('tools.editArtifact.less') : $t('tools.editArtifact.more') }}
+          {{ promptExpanded ? t('tools.editArtifact.less') : t('tools.editArtifact.more') }}
         </button>
       </div>
 
@@ -58,40 +59,40 @@
         <span
           v-for="viz in resolvedVisualizations"
           :key="viz.id"
-          class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400"
+          class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-chat-3 font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400"
         >
           {{ viz.title }}
         </span>
       </div>
 
       <!-- Stopped/Error message -->
-      <div v-if="status === 'stopped'" class="mt-1 ms-[18px] text-xs text-gray-400 dark:text-gray-500 italic">{{ $t('tools.editArtifact.generationStopped') }}</div>
-      <div v-else-if="status === 'error' && errorMessage" class="mt-1 ms-[18px] text-xs text-gray-500 dark:text-gray-400">
+
+      <div v-if="status === 'error' && errorMessage" class="mt-1 ms-[18px] text-chat-2 text-gray-500 dark:text-gray-400">
         {{ errorMessage }}
       </div>
 
       <!-- Progress stages -->
-      <div v-if="status === 'running' && progressStage !== 'awaiting_confirmation'" class="mt-1 ms-[18px] text-xs text-gray-400 dark:text-gray-500">
-        <div v-if="progressStage === 'loading_artifact'"><span>{{ $t('tools.editArtifact.loadingArtifact') }}</span></div>
-        <div v-else-if="progressStage === 'loading_visualizations'"><span>{{ $t('tools.editArtifact.loadingVisualizations') }}</span></div>
+      <div v-if="status === 'running' && progressStage !== 'awaiting_confirmation'" class="mt-1 ms-[18px] text-chat-2 text-ink-muted">
+        <div v-if="progressStage === 'loading_artifact'"><span>{{ t('tools.editArtifact.loadingArtifact') }}</span></div>
+        <div v-else-if="progressStage === 'loading_visualizations'"><span>{{ t('tools.editArtifact.loadingVisualizations') }}</span></div>
         <div v-else-if="progressStage === 'generating_edit' || progressStage === 'generating'">
-          <span>{{ $t('tools.editArtifact.generatingEdit') }}</span>
-          <span v-if="progressChars" class="ms-1 text-gray-300 dark:text-gray-600">{{ $t('tools.editArtifact.charsCount', { n: progressChars }) }}</span>
+          <span>{{ t('tools.editArtifact.generatingEdit') }}</span>
+          <span v-if="progressChars" class="ms-1 text-gray-300 dark:text-gray-600">{{ t('tools.editArtifact.charsCount', { n: progressChars }) }}</span>
         </div>
-        <div v-else-if="progressStage === 'applying_edit' || progressStage === 'applying_edits'"><span>{{ $t('tools.editArtifact.applyingEdit') }}</span></div>
-        <div v-else-if="progressStage === 'validating' || progressStage === 'validating_render'"><span>{{ $t('tools.editArtifact.processing') }}</span></div>
-        <div v-else-if="progressStage === 'saving_artifact'"><span>{{ $t('tools.editArtifact.savingArtifact') }}</span></div>
-        <div v-else><span>{{ $t('tools.editArtifact.processing') }}</span></div>
+        <div v-else-if="progressStage === 'applying_edit' || progressStage === 'applying_edits'"><span>{{ t('tools.editArtifact.applyingEdit') }}</span></div>
+        <div v-else-if="progressStage === 'validating' || progressStage === 'validating_render'"><span>{{ t('tools.editArtifact.processing') }}</span></div>
+        <div v-else-if="progressStage === 'saving_artifact'"><span>{{ t('tools.editArtifact.savingArtifact') }}</span></div>
+        <div v-else><span>{{ t('tools.editArtifact.processing') }}</span></div>
       </div>
 
       <!-- Confirmation card -->
       <div v-if="confirmation && progressStage === 'awaiting_confirmation'" class="mt-2 ms-[18px] rounded-md border border-amber-200 bg-amber-50 dark:bg-amber-950 p-2.5 space-y-2">
-        <div class="text-xs font-medium text-gray-700 dark:text-gray-300">{{ $t('tools.editArtifact.confirm') }}</div>
+        <div class="text-chat-2 font-medium text-gray-700 dark:text-gray-300">{{ t('tools.editArtifact.confirm') }}</div>
         <div v-if="confirmation.visualizations?.length" class="flex flex-wrap gap-1">
           <span
             v-for="viz in confirmation.visualizations"
             :key="viz.id"
-            class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-white dark:bg-gray-900 border border-amber-200 text-gray-600 dark:text-gray-400"
+            class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-chat-3 font-medium bg-white dark:bg-gray-900 border border-amber-200 text-gray-600 dark:text-gray-400"
           >
             {{ viz.title }}
           </span>
@@ -99,12 +100,12 @@
         <input
           v-model="editableTitle"
           class="w-full px-2 py-1 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 focus:outline-none focus:border-blue-400"
-          :placeholder="$t('tools.editArtifact.titlePlaceholder')"
+          :placeholder="t('tools.editArtifact.titlePlaceholder')"
         />
         <div class="flex items-center gap-2">
-          <button class="px-2.5 py-1 text-xs font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors" @click="approveConfirmation">{{ $t('tools.editArtifact.approve') }}</button>
-          <button class="px-2.5 py-1 text-xs font-medium text-gray-600 dark:text-gray-400 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors" @click="rejectConfirmation">{{ $t('tools.editArtifact.cancel') }}</button>
-          <span class="text-[10px] text-gray-400 dark:text-gray-500">{{ $t('tools.editArtifact.autoApprovingIn', { n: confirmationCountdown }) }}</span>
+          <button class="px-2.5 py-1 text-chat-2 font-medium text-white bg-blue-600 rounded hover:bg-blue-700 transition-colors" @click="approveConfirmation">{{ t('tools.editArtifact.approve') }}</button>
+          <button class="px-2.5 py-1 text-chat-2 font-medium text-gray-600 dark:text-gray-400 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors" @click="rejectConfirmation">{{ t('tools.editArtifact.cancel') }}</button>
+          <span class="text-chat-3 text-ink-muted">{{ t('tools.editArtifact.autoApprovingIn', { n: confirmationCountdown }) }}</span>
         </div>
       </div>
       <!-- Preview Card -->
@@ -130,22 +131,22 @@
         </div>
         <!-- Title and info -->
         <div class="flex-1 min-w-0">
-          <div class="text-xs font-medium text-gray-700 dark:text-gray-300 truncate">{{ artifactTitle || $t('tools.editArtifact.untitled') }}</div>
-          <div class="text-[10px] text-gray-400 dark:text-gray-500">
-            <span v-if="status === 'running'">{{ $t('tools.editArtifact.editingInProgress') }}</span>
-            <span v-else>{{ $t('tools.editArtifact.dashboardEdited') }}</span>
+          <div class="text-chat-2 font-medium text-gray-700 dark:text-gray-300 truncate">{{ artifactTitle || t('tools.editArtifact.untitled') }}</div>
+          <div class="text-chat-3 text-ink-muted">
+            <span v-if="status === 'running'">{{ t('tools.editArtifact.editingInProgress') }}</span>
+            <span v-else>{{ t('tools.editArtifact.dashboardEdited') }}</span>
           </div>
           <button
             v-if="createdArtifact && !isCollapsed"
             @click.stop="copyArtifactId"
-            class="flex items-center gap-0.5 text-[10px] text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-400 font-mono mt-0.5"
-            :title="$t('tools.editArtifact.copyIdTooltip')"
+            class="flex items-center gap-0.5 text-chat-3 text-ink-muted hover:text-gray-600 dark:hover:text-gray-400 font-mono mt-0.5"
+            :title="t('tools.editArtifact.copyIdTooltip')"
           >
             <Icon name="heroicons:clipboard-document" class="w-3 h-3" />
             {{ createdArtifact.slice(0, 8) }}
           </button>
         </div>
-        <Icon name="heroicons:arrow-top-right-on-square" class="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 group-hover:text-gray-600 dark:group-hover:text-gray-400 flex-shrink-0" />
+        <Icon name="heroicons:arrow-top-right-on-square" class="w-3.5 h-3.5 text-ink-muted group-hover:text-gray-600 dark:group-hover:text-gray-400 flex-shrink-0" />
       </div>
     </div>
     </template>
@@ -154,11 +155,11 @@
 
 <script setup lang="ts">
 import { computed, ref, watch, onUnmounted } from 'vue'
-import { useI18n } from 'vue-i18n'
+import { useResponseI18n } from '~/composables/useResponseI18n'
 import Spinner from '~/components/Spinner.vue'
 import { toolErrorText } from '~/utils/toolError'
 
-const { t } = useI18n()
+const { t } = useResponseI18n()
 
 interface Props {
   toolExecution: {
@@ -264,6 +265,8 @@ onUnmounted(() => {
   if (countdownInterval) clearInterval(countdownInterval)
 })
 
+const { markConfirmationAnswered } = useToolConfirmations()
+
 async function approveConfirmation() {
   if (!confirmation.value?.confirmation_id) return
   if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null }
@@ -272,6 +275,7 @@ async function approveConfirmation() {
       method: 'POST',
       body: { approved: true, title: editableTitle.value || null },
     })
+    markConfirmationAnswered(confirmation.value?.confirmation_id)
   } catch {}
 }
 
@@ -283,6 +287,7 @@ async function rejectConfirmation() {
       method: 'POST',
       body: { approved: false },
     })
+    markConfirmationAnswered(confirmation.value?.confirmation_id)
   } catch {}
 }
 

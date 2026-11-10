@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
 from typing import Any, Dict, List, Optional, Type
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel
+
+from app.schemas.data_sources.remote_server import (
+    RemoteSSHConfig, RemoteSMBConfig, SSHKeyCredentials, SSHPasswordCredentials,
+    RemoteKerberosCredentials, SMBPasswordCredentials,
+)
 
 # Import provider Config/Credentials from the provider module
 from app.schemas.data_sources.configs import (
@@ -24,8 +29,18 @@ from app.schemas.data_sources.configs import (
     ZohoBooksCredentials,
     # Configs
     PostgreSQLConfig,
+    BrocadeConfig,
+    BrocadeCredentials,
     SharePointOnpremConfig,
     SharePointOnpremNtlmCredentials,
+    DocumentumConfig,
+    DocumentumUserPassCredentials,
+    DocumentumOtdsClientCredentials,
+    DocumentumImpersonationCredentials,
+    OAuthDelegatedCredentials as _DocumentumOAuthCredentials,
+    KmsLighthouseConfig,
+    KmsLighthouseUserPassCredentials,
+    KmsLighthouseTokenCredentials,
     SharePointOnpremKerberosCredentials,
     SQLiteConfig,
     OracleConfig,
@@ -42,6 +57,7 @@ from app.schemas.data_sources.configs import (
     MssqlKerberosDelegatedCredentials,
     PrestoConfig,
     TrinoConfig,
+    StarburstConfig,
     GoogleAnalyticsConfig,
     GCPConfig,
     AWSCostConfig,
@@ -56,8 +72,16 @@ from app.schemas.data_sources.configs import (
     TableauConfig,
     SalesforceConfig,
     MondayConfig,
+    NetAppOntapConfig,
+    F5BigIpConfig, F5BigIpCredentials,
+    CheckPointConfig, CheckPointUserPassCredentials, CheckPointApiKeyCredentials,
+    DellOmeConfig, DellOmeCredentials,
+    HpeOneViewConfig, HpeOneViewCredentials,
+    NetAppOntapCredentials,
     ServiceNowConfig,
     ZabbixConfig,
+    CrowdStrikeConfig,
+    CrowdStrikeApiClientCredentials,
     KubernetesConfig,
     KubernetesAccessFileCredentials,
     ZabbixTokenCredentials,
@@ -66,6 +90,11 @@ from app.schemas.data_sources.configs import (
     AppDynamicsUserPassCredentials,
     AriaOperationsConfig,
     AriaOperationsUserPassCredentials,
+    VCenterConfig,
+    VCenterUserPassCredentials,
+    SpectrumConfig,
+    SpectrumUserPassCredentials,
+    SpectrumTokenCredentials,
     AppDynamicsApiClientCredentials,
     ElasticsearchConfig,
     ElasticsearchApiKeyCredentials,
@@ -80,6 +109,7 @@ from app.schemas.data_sources.configs import (
     DruidTokenCredentials,
     DruidBasicTokenCredentials,
     MongoDBConfig,
+    Neo4jConfig,
     OpenSearchConfig,
     OpenSearchCredentials,
     OpenSearchNoAuthCredentials,
@@ -94,6 +124,9 @@ from app.schemas.data_sources.configs import (
     JaegerNoAuthCredentials,
     JaegerBasicCredentials,
     JaegerBearerCredentials,
+    # Microsoft Intune
+    IntuneConfig,
+    IntuneCredentials,
     # DuckDB
     DuckDBConfig,
     DuckDBNoAuthCredentials,
@@ -103,6 +136,10 @@ from app.schemas.data_sources.configs import (
     # Azure Data Explorer
     AzureDataExplorerConfig,
     AzureDataExplorerCredentials,
+    # Azure Cost Management
+    AzureCostConfig,
+    AzureCostServicePrincipalCredentials,
+    AzureCostDefaultCredentials,
     # Databricks SQL
     DatabricksSqlConfig,
     DatabricksSqlCredentials,
@@ -119,6 +156,10 @@ from app.schemas.data_sources.configs import (
     # Network Directory (local / mounted file share)
     NetworkDirConfig,
     NetworkDirCredentials,
+    GitRepoConfig,
+    GitTokenCredentials,
+    BitbucketTokenCredentials,
+    GitPublicCredentials,
     # Amazon S3
     S3Config,
     S3KeyCredentials,
@@ -139,7 +180,6 @@ from app.schemas.data_sources.configs import (
     # Qlik Sense Enterprise on Windows (on-prem)
     QlikSenseOnPremConfig,
     QlikSenseOnPremCertCredentials,
-    QlikSenseOnPremUserIdentityCredentials,
     # Microsoft Fabric
     MSFabricConfig,
     MSFabricCredentials,
@@ -155,6 +195,7 @@ from app.schemas.data_sources.configs import (
     OutlookMailConfig,
     GoogleDriveConfig,
     GoogleDriveCredentials,
+    GoogleDriveServiceAccountCredentials,
     GmailConfig,
     GmailCredentials,
     # Sybase SQL Anywhere
@@ -173,6 +214,10 @@ from app.schemas.data_sources.configs import (
     PriorityErpConfig,
     PriorityErpPatCredentials,
     PriorityErpBasicCredentials,
+    # Microsoft Configuration Manager (SCCM / MECM)
+    MecmConfig,
+    MecmNtlmCredentials,
+    MecmKerberosCredentials,
     # Oracle BI (OBIEE / OAS / OAC)
     OracleBIConfig,
     OracleBICredentials,
@@ -180,6 +225,11 @@ from app.schemas.data_sources.configs import (
     InforOlapConfig,
     InforOlapCredentials,
     InforOlapIonCredentials,
+    # Infor EPM (Application Engine REST API)
+    InforEpmConfig,
+    InforEpmIonCredentials,
+    InforEpmServiceAccountCredentials,
+    InforEpmTokenCredentials,
     # Microsoft Analysis Services (SSAS — XMLA)
     AnalysisServicesConfig,
     AnalysisServicesCredentials,
@@ -199,6 +249,7 @@ from app.schemas.data_sources.configs import (
     SQLCredentials,
     PrestoCredentials,
     TrinoCredentials,
+    TrinoTokenCredentials,
     GoogleAnalyticsCredentials,
     GCPCredentials,
     AWSCostCredentials,
@@ -215,11 +266,18 @@ from app.schemas.data_sources.configs import (
     MondayApiTokenCredentials,
     ServiceNowCredentials,
     MongoDBCredentials,
+    Neo4jCredentials,
+    Neo4jBearerCredentials,
+    Neo4jNoAuthCredentials,
+    Neo4jImpersonationCredentials,
+    Neo4jKerberosCredentials,
+    Neo4jKerberosDelegatedCredentials,
     PostHogCredentials,
     # MCP
     MCPConfig,
     MCPNoAuthCredentials,
     MCPBearerCredentials,
+    MCPBasicCredentials,
     MCPOAuthAppCredentials,
     # Custom API
     CustomAPIConfig,
@@ -249,6 +307,11 @@ class AuthVariant(BaseModel):
     # keeps the secret on the connection, the user contributes only their
     # identity fields. Only meaningful on user-scoped variants.
     overlay: bool = False
+    # Override the entry's `catalog_ownership` when a connection uses this
+    # variant. Lets one connector offer both a per-user mode (each user signs
+    # in) and a shared mode (one service identity, one admin-side catalog) —
+    # e.g. Google Drive via user OAuth vs. a service account.
+    catalog_ownership: Optional[str] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -303,6 +366,11 @@ class DataSourceRegistryEntry(BaseModel):
     # Optional explicit client path; if None, fallback to dynamic resolution
     client_path: Optional[str] = None
     dev_only: bool = False
+    # Optional Python module the client needs but we don't ship (e.g. a driver
+    # whose license forbids redistribution). When it isn't importable the entry
+    # is hidden from the new-connection catalog; existing connections still
+    # resolve and surface the client's own "install the driver" error.
+    requires_module: Optional[str] = None
     # Legacy flag — derived from `data_shape != "tables"`. Kept for backwards
     # compatibility with callers reading `client.is_document_based`. New code
     # should branch on `data_shape` directly.
@@ -405,7 +473,7 @@ class McpPreset(BaseModel):
     title: str
     server_url: str
     transport: str = "streamable_http"   # streamable_http | sse
-    auth: str = "oauth"                   # oauth(DCR) | oauth_app | bearer
+    auth: str = "oauth"                   # oauth(DCR) | oauth_app | bearer | basic
     description: str = ""
     # UI grouping bucket — same vocabulary as DataSourceRegistryEntry.category.
     # Presets are branded MCP servers, so they slot into a domain category
@@ -413,7 +481,7 @@ class McpPreset(BaseModel):
     # transport-named "MCP" category.
     category: str = "services"
     # Which auth modes the connect form offers for this tile, in form-vocabulary
-    # (none | bearer | api_key | dcr | oauth_app). None → offer all (the generic
+    # (none | bearer | api_key | basic | dcr | oauth_app). None → offer all (the generic
     # / arbitrary-URL case). E.g. X excludes `dcr` (its server has no DCR).
     allowed_auth: Optional[List[str]] = None
     # Provider OAuth constants to pre-fill when `oauth_app` is chosen. None for
@@ -440,6 +508,8 @@ def _is_dev_environment() -> bool:
 
 
 def _entry_visible(entry: DataSourceRegistryEntry) -> bool:
+    if entry.requires_module and importlib.util.find_spec(entry.requires_module) is None:
+        return False
     if not entry.dev_only:
         return True
     return _is_dev_environment()
@@ -592,6 +662,9 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
             "userpass": AuthVariant(title="Username / Password", schema=SapHanaCredentials, scopes=["system", "user"])
         }),
         client_path="app.data_sources.clients.sap_hana_client.SapHanaClient",
+        # hdbcli is under the SAP Developer License (proprietary, not
+        # redistributable), so it isn't bundled — self-hosters install it.
+        requires_module="hdbcli",
     ),
     "sap_datasphere": DataSourceRegistryEntry(
         type="sap_datasphere",
@@ -823,6 +896,48 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         catalog_nouns=("form", "forms"),
         version="beta",
     ),
+    "mecm": DataSourceRegistryEntry(
+        type="mecm",
+        category="infra",
+        title="Microsoft Configuration Manager (SCCM)",
+        description="Microsoft Configuration Manager (SCCM / MECM / ConfigMgr). Query devices, collections, hardware and software inventory, applications, deployments and software update compliance via the AdminService REST API. Read-only.",
+        config_schema=MecmConfig,
+        credentials_auth=AuthOptions(default="ntlm", by_auth={
+            # The SMS Provider only speaks Windows auth. NTLM also offers the
+            # user scope: each person's own CM security scopes then filter what
+            # they see (bring-your-own Windows credentials).
+            "ntlm": AuthVariant(title="Windows credentials (NTLM)", schema=MecmNtlmCredentials, scopes=["system", "user"]),
+            # Kerberos runs as a keytab-backed service account mounted on the
+            # server — one identity for everyone, so system scope only.
+            "kerberos": AuthVariant(title="Kerberos service account (mounted keytab / ticket cache)", schema=MecmKerberosCredentials, scopes=["system"]),
+        }),
+        setup_guide=[
+            SetupStep(
+                title="Give the account read access in Configuration Manager",
+                body="In the console go to Administration > Security > Administrative Users, add the account (or its AD group) and assign the Read-only Analyst role. Its security scopes and collections decide what Bag of Words can see.",
+            ),
+            SetupStep(
+                title="Check the administration service answers",
+                body="From a domain-joined machine, run this against your SMS Provider. It should list your site.",
+                code="Invoke-RestMethod -UseDefaultCredentials -Uri 'https://cm01.contoso.com/AdminService/wmi/SMS_Site'",
+                language="powershell",
+            ),
+            SetupStep(
+                title="Export the SMS Provider certificate",
+                body="The site binds a self-signed certificate by default. Run this in PowerShell on the SMS Provider and paste the output into SMS Provider certificate (PEM). Skip this if the certificate comes from a CA this server already trusts.",
+                code=(
+                    "$hash = ((netsh http show sslcert ipport=0.0.0.0:443) -match 'Certificate Hash' -split ':\\s*')[-1].Trim()\n"
+                    "$c = Get-Item \"Cert:\\LocalMachine\\My\\$hash\"\n"
+                    "'-----BEGIN CERTIFICATE-----'; [Convert]::ToBase64String($c.RawData, 'InsertLineBreaks'); '-----END CERTIFICATE-----'"
+                ),
+                language="powershell",
+            ),
+        ],
+        client_path="app.data_sources.clients.mecm_client.MecmClient",
+        # Configuration Manager catalogs WMI classes, not database tables.
+        catalog_nouns=("class", "classes"),
+        version="beta",
+    ),
     "appdynamics": DataSourceRegistryEntry(
         type="appdynamics",
         category="infra",
@@ -842,6 +957,21 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.appdynamics_client.AppDynamicsClient",
         version="beta",
     ),
+    "crowdstrike": DataSourceRegistryEntry(
+        type="crowdstrike",
+        category="infra",
+        title="CrowdStrike Falcon",
+        description="Endpoint security platform. Query hosts, alerts, incidents, CrowdScore, Spotlight vulnerabilities, prevention policies and custom IOCs via the Falcon API (read-only).",
+        config_schema=CrowdStrikeConfig,
+        credentials_auth=AuthOptions(default="api_client", by_auth={
+            # OAuth2 client credentials — the only auth the Falcon API accepts.
+            # Per-user scope = each user brings an API client scoped to what
+            # they may see.
+            "api_client": AuthVariant(title="API Client (OAuth)", schema=CrowdStrikeApiClientCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.crowdstrike_client.CrowdStrikeClient",
+        version="beta",
+    ),
     "zabbix": DataSourceRegistryEntry(
         type="zabbix",
         category="infra",
@@ -857,6 +987,67 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         }),
         client_path="app.data_sources.clients.zabbix_client.ZabbixClient",
         requires_license="enterprise",
+    ),
+    "netapp_ontap": DataSourceRegistryEntry(
+        type="netapp_ontap",
+        category="infra",
+        title="NetApp ONTAP",
+        description="Investigate storage incidents with read-only inventory, topology, performance, events and diagnostic tables. ONTAP 9.14.1 contract; customer validation required.",
+        config_schema=NetAppOntapConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=NetAppOntapCredentials, scopes=["system"]),
+        }),
+        client_path="app.data_sources.clients.netapp_ontap_client.NetAppOntapClient",
+        version="beta",
+    ),
+    "f5_bigip": DataSourceRegistryEntry(
+        type="f5_bigip",
+        category="infra",
+        title="F5 BIG-IP",
+        description="Investigate load-balancer incidents with read-only virtual servers, pools, pool members and their stats, nodes, iRules, certificates, device and failover state via iControl REST. Simulator-verified; customer validation required.",
+        config_schema=F5BigIpConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=F5BigIpCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.f5_bigip_client.F5BigIpClient",
+        version="beta",
+    ),
+    "checkpoint": DataSourceRegistryEntry(
+        type="checkpoint",
+        category="infra",
+        title="Check Point Management",
+        description="Investigate firewall policy and gateway incidents with read-only hosts, networks, groups, services, access and NAT rulebases, gateways, sessions and logs via the Management API. Simulator-verified; customer validation required.",
+        config_schema=CheckPointConfig,
+        credentials_auth=AuthOptions(default="api_key", by_auth={
+            "api_key": AuthVariant(title="API key", schema=CheckPointApiKeyCredentials, scopes=["system", "user"]),
+            "userpass": AuthVariant(title="Username / Password", schema=CheckPointUserPassCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.checkpoint_client.CheckPointClient",
+        version="beta",
+    ),
+    "dell_ome": DataSourceRegistryEntry(
+        type="dell_ome",
+        category="infra",
+        title="Dell OpenManage Enterprise",
+        description="Investigate server fleet incidents with read-only devices, inventory, alerts, warranty, firmware baselines and compliance, jobs, groups and audit logs via the OME REST API. Simulator-verified; customer validation required.",
+        config_schema=DellOmeConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=DellOmeCredentials, scopes=["system"]),
+        }),
+        client_path="app.data_sources.clients.dell_ome_client.DellOmeClient",
+        version="beta",
+    ),
+    "hpe_oneview": DataSourceRegistryEntry(
+        type="hpe_oneview",
+        category="infra",
+        title="HPE OneView",
+        description="Investigate compute infrastructure incidents with read-only server hardware, enclosures, interconnects, server profiles, firmware, alerts, tasks and networks via the OneView REST API. Simulator-verified; customer validation required.",
+        config_schema=HpeOneViewConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=HpeOneViewCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.hpe_oneview_client.HpeOneViewClient",
+        version="beta",
     ),
     "kubernetes": DataSourceRegistryEntry(
         type="kubernetes",
@@ -889,6 +1080,18 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         ],
         client_path="app.data_sources.clients.kubernetes_client.KubernetesClient",
         version="beta",
+    ),
+    "brocade": DataSourceRegistryEntry(
+        type="brocade",
+        category="infra",
+        title="Brocade Fabric OS",
+        description="Investigate Fibre Channel ports, optics, zoning, congestion and events with read-only diagnostics.",
+        config_schema=BrocadeConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username + Password", schema=BrocadeCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.brocade_client.BrocadeClient",
+        version="beta",
         requires_license="enterprise",
     ),
     "aria_operations": DataSourceRegistryEntry(
@@ -906,6 +1109,42 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         # Explicit path: dynamic resolution would derive "AriaOperationsClient"
         # correctly today, but the explicit path is the contract.
         client_path="app.data_sources.clients.aria_operations_client.AriaOperationsClient",
+        version="beta",
+        requires_license="enterprise",
+    ),
+    "vcenter": DataSourceRegistryEntry(
+        type="vcenter",
+        category="infra",
+        title="VMware vCenter",
+        description="VMware vCenter Server or ESXi (vSphere 7–9). Query VMs, disks, snapshots, hosts, clusters, datastores, networks, resource pools and tags, plus performance metrics, the event log, tasks and triggered alarms — for capacity questions and infrastructure RCA.",
+        config_schema=VCenterConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            # vCenter has no API keys: an SSO / AD user logs in and gets a session
+            # (one per query, logged out afterwards). Per-user scope = each
+            # analyst's own vCenter login, so vCenter permissions apply.
+            "userpass": AuthVariant(title="Username + Password", schema=VCenterUserPassCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.vcenter_client.VCenterClient",
+        version="beta",
+        requires_license="enterprise",
+    ),
+    "spectrum": DataSourceRegistryEntry(
+        type="spectrum",
+        category="infra",
+        title="DX NetOps Spectrum",
+        description="Broadcom DX NetOps Spectrum (CA Spectrum) network fault management: device and interface inventory, current alarms with root-cause/symptom links, event history and topology (connectivity, associations) via the OneClick Web Services API — for network RCA.",
+        config_schema=SpectrumConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            # Basic auth with a LOCAL Spectrum user works on every supported
+            # version (also with SAML/SSO on); bearer tokens are minted by an
+            # admin in OneClick → Token Configuration from 24.3.10. Both are
+            # static credentials — no token endpoint, nothing to refresh.
+            # Per-user scope = each analyst's own Spectrum login, so Spectrum's
+            # own landscape/role security applies.
+            "userpass": AuthVariant(title="Username + Password", schema=SpectrumUserPassCredentials, scopes=["system", "user"]),
+            "token": AuthVariant(title="Bearer Token", schema=SpectrumTokenCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.spectrum_client.SpectrumClient",
         version="beta",
         requires_license="enterprise",
     ),
@@ -947,7 +1186,6 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
             },
         ),
         client_path="app.data_sources.clients.splunk_client.SplunkClient",
-        requires_license="enterprise",
         version="beta",
     ),
     "MSSQL": DataSourceRegistryEntry(
@@ -980,12 +1218,50 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
     "trino": DataSourceRegistryEntry(
         type="trino",
         title="Trino",
-        description="Trino is a distributed SQL query engine for big data analytics.",
+        description="Trino is a distributed SQL query engine for big data analytics. Federates many catalogs behind one SQL endpoint.",
         config_schema=TrinoConfig,
         credentials_auth=AuthOptions(default="userpass", by_auth={
-            "userpass": AuthVariant(title="Username / Password", schema=TrinoCredentials, scopes=["system", "user"])
+            "userpass": AuthVariant(title="Username / Password", schema=TrinoCredentials, scopes=["system", "user"]),
+            "token": AuthVariant(title="Access token (JWT)", schema=TrinoTokenCredentials, scopes=["system", "user"]),
         }),
-        client_path=None,
+        client_path="app.data_sources.clients.trino_client.TrinoClient",
+    ),
+    # Starburst Galaxy and Starburst Enterprise are Trino with a managed /
+    # hardened deployment around it: same driver, same SQL, same client. The
+    # separate entry exists for discoverability and for defaults that work on
+    # the first try (TLS on 443, a role, the Galaxy setup guide).
+    "starburst": DataSourceRegistryEntry(
+        type="starburst",
+        title="Starburst",
+        description="Starburst Galaxy and Starburst Enterprise: the Trino-based query engine that federates lakehouse, warehouse and operational databases under one SQL endpoint.",
+        config_schema=StarburstConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=TrinoCredentials, scopes=["system", "user"]),
+            "token": AuthVariant(title="Access token (JWT)", schema=TrinoTokenCredentials, scopes=["system", "user"]),
+        }),
+        setup_guide=[
+            SetupStep(
+                title="Starburst Galaxy: create a role for Bag of Words",
+                body="In Galaxy go to Access control > Roles and privileges and add a role (for example bagofwords). Under Add privileges grant it Use cluster on the cluster, and Select from table on every catalog or schema the agent should see.",
+            ),
+            SetupStep(
+                title="Starburst Galaxy: create a service account",
+                body="Go to Access control > Service accounts, create one with the new role as its default role, and generate a password. The username is the service account's full name (for example bagofwords@<account>.galaxy.starburst.io). Enter it below as User, with the generated password.",
+            ),
+            SetupStep(
+                title="Starburst Galaxy: copy the connection details",
+                body="Open the cluster's Connection info (Partner connect > Other clients). Host is <account>-<cluster>.trino.galaxy.starburst.io and the port is 443 over HTTPS. If the cluster restricts client IPs, allow this Bag of Words instance's address.",
+            ),
+            SetupStep(
+                title="Starburst Enterprise: use the TLS coordinator",
+                body="Use the coordinator hostname with its TLS port (8443 by default, or 443 behind a load balancer) and keep Protocol on https. Log in with an LDAP or password-file user, or switch the authentication method to Access token for a JWT. If the certificate comes from an internal CA, paste the CA's PEM certificate into CA certificate.",
+            ),
+            SetupStep(
+                title="Pick catalog, schema and role, then test",
+                body="Catalog is where queries run by default; Schema narrows indexing to one or more schemas. Add other catalogs under Additional catalogs to let the agent join across them. If the login has several roles, set Role to the one that holds the grants, then click Test connection.",
+            ),
+        ],
+        client_path="app.data_sources.clients.trino_client.TrinoClient",
     ),
     "azure_data_explorer": DataSourceRegistryEntry(
         type="azure_data_explorer",
@@ -1031,6 +1307,33 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
             "key": AuthVariant(title="AWS Keys", schema=AWSCostCredentials, scopes=["system", "user"])  # system
         }),
         client_path=None,
+        version="beta",
+    ),
+    "azure_cost": DataSourceRegistryEntry(
+        type="azure_cost",
+        category="infra",
+        title="Azure Cost Management",
+        description="Analyze Azure spend by service, resource group, resource, tag and time, and forecast where the month will land.",
+        config_schema=AzureCostConfig,
+        # Service principal is the common case. The default chain covers
+        # deployments inside Azure (managed identity / workload identity),
+        # where no secret should be stored at all.
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Service Principal (Entra ID App)",
+                    schema=AzureCostServicePrincipalCredentials,
+                    scopes=["system", "user"],
+                ),
+                "managed_identity": AuthVariant(
+                    title="Managed Identity / Default Azure Credential",
+                    schema=AzureCostDefaultCredentials,
+                    scopes=["system"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.azure_cost_client.AzureCostClient",
         version="beta",
     ),
     "aws_cloudwatch": DataSourceRegistryEntry(
@@ -1140,6 +1443,58 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.mongodb_client.MongodbClient",
         is_document_based=True,
         data_shape="objects",
+    ),
+    "neo4j": DataSourceRegistryEntry(
+        type="neo4j",
+        title="Neo4j",
+        description="Graph database. Query nodes and relationships with read-only Cypher.",
+        config_schema=Neo4jConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                # Native or LDAP users (LDAP is checked by the server).
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=Neo4jCredentials,
+                    scopes=["system", "user"]
+                ),
+                # A token from the IdP Neo4j's OIDC SSO trusts.
+                "bearer": AuthVariant(
+                    title="SSO access token (OIDC)",
+                    schema=Neo4jBearerCredentials,
+                    scopes=["system", "user"],
+                ),
+                # A service user that runs queries as another Neo4j user. Under
+                # "Require user authentication" the impersonated user is bound
+                # to a member attribute (member_mapped), never typed by members.
+                "impersonation": AuthVariant(
+                    title="Impersonation",
+                    schema=Neo4jImpersonationCredentials,
+                    scopes=["system"],
+                ),
+                # BOW's own Kerberos identity; system scope only.
+                "kerberos": AuthVariant(
+                    title="Kerberos",
+                    schema=Neo4jKerberosCredentials,
+                    scopes=["system"],
+                ),
+                # Per-user Kerberos SSO via constrained delegation, as for SQL Server.
+                "kerberos_delegated": AuthVariant(
+                    title="Kerberos SSO (per-user delegation)",
+                    schema=Neo4jKerberosDelegatedCredentials,
+                    scopes=["user"],
+                ),
+                "none": AuthVariant(
+                    title="No Authentication",
+                    schema=Neo4jNoAuthCredentials,
+                    scopes=["system"],
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.neo4j_client.Neo4jClient",
+        is_document_based=True,
+        data_shape="objects",
+        catalog_nouns=("node or relationship type", "node and relationship types"),
     ),
     "opensearch": DataSourceRegistryEntry(
         type="opensearch",
@@ -1336,7 +1691,8 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         description=(
             "Browse, search and read files from a directory — a local folder or "
             "a mounted network share (SMB/NFS). Searches inside PDF, Word, "
-            "PowerPoint, Excel and CSV, and can attach files to a report."
+            "PowerPoint, Excel, CSV and email files (.eml/.msg, including their "
+            "attachments), and can attach files to a report."
         ),
         config_schema=NetworkDirConfig,
         credentials_auth=AuthOptions(
@@ -1358,12 +1714,103 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         data_shape="files",
         catalog_ownership="shared",
     ),
+    # Code connections: one repository, read-only, served from a cached local
+    # clone (app.services.repo_cache) through the same file tools as a network
+    # share. Nothing in the repo is executed. Issues/PRs/pipelines are the
+    # separate GitHub / GitLab / Bitbucket MCP presets.
+    "github_repo": DataSourceRegistryEntry(
+        type="github_repo",
+        category="files",
+        title="GitHub (code)",
+        description=(
+            "Read, search and grep the code of one GitHub repository. The repo is "
+            "cloned read-only into a local cache and refreshed when stale; nothing "
+            "in it is ever executed."
+        ),
+        setup_guide=[
+            SetupStep(
+                title="Create a read-only token",
+                body="In GitHub go to Settings > Developer settings > Fine-grained tokens, choose the repository, and grant Contents: Read-only (Metadata: Read-only is added automatically). Public repositories need no token.",
+            ),
+        ],
+        config_schema=GitRepoConfig,
+        credentials_auth=AuthOptions(
+            default="token",
+            by_auth={
+                "token": AuthVariant(title="Access token", schema=GitTokenCredentials, scopes=["system"]),
+                "none": AuthVariant(title="Public repository", schema=GitPublicCredentials, scopes=["system"]),
+            },
+        ),
+        client_path="app.data_sources.clients.git_repo_client.GitHubRepoClient",
+        version="beta",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+    ),
+    "gitlab_repo": DataSourceRegistryEntry(
+        type="gitlab_repo",
+        category="files",
+        title="GitLab (code)",
+        description=(
+            "Read, search and grep the code of one GitLab project (gitlab.com or "
+            "self-managed). Cloned read-only into a local cache; nothing in it is "
+            "ever executed."
+        ),
+        setup_guide=[
+            SetupStep(
+                title="Create a read-only token",
+                body="Create a project access token (Project > Settings > Access tokens) or a personal access token with the read_repository scope. Public projects need no token. For self-managed GitLab, also fill in Server.",
+            ),
+        ],
+        config_schema=GitRepoConfig,
+        credentials_auth=AuthOptions(
+            default="token",
+            by_auth={
+                "token": AuthVariant(title="Access token", schema=GitTokenCredentials, scopes=["system"]),
+                "none": AuthVariant(title="Public project", schema=GitPublicCredentials, scopes=["system"]),
+            },
+        ),
+        client_path="app.data_sources.clients.git_repo_client.GitLabRepoClient",
+        version="beta",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+    ),
+    "bitbucket_repo": DataSourceRegistryEntry(
+        type="bitbucket_repo",
+        category="files",
+        title="Bitbucket (code)",
+        description=(
+            "Read, search and grep the code of one Bitbucket Cloud repository. "
+            "Cloned read-only into a local cache; nothing in it is ever executed."
+        ),
+        setup_guide=[
+            SetupStep(
+                title="Create an API token",
+                body="In your Atlassian account go to Security > API tokens > Create API token with scopes, pick Bitbucket and grant read:repository:bitbucket. Leave Username empty. For a repository access token, set Username to x-token-auth.",
+            ),
+        ],
+        config_schema=GitRepoConfig,
+        credentials_auth=AuthOptions(
+            default="token",
+            by_auth={
+                "token": AuthVariant(title="API token", schema=BitbucketTokenCredentials, scopes=["system"]),
+                "none": AuthVariant(title="Public repository", schema=GitPublicCredentials, scopes=["system"]),
+            },
+        ),
+        client_path="app.data_sources.clients.git_repo_client.BitbucketRepoClient",
+        version="beta",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+    ),
     "s3": DataSourceRegistryEntry(
         type="s3",
         title="Amazon S3",
         description=(
             "Browse and read files from an Amazon S3 bucket. Reads inside PDF, "
-            "Word, PowerPoint, Excel and CSV, and can attach objects to a report. "
+            "Word, PowerPoint, Excel, CSV and email files (.eml/.msg with their "
+            "attachments), and can attach objects to a report. "
             "Large objects can be read in byte-range windows."
         ),
         config_schema=S3Config,
@@ -1508,20 +1955,77 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
                     schema=QlikSenseOnPremCertCredentials,
                     scopes=["system"],
                 ),
-                # Per-user auth: the user contributes only their Qlik identity;
-                # the admin's certificate is merged underneath at query time
-                # (overlay). Qlik then evaluates their queries with their own
-                # stream access and Section Access rules.
-                "identity": AuthVariant(
-                    title="Qlik Identity (uses the connection's certificate)",
-                    schema=QlikSenseOnPremUserIdentityCredentials,
-                    scopes=["user"],
-                    overlay=True,
+            },
+        ),
+        # Per-user auth is "member_mapped": the admin binds User Directory /
+        # User ID to member attributes on this form, and each member acts as
+        # their own Qlik account with the connection's certificate. Members
+        # never name the account themselves (services/member_identity.py).
+        client_path="app.data_sources.clients.qlik_sense_onprem_client.QlikSenseOnPremClient",
+        requires_license="enterprise",
+    ),
+    "documentum": DataSourceRegistryEntry(
+        type="documentum",
+        category="files",
+        title="OpenText Documentum",
+        description=(
+            "Read and search documents in an OpenText Documentum repository through Documentum REST "
+            "Services. Documentum ACLs apply to every read; per-user access via OTDS impersonation or sign-in."
+        ),
+        config_schema=DocumentumConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                # Repository user/password (HTTP Basic). Per user, this is the
+                # bring-your-own-password path; it does not work for Entra-only
+                # OTDS users, who have no password OTDS can validate.
+                "userpass": AuthVariant(title="Username / Password", schema=DocumentumUserPassCredentials, scopes=["system", "user"]),
+                # A confidential OTDS OAuth client acting as its service user.
+                # System scope only — the client secret is admin-equivalent.
+                "otds_client": AuthVariant(title="OTDS OAuth client (service identity)", schema=DocumentumOtdsClientCredentials, scopes=["system"]),
+                # Per-user overlay: the user contributes only their login; the
+                # connection's OTDS client mints a token FOR them (token
+                # exchange), so Documentum runs the session as that user.
+                "otds_impersonation": AuthVariant(title="OTDS impersonation (uses the connection's OAuth client)", schema=DocumentumImpersonationCredentials, scopes=["user"], overlay=True),
+                # Per-user OTDS sign-in (authorization code); needs the OTDS
+                # client on the connection's system credentials.
+                "oauth": AuthVariant(title="Sign in with OTDS", schema=_DocumentumOAuthCredentials, scopes=["user"]),
+            },
+        ),
+        client_path="app.data_sources.clients.documentum_client.DocumentumClient",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+        requires_license="enterprise",
+        version="beta",
+    ),
+    "kms_lighthouse": DataSourceRegistryEntry(
+        type="kms_lighthouse",
+        category="files",
+        title="KMS Lighthouse",
+        description=(
+            "Search and read KMS Lighthouse knowledge articles and decision-tree scenarios (read-only, live). "
+            "KMS permissions apply to every call; per-user access with each person's own KMS login or token."
+        ),
+        config_schema=KmsLighthouseConfig,
+        credentials_auth=AuthOptions(
+            default="token",
+            by_auth={
+                "token": AuthVariant(title="API token (Bearer)", schema=KmsLighthouseTokenCredentials, scopes=["system", "user"]),
+                "userpass": AuthVariant(
+                    title="Password in URL (undocumented)",
+                    schema=KmsLighthouseUserPassCredentials, scopes=["system", "user"],
                 ),
             },
         ),
-        client_path="app.data_sources.clients.qlik_sense_onprem_client.QlikSenseOnPremClient",
+        client_path="app.data_sources.clients.kms_lighthouse_client.KmsLighthouseClient",
+        is_document_based=True,
+        data_shape="files",
+        # No catalog (ADR-1): search and browse are live, per identity.
+        catalog_ownership="none",
+        catalog_nouns=("document", "documents"),
         requires_license="enterprise",
+        version="beta",
     ),
     "sharepoint_onprem": DataSourceRegistryEntry(
         type="sharepoint_onprem",
@@ -1571,6 +2075,28 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         data_shape="files",
         catalog_ownership="shared",
         requires_license="enterprise",
+    ),
+    "intune": DataSourceRegistryEntry(
+        type="intune",
+        category="infra",
+        title="Microsoft Intune",
+        description="Query Intune device management — managed devices, compliance status per policy, configuration profiles, apps, discovered software and Autopilot — read-only through Microsoft Graph.",
+        config_schema=IntuneConfig,
+        credentials_auth=AuthOptions(default="service_principal", by_auth={
+            # App-only (client credentials) with read-only Graph application
+            # permissions. Intune data is tenant-wide inventory, so there is no
+            # per-user variant: a delegated token would need the user to hold
+            # an Intune RBAC role, which is an admin-only shape anyway.
+            "service_principal": AuthVariant(
+                title="Entra ID App (Service Principal)",
+                schema=IntuneCredentials,
+                scopes=["system"],
+            ),
+        }),
+        client_path="app.data_sources.clients.intune_client.IntuneClient",
+        data_shape="tables",
+        catalog_ownership="shared",
+        version="beta",
     ),
     "sharepoint_lists": DataSourceRegistryEntry(
         type="sharepoint_lists",
@@ -1638,7 +2164,6 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         data_shape="files",
         catalog_ownership="per_user",
         ui_form="integration",
-        requires_license="enterprise",
     ),
     "onenote": DataSourceRegistryEntry(
         type="onenote",
@@ -1711,7 +2236,6 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         catalog_ownership="per_user",
         ui_form="integration",
         catalog_nouns=("message", "messages"),
-        requires_license="enterprise",
     ),
     "gmail_mail": DataSourceRegistryEntry(
         type="gmail_mail",
@@ -1740,7 +2264,6 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         catalog_ownership="per_user",
         ui_form="integration",
         catalog_nouns=("message", "messages"),
-        requires_license="enterprise",
     ),
     "google_drive": DataSourceRegistryEntry(
         type="google_drive",
@@ -1761,6 +2284,15 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
                     schema=OAuthDelegatedCredentials,
                     scopes=["user"],
                 ),
+                # Purely shared: one Google identity for everyone. Users see
+                # whatever was shared with the service account's email; no
+                # per-user sign-in and no per-user Drive permissions.
+                "service_account": AuthVariant(
+                    title="Service Account (shared)",
+                    schema=GoogleDriveServiceAccountCredentials,
+                    scopes=["system"],
+                    catalog_ownership="shared",
+                ),
             },
         ),
         client_path="app.data_sources.clients.google_drive_client.GoogleDriveClient",
@@ -1768,7 +2300,6 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         data_shape="files",
         catalog_ownership="per_user",
         ui_form="integration",
-        requires_license="enterprise",
     ),
     "ms_fabric": DataSourceRegistryEntry(
         type="ms_fabric",
@@ -1905,6 +2436,38 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         client_path="app.data_sources.clients.infor_olap_client.InforOlapClient",
         requires_license="enterprise",
     ),
+    "infor_epm": DataSourceRegistryEntry(
+        type="infor_epm",
+        category="bi",
+        title="Infor EPM (Application Engine)",
+        description=(
+            "Query Infor d/EPM OLAP cubes via MDX through Application Engine processes published on the "
+            "ION API Gateway. Uses IFS/OAuth2 authentication — no OLAP Basic credentials required."
+        ),
+        config_schema=InforEpmConfig,
+        credentials_auth=AuthOptions(
+            default="ion_oauth",
+            by_auth={
+                "ion_oauth": AuthVariant(
+                    title="ION API Gateway",
+                    schema=InforEpmIonCredentials,
+                    scopes=["system"],
+                ),
+                "ion_service_account": AuthVariant(
+                    title="ION Service Account",
+                    schema=InforEpmServiceAccountCredentials,
+                    scopes=["system"],
+                ),
+                "bearer_token": AuthVariant(
+                    title="Bearer Token (testing)",
+                    schema=InforEpmTokenCredentials,
+                    scopes=["system"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.infor_epm_client.InforEpmClient",
+        requires_license="enterprise",
+    ),
     "analysis_services": DataSourceRegistryEntry(
         type="analysis_services",
         category="bi",
@@ -1946,6 +2509,11 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
                 "api_key": AuthVariant(
                     title="API Key",
                     schema=CustomAPIKeyCredentials,
+                    scopes=["system", "user"],
+                ),
+                "basic": AuthVariant(
+                    title="Email + API token (Basic)",
+                    schema=MCPBasicCredentials,
                     scopes=["system", "user"],
                 ),
                 "oauth_app": AuthVariant(
@@ -1992,6 +2560,39 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
         data_shape="tools",
         catalog_ownership="none",
         ui_form="browser",
+    ),
+    "remote_ssh": DataSourceRegistryEntry(
+        type="remote_ssh", title="Remote Server (SSH)", category="infra",
+        description="Inspect Linux or Windows logs over SSH without installing an agent. Maintenance follows connection policies and saved per-user permissions.",
+        setup_guide=[
+            SetupStep(title="Prepare the remote account", body="Use an SSH account with access to the intended logs. Agentless inspection uses existing Python 3 on Linux or PowerShell on Windows. No agent installation is needed. Configure allowed paths under Advanced settings; * allows all account-readable paths. The installed restricted reader is optional."),
+            SetupStep(title="Verify the server identity", body="Obtain the SSH host public key through a trusted administrator. BOW pins this key and refuses changed or unknown keys."),
+            SetupStep(title="Separate maintenance access", body="Choose shell approval or automatic execution policies. Use a separate account/connection when the inspection account is restricted to the reader. Remote privilege limits are configured on the server."),
+        ],
+        config_schema=RemoteSSHConfig,
+        credentials_auth=AuthOptions(default="key", by_auth={
+            "key": AuthVariant(title="SSH key / certificate", schema=SSHKeyCredentials, scopes=["system", "user"]),
+            "password": AuthVariant(title="Password", schema=SSHPasswordCredentials, scopes=["system", "user"]),
+            "keyboard_interactive": AuthVariant(title="Keyboard-interactive (single password; no interactive MFA)", schema=SSHPasswordCredentials, scopes=["system", "user"]),
+            "kerberos": AuthVariant(title="Kerberos keytab", schema=RemoteKerberosCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.remote_server_client.RemoteServerClient",
+        version="beta", is_connection=False, data_shape="tools", catalog_ownership="none",
+    ),
+    "remote_smb": DataSourceRegistryEntry(
+        type="remote_smb", title="Windows Logs (SMB)", category="infra",
+        description="Read and search IIS and application logs from dedicated Windows shares. Uses the account's share and NTFS permissions; no remote shell.",
+        setup_guide=[
+            SetupStep(title="Create a read-only log share", body="Share only the application and IIS log directories. Grant the account read/list access in both share and NTFS permissions, inherited by rotated logs. Avoid administrative drive shares such as d$."),
+            SetupStep(title="Allow network access", body="Allow TCP 445 from the BOW backend. No privileged container or host mount is required. SMB encryption is enabled by default; Kerberos additionally requires DNS, clock synchronization and KDC access."),
+        ],
+        config_schema=RemoteSMBConfig,
+        credentials_auth=AuthOptions(default="ntlm", by_auth={
+            "ntlm": AuthVariant(title="Domain / local account (NTLMv2)", schema=SMBPasswordCredentials, scopes=["system", "user"]),
+            "kerberos": AuthVariant(title="Kerberos keytab", schema=RemoteKerberosCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.remote_server_client.RemoteSMBClient",
+        version="beta", is_connection=False, data_shape="tools", catalog_ownership="none",
     ),
     "custom_api": DataSourceRegistryEntry(
         type="custom_api",
@@ -2100,6 +2701,21 @@ _TOOLS_NOTION = [
     "create-database", "update-database", "create-comment", "get-comments", "get-users",
     "get-self", "get-user",
 ]
+ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp/authv2"  # OAuth 2.1 + DCR
+ATLASSIAN_MCP_TOKEN_URL = "https://mcp.atlassian.com/v2/mcp"   # API tokens
+# Retired 2026-06-30; kept so old connections can be recognised and migrated.
+ATLASSIAN_LEGACY_SSE_URL = "https://mcp.atlassian.com/v1/sse"
+
+_TOOLS_GITLAB = [
+    "get_issue", "create_issue", "get_merge_request", "get_merge_request_diffs",
+    "get_merge_request_pipelines", "get_pipeline_jobs", "search", "semantic_code_search",
+]
+# Tool names from Atlassian's Bitbucket announcement (2026-04).
+_TOOLS_BITBUCKET = [
+    "bitbucketWorkspace", "bitbucketRepository", "bitbucketPullRequest",
+    "bitbucketBranch", "bitbucketCommit", "bitbucketPipeline", "bitbucketDeployment",
+]
+
 _TOOLS_ATLASSIAN = [
     "atlassianUserInfo", "getAccessibleAtlassianResources", "getConfluenceSpaces",
     "getConfluencePage", "getPagesInConfluenceSpace", "getConfluencePageAncestors",
@@ -2133,6 +2749,20 @@ _TOOLS_GOOGLE_DRIVE = [
     "get_file_metadata", "get_file_permissions", "create_file",
 ]
 
+_TOOLS_HUBSPOT = [
+    # Discovered live from HubSpot's MCP server (tools/list, 2026-09) — not a
+    # guess. `query_crm_data` is the notable one: HubSpot CRM over SQL.
+    "query_crm_data", "search_crm_objects", "get_crm_objects", "search_properties",
+    "get_properties", "discover_hubspot_schema", "search_owners", "get_user_details",
+    "get_organization_details", "manage_segment", "search_conversations",
+    "get_conversation_channel_metadata", "read_campaign_data",
+    "manage_campaign_objects", "get_campaign_attribution_reports",
+    "manage_marketing_email", "get_marketing_email_analytics", "manage_landing_page",
+    "get_content_analytics_report", "get_aeo_metrics", "manage_aeo_prompts",
+    "manage_aeo_recommendations", "manage_onboarding", "tool_guidance",
+    "submit_feedback",
+]
+
 MCP_PRESETS: List[McpPreset] = [
     McpPreset(key="monday", title="Monday", server_url="https://mcp.monday.com/mcp",
               allowed_auth=["dcr"], sample_tools=_TOOLS_MONDAY,
@@ -2140,9 +2770,38 @@ MCP_PRESETS: List[McpPreset] = [
     McpPreset(key="notion", title="Notion", server_url="https://mcp.notion.com/mcp",
               allowed_auth=["dcr"], sample_tools=_TOOLS_NOTION,
               description="Pages, databases and search across your Notion workspace."),
-    McpPreset(key="atlassian", title="Jira / Atlassian", server_url="https://mcp.atlassian.com/v1/sse",
-              transport="sse", allowed_auth=["dcr"], sample_tools=_TOOLS_ATLASSIAN,
+    # Atlassian retired the /v1/sse endpoint after 2026-06-30 (OAuth still
+    # succeeds but the MCP handshake 404s). /v1/mcp/authv2 is the Streamable
+    # HTTP endpoint Atlassian recommends for custom clients; same authorization
+    # server and DCR registration endpoint (verified by live discovery 2026-10).
+    # Existing connections are moved over by migration atlv201.
+    McpPreset(key="atlassian", title="Jira / Atlassian", server_url=ATLASSIAN_MCP_URL,
+              allowed_auth=["dcr"], sample_tools=_TOOLS_ATLASSIAN,
               description="Jira issues and Confluence pages."),
+    # Bitbucket Cloud is served by the same Atlassian Rovo MCP server, but its
+    # tools accept API-token auth only (no OAuth yet — Atlassian, 2026-04), and
+    # an org admin must enable API-token auth in Admin Hub → Rovo → MCP server.
+    # API tokens use their own endpoint (/v2/mcp — Atlassian's API-token doc;
+    # /v1/mcp/authv2 is the OAuth one). A personal token goes in as HTTP Basic
+    # (email:api_token); a service-account API key as Bearer.
+    McpPreset(key="bitbucket", title="Bitbucket", server_url=ATLASSIAN_MCP_TOKEN_URL,
+              auth="basic", allowed_auth=["basic", "bearer"], category="dev",
+              sample_tools=_TOOLS_BITBUCKET,
+              description=(
+                  "Bitbucket Cloud repos, pull requests and pipelines via Atlassian's MCP server "
+                  "(needs an Atlassian API token; an org admin must enable API-token auth)."
+              )),
+    # GitLab's official MCP server (GA in GitLab 19.5; all tiers). OAuth 2.1 +
+    # DCR with the single `mcp` scope, which discovery reads from the 401
+    # challenge (verified live 2026-10). A group owner (gitlab.com) or instance
+    # admin (self-managed) must allow MCP access first, or the server answers
+    # 404 after sign-in. Self-managed: https://<host>/api/v4/mcp (18.6+).
+    McpPreset(key="gitlab", title="GitLab", server_url="https://gitlab.com/api/v4/mcp",
+              allowed_auth=["dcr", "bearer"], category="dev", sample_tools=_TOOLS_GITLAB,
+              description=(
+                  "Issues, merge requests, pipelines and repository files from GitLab "
+                  "(a group owner must allow MCP access)."
+              )),
     McpPreset(key="linear", title="Linear", server_url="https://mcp.linear.app/mcp",
               allowed_auth=["dcr"], sample_tools=_TOOLS_LINEAR,
               description="Issues, projects and cycles from Linear."),
@@ -2157,6 +2816,32 @@ MCP_PRESETS: List[McpPreset] = [
                   scopes="read:user, repo, read:org",
               ),
               description="Repos, issues and PRs (needs a GitHub OAuth app)."),
+    # HubSpot's hosted CRM MCP server. No DCR — its AS metadata advertises no
+    # registration_endpoint (live probe 2026-09) — so the admin registers a
+    # HubSpot app, like github above. server_url is the bare ORIGIN: HubSpot
+    # serves MCP at the root and /mcp is a 404; since the connect form matches a
+    # preset by exact server_url, adding a path also breaks preset recognition in
+    # edit mode. Endpoints are the MCP-specific pair HubSpot advertises, not the
+    # classic app.hubspot.com/api.hubapi.com ones; it takes client_secret_post
+    # (our default → left unset) and PKCE S256. Scopes are declared on the app and
+    # gated by portal tier (scopes_supported is empty). NOTE: for a HubSpot *MCP
+    # Connector* app the `scope` parameter is not what grants access — a live
+    # sign-in (2026-09) returned a fixed 37-scope bundle from the app's own
+    # config, unrelated to the 4 scopes requested here. The value below is kept
+    # only as documentation of the minimum an admin should configure on the app;
+    # it neither widens nor narrows what HubSpot actually grants. No audience:
+    # HubSpot doesn't advertise RFC 8707, so we must not send `resource` on the
+    # token request. See docs/feedback-loops/hubspot-mcp-preset.md.
+    McpPreset(key="hubspot", title="HubSpot", server_url="https://mcp.hubspot.com",
+              auth="oauth_app", allowed_auth=["oauth_app"], category="services",
+              oauth_defaults=McpAuthDefaults(
+                  authorize_url="https://mcp.hubspot.com/oauth/authorize/user",
+                  token_url="https://mcp.hubspot.com/oauth/v3/token",
+                  scopes=("oauth, crm.objects.contacts.read, "
+                          "crm.objects.companies.read, crm.objects.deals.read"),
+              ),
+              sample_tools=_TOOLS_HUBSPOT,
+              description="CRM records, SQL queries, and marketing data from HubSpot (needs a HubSpot app)."),
     # Google first-party remote MCP servers (per-user OAuth via a Google OAuth
     # client; no DCR — the authorize flow audience-binds the token to the MCP
     # resource via RFC 8707). Files come back as blobs → materialized for analysis.
@@ -2202,6 +2887,34 @@ def get_entry(ds_type: str) -> DataSourceRegistryEntry:
     if entry.dev_only and not _is_dev_environment():
         raise ValueError(f"Unknown data source type: {ds_type}")
     return entry
+
+
+def catalog_ownership_for(ds_type: str, config=None) -> str:
+    """The catalog ownership of a connection of `ds_type` with `config`.
+
+    Honors a per-auth-variant override (AuthVariant.catalog_ownership), so a
+    Google Drive connection on a service account is "shared" while one on
+    user OAuth stays "per_user". Unknown types read as "shared".
+    """
+    entry = REGISTRY.get(ds_type)
+    if not entry:
+        return "shared"
+    if isinstance(config, str):
+        try:
+            import json as _json
+            config = _json.loads(config)
+        except ValueError:
+            config = None
+    auth_type = (config or {}).get("auth_type") if isinstance(config, dict) else None
+    variant = (entry.credentials_auth.by_auth or {}).get(auth_type or entry.credentials_auth.default)
+    if variant and variant.catalog_ownership:
+        return variant.catalog_ownership
+    return entry.catalog_ownership
+
+
+def connection_catalog_ownership(connection) -> str:
+    """`catalog_ownership_for` for a Connection row."""
+    return catalog_ownership_for(getattr(connection, "type", None), getattr(connection, "config", None))
 
 
 def is_overlay_auth(ds_type: str, auth_mode: str) -> bool:
@@ -2251,6 +2964,7 @@ def list_available_data_sources(include_tool_providers: bool = True) -> list[dic
             "requires_license": e.requires_license,
             "is_connection": e.is_connection,
             "data_shape": e.data_shape,
+            "catalog_nouns": list(e.catalog_nouns) if e.catalog_nouns else None,
             "catalog_ownership": e.catalog_ownership,
             "ui_form": e.ui_form,
             "category": e.category,
@@ -2264,11 +2978,6 @@ def list_available_data_sources(include_tool_providers: bool = True) -> list[dic
             and (e.is_connection or include_tool_providers)
         )
     ]
-
-
-# Authorization-server hosts that differ from the resource host (for the DCR
-# SSRF allowlist below).
-_EXTRA_DCR_HOSTS = {"auth.atlassian.com", "cf.mcp.atlassian.com", "github.com"}
 
 
 def mcp_presets() -> list[dict]:
@@ -2364,20 +3073,6 @@ def custom_api_preset(key: str) -> Optional[CustomApiPreset]:
     return next((p for p in CUSTOM_API_PRESETS if p.key == key), None)
 
 
-def allowed_dcr_hosts() -> set:
-    """Hostnames DCR discovery/registration may target (SSRF guard): every
-    preset server_url host plus the known authorization-server hosts. Non-preset
-    custom URLs require an explicit admin allowlist (not implemented here)."""
-    hosts = set()
-    for p in MCP_PRESETS:
-        if p.server_url:
-            h = urlsplit(p.server_url).netloc
-            if h:
-                hosts.add(h)
-    hosts.update(_EXTRA_DCR_HOSTS)
-    return hosts
-
-
 def config_schema_for(ds_type: str) -> Type[BaseModel]:
     return get_entry(ds_type).config_schema
 
@@ -2406,7 +3101,30 @@ def supports_user_auth(ds_type: str) -> bool:
         variants = get_entry(ds_type).credentials_auth.by_auth or {}
     except ValueError:
         return True
-    return any("user" in (v.scopes or []) for v in variants.values())
+    if any("user" in (v.scopes or []) for v in variants.values()):
+        return True
+    # Admin-mapped identity: per-user auth binds credential fields to member
+    # attributes instead of asking members for credentials.
+    return bool(member_bindable_fields(ds_type))
+
+
+def member_bindable_fields(ds_type: str, auth_type: Optional[str] = None) -> list[str]:
+    """Credential fields an admin may bind to a member attribute under
+    "Require user authentication" (``ui:memberBindable`` in the schema of
+    ``auth_type``, default variant when None). [] for most types."""
+    try:
+        entry = get_entry(ds_type)
+    except ValueError:
+        return []
+    variant = entry.credentials_auth.by_auth.get(auth_type or entry.credentials_auth.default)
+    if variant is None:
+        return []
+    return [
+        name
+        for name, field in variant.schema.model_fields.items()
+        if isinstance(field.json_schema_extra, dict)
+        and field.json_schema_extra.get("ui:memberBindable") is True
+    ]
 
 
 def default_credentials_schema_for(ds_type: str) -> Type[BaseModel]:
@@ -2452,6 +3170,13 @@ def data_shape_for(ds_type: str) -> str:
     """Data shape for a type; 'tables' for unknown types (SQL-style default)."""
     entry = REGISTRY.get(ds_type)
     return entry.data_shape if entry is not None else "tables"
+
+
+def catalog_nouns_override(ds_type: str) -> Optional[list]:
+    """The entry's own (singular, plural) catalog noun when it sets one, for
+    the UI; None leaves the UI on its data_shape noun."""
+    entry = REGISTRY.get(ds_type)
+    return list(entry.catalog_nouns) if entry is not None and entry.catalog_nouns else None
 
 
 def catalog_nouns_for(ds_type: str) -> tuple:

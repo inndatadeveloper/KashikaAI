@@ -47,6 +47,7 @@ async def run_wait_wake(
     organization_id: str,
     reason: str,
     attempt: int = 1,
+    system_completion_id: str | None = None,
 ) -> None:
     """APScheduler callback: resume the agent on ``report_id``.
 
@@ -75,6 +76,15 @@ async def run_wait_wake(
         if not user or not organization:
             logger.warning("wait wake %s: user/org gone", job_id)
             return
+        # The job was armed while the user could act. Re-check at fire time:
+        # a deactivated or removed user must not keep driving the agent.
+        from app.core.permission_resolver import principal_can_act_in_org
+        if not await principal_can_act_in_org(db, user, str(organization.id)):
+            logger.warning("wait wake %s: user %s deactivated or left org; dropping", job_id, user_id)
+            return
+
+        from app.services.conversation_surface import parent_app_surface
+        surface = await parent_app_surface(db, system_completion_id)
 
         wake_prompt = (
             f"[Automatic resume after a scheduled wait] The wait you requested has "
@@ -94,8 +104,10 @@ async def run_wait_wake(
                 trigger_source="wait",
                 message_type="wait_resume_event",
                 instruction=wake_prompt,
+                parent_completion_id=system_completion_id,
                 # Structured fields for locale-aware frontend rendering.
                 meta={"reason": reason[:200]},
+                **surface,
             )
         except Exception as e:
             logger.error("wait wake %s: resume failed: %s", job_id, e)
@@ -113,6 +125,7 @@ class WaitService:
         reason: str,
         delay_minutes: int,
         attempt: int = 1,
+        system_completion_id: str | None = None,
     ) -> dict:
         """Register a one-shot resume job. Returns {job_id, wake_at (ISO UTC)}."""
         token = uuid.uuid4().hex[:12]
@@ -131,6 +144,7 @@ class WaitService:
                 "organization_id": organization_id,
                 "reason": reason,
                 "attempt": int(attempt),
+                "system_completion_id": system_completion_id,
             },
             replace_existing=True,
             misfire_grace_time=3600,  # if the worker was down, still resume within an hour
@@ -174,6 +188,29 @@ class WaitService:
             logger.warning("list_waits(%s) failed: %s", report_id, e)
         out.sort(key=lambda j: j.get("wake_at") or "")
         return out
+
+    def cancel_waits_for_user(self, user_id: str, organization_id: str | None = None) -> list[str]:
+        """Cancel every pending wait armed by ``user_id``. With ``organization_id``,
+        only waits in that org. Called on deprovisioning. ``run_wait_wake``
+        re-checks at fire time anyway, so this just clears dead jobs early.
+        """
+        cancelled: list[str] = []
+        try:
+            jobs = scheduler.get_jobs()
+        except Exception as e:
+            logger.warning("cancel_waits_for_user(%s) failed: %s", user_id, e)
+            return cancelled
+        for job in jobs:
+            if not str(job.id).startswith(_JOB_PREFIX):
+                continue
+            kwargs = getattr(job, "kwargs", {}) or {}
+            if str(kwargs.get("user_id")) != str(user_id):
+                continue
+            if organization_id is not None and str(kwargs.get("organization_id")) != str(organization_id):
+                continue
+            if self.cancel_wait(str(job.id)):
+                cancelled.append(str(job.id))
+        return cancelled
 
     def cancel_waits_for_report(self, report_id: str) -> list[str]:
         """Cancel every pending wait on a report. Returns the cancelled job ids."""

@@ -15,12 +15,67 @@
  *     toast.add({ description: getErrorMessage(e, t('errors.generic')) })
  *   }
  */
+/**
+ * The catalog keys an error code may live under, in lookup order. Most codes
+ * hold a dot ("artifact.not_found") and the catalog stores them as flat keys
+ * under `errors`, but vue-i18n reads a dotted path as nesting
+ * (errors → artifact → not_found), so the flat key needs bracket form.
+ */
+export function errorCatalogKeys(code: string): string[] {
+  return [`errors.${code}`, `errors['${code}']`]
+}
+
+/**
+ * The localized message for an AppError payload, or null when the catalog
+ * has no entry for its code. The catalog wins over the server's `detail`
+ * whenever it has one: `detail` is the server's English (backend/AGENTS.md:
+ * "the frontend localizes via the error_code").
+ */
+export function catalogMessage(
+  payload: { error_code?: string; params?: Record<string, unknown> },
+  t: (key: string, params: Record<string, unknown>) => string,
+  te: (key: string) => boolean,
+): string | null {
+  const code = payload.error_code
+  if (!code) return null
+  const key = errorCatalogKeys(code).find((k) => te(k))
+  return key ? t(key, (payload.params ?? {}) as Record<string, unknown>) : null
+}
+
+/**
+ * Error codes whose `detail` is a specific, field-level reason that must reach
+ * the user verbatim rather than be replaced by the generic localized line.
+ * Resource writes return these from the artifact-resource SDK; the detail names
+ * the field and what was wrong (too long, required, must be unique, …).
+ */
+export const DETAIL_FIRST_CODES = new Set<string>([
+  'ARTIFACT_RESOURCE_VALIDATION',
+  'ARTIFACT_RESOURCE_CONFLICT',
+])
+
+/**
+ * The server's specific `detail` for a code whose detail must reach the user
+ * verbatim, or null to fall back to the localized catalog line. Pure, so the
+ * precedence is unit-tested without an i18n context.
+ */
+export function specificDetail(payload: { error_code?: string; detail?: unknown }): string | null {
+  if (
+    payload.error_code &&
+    DETAIL_FIRST_CODES.has(payload.error_code) &&
+    typeof payload.detail === 'string' &&
+    payload.detail
+  ) {
+    return payload.detail
+  }
+  return null
+}
+
 export function useErrorMessage() {
   const { t, te } = useI18n()
 
   function extractPayload(err: unknown): {
     error_code?: string
-    detail?: string
+    detail?: string | Array<{ loc?: unknown[]; msg?: string }>
     message?: string
     params?: Record<string, unknown>
   } {
@@ -38,15 +93,23 @@ export function useErrorMessage() {
 
   function getErrorMessage(err: unknown, fallback?: string): string {
     const payload = extractPayload(err)
-    const code = payload.error_code
-    if (code) {
-      const key = `errors.${code}`
-      if (te(key)) {
-        return t(key, (payload.params ?? {}) as Record<string, unknown>)
-      }
-    }
+    // A few codes carry a specific, field-level reason in `detail` (which field
+    // failed validation, or which unique value already exists). For those the
+    // generic localized catalog line ("Invalid resource request") would hide the
+    // only useful part, so the server's detail wins. Every other code localizes.
+    const specific = specificDetail(payload)
+    if (specific) return specific
+    const localized = catalogMessage(payload, t, te)
+    if (localized) return localized
     // Fall back to server-provided English string, then caller fallback, then generic.
     if (typeof payload.detail === 'string' && payload.detail) return payload.detail
+    // FastAPI validation responses are arrays, not localized AppError envelopes.
+    // Include only the field path and message, never echoed input values.
+    if (Array.isArray(payload.detail)) {
+      const messages = payload.detail.slice(0, 5).filter(item => item && typeof item.msg === 'string')
+        .map(item => `${(item.loc || []).filter(part => part !== 'body').join('.')}: ${item.msg}`)
+      if (messages.length) return messages.join('; ')
+    }
     if (typeof payload.message === 'string' && payload.message) return payload.message
     if (fallback) return fallback
     return t('errors.generic')

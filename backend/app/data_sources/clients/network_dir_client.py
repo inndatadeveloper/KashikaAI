@@ -18,8 +18,10 @@ capabilities otherwise so runtime resolution rejects a write against a
 read-only dir).
 """
 from __future__ import annotations
+from app.data_sources.clients.progress import discovery_progress
 
 import hashlib
+from contextlib import contextmanager
 import io
 import json
 import mimetypes
@@ -38,26 +40,35 @@ from app.data_sources.clients._document_text import (
     extract_document_text,
     extract_pdf_pages_text,
 )
+from app.data_sources.clients._email_text import EMAIL_EXTS
 from app.data_sources.clients._file_source_common import (
+    EXCEL_EXTS,
+    read_excel_sheet,
     INDEX_CONTENT,
     INDEX_METADATA,
     INDEX_NONE,
+    FileTooLargeError,
     GlobScopeError,
     NamedBytes,
+    ScopeEscapeError,
+    UTF8_SLACK,
+    byte_limit,
+    byte_window,
     globs_from_str,
     legacy_fs_candidates,
     normalize_index_mode,
     path_matches_globs,
     recover_filename,
 )
-from app.data_sources.clients._keywords import extract_keywords
+from app.data_sources.clients._keywords import extract_file_keywords
+from app.data_sources.clients.progress import IndexingCancelled
 from app.data_sources.clients.base import Capability, DataSourceClient
 
 
 # Extensions we parse into DataFrames / structured objects; everything else is
 # returned as text (if decodable) or raw bytes.
 TABULAR_EXTS = {"csv", "tsv", "xlsx", "xls"}
-TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml", "xml", "py", "sql"}
+TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml", "xml", "py", "sql", "ndjson", "jsonl"}
 # Rich document formats (pdf/docx/pptx) we extract plain text from so their
 # contents are readable and searchable — see _document_text.DOC_EXTS.
 # Extensions we're willing to scan for content matches in search_files: text,
@@ -65,6 +76,59 @@ TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml", "xml", "p
 GREPPABLE_EXTS = TABULAR_EXTS | TEXT_EXTS | DOC_EXTS
 
 DEFAULT_WINDOW_BYTES = 1024 * 1024  # 1 MiB default page for windowed reads
+
+
+# Roots refused when ``security.network_dir_allowed_roots`` is unset. A root
+# is refused when it IS one of these, sits BELOW one, or CONTAINS one (so `/`
+# and `/home/user` holding the app checkout are refused too). Unset is a
+# denylist rather than "block everything" so existing installs pointing at a
+# share (/mnt, /srv, /data, /home/<user>/share, …) keep working.
+_SYSTEM_DIRS = (
+    "/", "/etc", "/proc", "/sys", "/root", "/var/lib", "/var/run", "/run",
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/dev",
+)
+
+
+def _app_dirs() -> List[str]:
+    """The app's own directories: backend checkout (code, db/, uploads/,
+    configs/), the working dir uploads/ resolve against, and the
+    bow-config file's directory."""
+    dirs = [str(Path(__file__).resolve().parents[3]), os.getcwd()]
+    cfg = os.environ.get("BOW_CONFIG_PATH")
+    if cfg:
+        dirs.append(str(Path(cfg).resolve().parent))
+    return dirs
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def check_network_dir_root(root_path: str) -> Path:
+    """Resolve ``root_path`` (all symlinks followed) and refuse roots outside
+    policy. Raises ValueError. With ``security.network_dir_allowed_roots`` set
+    the realpath must be inside one listed prefix; unset, system and app
+    directories are refused (see ``_SYSTEM_DIRS``)."""
+    root = Path(root_path).expanduser().resolve()
+    allowed = None
+    try:
+        from app.settings.config import settings
+        allowed = settings.bow_config.security.network_dir_allowed_roots
+    except Exception:
+        allowed = None
+    if allowed:
+        if not any(_is_within(root, Path(a).expanduser().resolve()) for a in allowed if a):
+            raise ValueError("Directory path is outside the allowed network directory roots")
+        return root
+    for d in (*_SYSTEM_DIRS, *_app_dirs()):
+        base = Path(d).resolve()
+        if root == base or _is_within(base, root) or (str(base) != "/" and _is_within(root, base)):
+            raise ValueError("Directory path points at a protected system or application directory")
+    return root
 
 
 def _ext(name: str) -> str:
@@ -91,6 +155,32 @@ class NetworkDirClient(DataSourceClient):
     # Local FS walk is cheap → list files live, per-connection (see base).
     cheap_live_listing = True
 
+    # Root-policy exemption for app-owned directories (see
+    # ``for_app_owned_dir``). Deliberately NOT an ``__init__`` parameter:
+    # connection configs are splatted into the constructor
+    # (``Connection.get_client`` → ``ClientClass(**config)``), so any keyword
+    # here would be reachable from a user-saved network_dir connection.
+    _root_policy_exempt = False
+
+    @classmethod
+    def for_app_owned_dir(cls, root_path: str, **kwargs) -> NetworkDirClient:
+        """Internal constructor for a client over one of the app's OWN
+        directories (``uploads/files`` under the backend checkout), skipping
+        ``check_network_dir_root``.
+
+        That check exists so a user-configured network_dir connection cannot
+        point at the app's code, db or uploads. The session-file shim
+        (``SessionFileClient``) is not user input: it serves the single upload
+        row the report owns from the directory the app wrote it to — which is
+        exactly the directory the policy refuses on a default install. Root
+        confinement in ``_resolve`` still applies. Never call this with a path
+        taken from a connection config.
+        """
+        self = cls.__new__(cls)
+        self._root_policy_exempt = True
+        self.__init__(root_path=root_path, **kwargs)
+        return self
+
     def __init__(
         self,
         root_path: Optional[str] = None,
@@ -107,6 +197,8 @@ class NetworkDirClient(DataSourceClient):
     ):
         super().__init__()
         self.root_path = (root_path or "").strip()
+        if self.root_path:
+            self._checked_root()
         self.allowed_extensions = self._parse_exts(allowed_extensions)
         # Include-globs scope the connection to matching files AND act as an
         # access boundary enforced in `_resolve` (a read of a real-but-off-glob
@@ -149,10 +241,17 @@ class NetworkDirClient(DataSourceClient):
             return True
         return _ext(name) in self.allowed_extensions
 
+    def _checked_root(self) -> Path:
+        """Resolve ``root_path`` through the connection-root policy, or only
+        through the filesystem for an app-owned root (``for_app_owned_dir``)."""
+        if self._root_policy_exempt:
+            return Path(self.root_path).expanduser().resolve()
+        return check_network_dir_root(self.root_path)
+
     def _root(self) -> Path:
         if not self.root_path:
             raise ValueError("root_path is required for a network directory connection")
-        root = Path(self.root_path).expanduser().resolve()
+        root = self._checked_root()
         if not root.exists():
             raise ValueError(f"Directory does not exist: {self.root_path}")
         if not root.is_dir():
@@ -170,6 +269,16 @@ class NetworkDirClient(DataSourceClient):
             raise
         except Exception:
             return None
+
+    @staticmethod
+    def _inside_root(path: Path, root: Path) -> bool:
+        """True when `path`'s realpath (all symlinks followed) is `root` or
+        below it. `root` must already be resolved (see `_root`)."""
+        try:
+            path.resolve().relative_to(root)
+            return True
+        except (ValueError, OSError, RuntimeError):
+            return False
 
     def _resolve(
         self, rel_or_id: str, *, must_exist: bool = True, enforce_scope: bool = True
@@ -220,7 +329,7 @@ class NetworkDirClient(DataSourceClient):
         try:
             rel = resolved.relative_to(root)
         except ValueError:
-            raise ValueError(f"Path escapes the connection root: {rel_or_id}")
+            raise ScopeEscapeError(f"Path escapes the connection root: {rel_or_id}")
         # Access boundary: if include-globs are configured, the resolved path
         # (relative to root) must match one — otherwise a read/attach of a
         # real-but-out-of-scope file (e.g. a `.env` next to the decks) is
@@ -277,6 +386,18 @@ class NetworkDirClient(DataSourceClient):
         how to map the recovered id back to the on-disk bytes."""
         return recover_filename(path.relative_to(self._root()).as_posix())
 
+    def _entries(self, paths) -> List[Dict[str, Any]]:
+        """`_entry` over a listing, skipping files that vanished between the
+        walk and the stat (temp files, a concurrent delete): the listing is a
+        snapshot, and one missing entry must not fail the whole call."""
+        out: List[Dict[str, Any]] = []
+        for p in paths:
+            try:
+                out.append(self._entry(p))
+            except FileNotFoundError:
+                continue
+        return out
+
     def _entry(self, path: Path) -> Dict[str, Any]:
         stat = path.stat()
         rel = self._rel_id(path)
@@ -318,6 +439,12 @@ class NetworkDirClient(DataSourceClient):
         for p in walker:
             if not p.is_file():
                 continue
+            # A symlink whose real target leaves root is never surfaced: it
+            # would leak the target's name/size/mtime in the listing and feed
+            # an outside file to the content indexer. `_resolve` rejects reads
+            # of it too; in-root symlinks stay visible.
+            if not self._inside_root(p, root):
+                continue
             if self._is_junk(p.name):
                 continue
             if not self._allowed(p.name):
@@ -353,7 +480,7 @@ class NetworkDirClient(DataSourceClient):
         rec = self.recursive if recursive is None else bool(recursive)
         files = self._iter_files(base, rec)
         files.sort(key=lambda p: p.as_posix().lower())
-        return [self._entry(p) for p in files]
+        return self._entries(files)
 
     def read_file(
         self,
@@ -393,8 +520,9 @@ class NetworkDirClient(DataSourceClient):
 
         # Windowed (ranged) read — same contract as S3's _read_window: a raw
         # byte window plus a cursor (next_cursor/total_size/eof) to page through
-        # arbitrarily large files. No parsing, no attachment. Text windows snap
-        # to the last complete newline so paging never splits a line.
+        # arbitrarily large files. No parsing, no attachment. The requested
+        # range, adjusted by at most 3 bytes at an edge so a multi-byte
+        # character is never split (see byte_window).
         if offset is not None:
             return self._read_window(path, int(offset), length)
 
@@ -439,8 +567,8 @@ class NetworkDirClient(DataSourceClient):
             return pd.read_csv(io.BytesIO(content))
         if ext == "tsv":
             return pd.read_csv(io.BytesIO(content), sep="\t")
-        if ext in ("xlsx", "xls"):
-            return pd.read_excel(io.BytesIO(content), sheet_name=sheet or 0)
+        if ext in EXCEL_EXTS:
+            return read_excel_sheet(content, sheet, trim=False)
         if ext == "json":
             try:
                 return json.loads(content.decode("utf-8", errors="replace"))
@@ -457,54 +585,19 @@ class NetworkDirClient(DataSourceClient):
     def _read_window(self, path: Path, offset: int, length: Optional[int]) -> Dict[str, Any]:
         """Ranged byte read of a local file → a window plus a cursor to page
         forward. Mirrors S3Client._read_window so the agent sees ONE contract
-        across file sources: text windows snap back to the last complete newline
-        (unless at EOF or the window has no newline); binary windows are base64.
+        across file sources (byte_window): the requested byte range, widened by
+        at most 3 bytes at the end / narrowed by at most 3 at the start so a
+        multi-byte character is never split, with `next_cursor` at the first
+        byte not returned; binary windows are base64.
         """
-        import base64 as _b64
-
         if offset < 0:
             raise ValueError("offset must be >= 0")
         window = int(length) if length else DEFAULT_WINDOW_BYTES
         total = path.stat().st_size
         with open(path, "rb") as fh:
             fh.seek(offset)
-            data = fh.read(window)
-
-        raw_end = offset + len(data)
-        eof = raw_end >= total
-
-        try:
-            text = data.decode("utf-8")
-            is_text = True
-        except UnicodeDecodeError:
-            is_text = False
-
-        if is_text:
-            content = text
-            next_cursor = raw_end
-            if not eof:
-                nl = text.rfind("\n")
-                if nl != -1 and nl + 1 < len(text):
-                    content = text[: nl + 1]
-                    next_cursor = offset + len(content.encode("utf-8"))
-            return {
-                "content": content,
-                "encoding": "text",
-                "offset": offset,
-                "length": len(content.encode("utf-8")),
-                "next_cursor": None if eof else next_cursor,
-                "total_size": total,
-                "eof": eof,
-            }
-        return {
-            "content": _b64.b64encode(data).decode("ascii"),
-            "encoding": "base64",
-            "offset": offset,
-            "length": len(data),
-            "next_cursor": None if eof else raw_end,
-            "total_size": total,
-            "eof": eof,
-        }
+            data = fh.read(window + UTF8_SLACK)
+        return byte_window(data, offset, total, window)
 
     def _file_text(self, path: Path, max_chars: int = 200_000) -> str:
         """Extract plain text from a greppable file (doc/csv/tsv/text) for
@@ -514,6 +607,9 @@ class NetworkDirClient(DataSourceClient):
         if ext not in GREPPABLE_EXTS:
             return ""
         try:
+            if ext in TEXT_EXTS | {"csv", "tsv"}:
+                with path.open("rb") as stream:
+                    return stream.read(max_chars).decode("utf-8", errors="ignore")
             if self.max_file_bytes and path.stat().st_size > self.max_file_bytes:
                 return ""
             if ext in DOC_EXTS:
@@ -531,51 +627,121 @@ class NetworkDirClient(DataSourceClient):
                 return "\n".join(parts)[:max_chars]
             # csv / tsv / plain text
             return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+        except IndexingCancelled:
+            raise
         except Exception:
             return ""
 
-    def read_raw_bytes(self, file_id: str) -> Tuple[bytes, str, Optional[str]]:
+    def read_raw_bytes(
+        self, file_id: str, *, max_bytes: Optional[int] = None
+    ) -> Tuple[bytes, str, Optional[str]]:
         """Return the file's raw bytes + name + mime, unparsed. Used by the
         attach_file tool to persist the ORIGINAL file (a real .pdf/.xlsx) rather
-        than a serialized/reparsed copy."""
+        than a serialized/reparsed copy. `max_bytes` tightens the connection's
+        own cap for this read (the file browser's preview budget)."""
         path = self._resolve(file_id, must_exist=True)
         if not path.is_file():
             raise ValueError(f"Not a file: {file_id}")
-        if self.max_file_bytes and path.stat().st_size > self.max_file_bytes:
-            raise ValueError(
+        limit = byte_limit(self.max_file_bytes, max_bytes)
+        if limit and path.stat().st_size > limit:
+            raise FileTooLargeError(
                 f"File {file_id} exceeds the "
-                f"{self.max_file_bytes / 1024 / 1024:.0f} MB limit."
+                f"{limit / 1024 / 1024:.0f} MB limit."
             )
         display = recover_filename(path.name)
         mime, _ = mimetypes.guess_type(display)
         return path.read_bytes(), display, mime
 
     def search_files(
-        self, query: str, max_results: int = 200, content: bool = True, **_
+        self, query: str, max_results: int = 200, content: bool = True,
+        deadline=None, cancel_check=None, max_total_bytes=100_000_000, **_,
     ) -> List[Dict[str, Any]]:
-        """Live filename + content search under root (the exhaustive fallback).
+        """Bounded live search. Partial coverage raises SearchStopped with hits.
 
-        A file matches if the (case-insensitive) query is a substring of its
-        relative path, OR appears in its extracted content. Mirrors `grep -ril`
-        + a filename check. Fast keyword search runs at the tool layer against
-        the indexed catalog; this is what the tool falls back to for the
-        not-yet-indexed / deep case.
+        Text uses the streaming scanner; documents retain bounded extraction.
+        For resumable deep text search use grep_files and its byte cursor.
         """
-        root = self._root()
-        q = (query or "").strip().lower()
+        import time
+        from app.data_sources.clients.base import SearchStopped
+        from app.data_sources.clients._streaming_grep import run_streaming_grep
+        q = (query or "").strip()
         if not q:
             return []
-        results: List[Dict[str, Any]] = []
-        for p in self._iter_files(root, recursive=True):
-            rel = self._rel_id(p).lower()
-            matched = q in rel
+        deadline = deadline if deadline is not None else time.monotonic() + 60
+        results, incomplete = [], None
+        remaining_bytes = max(0, int(max_total_bytes))
+        files = self._iter_files(self._root(), recursive=True)
+        if self._last_walk_truncated:
+            incomplete = "catalog_limit"
+        for path in files:
+            if (cancel_check and cancel_check()) or time.monotonic() >= deadline:
+                raise SearchStopped("deadline", results)
+            try:
+                entry = self._entry(path)
+            except FileNotFoundError:
+                continue
+            matched = q.casefold() in self._rel_id(path).casefold()
             if not matched and content:
-                matched = q in self._file_text(p).lower()
+                if remaining_bytes <= 0:
+                    incomplete = incomplete or "byte_budget"
+                    continue  # Filename matches remain available without content I/O.
+                if _ext(path.name) in DOC_EXTS | {"xlsx", "xls"}:
+                    if entry["size"] > remaining_bytes:
+                        incomplete = incomplete or "byte_budget"
+                        continue
+                    text = self._file_text(path)
+                    remaining_bytes -= entry["size"]
+                    matched = q.casefold() in text.casefold()
+                    if not matched and (len(text) >= 200_000 or (self.max_file_bytes and entry["size"] > self.max_file_bytes)):
+                        incomplete = incomplete or "extraction_limit"
+                elif _ext(path.name) in GREPPABLE_EXTS:
+                    sweep = run_streaming_grep(
+                        candidates=[entry], open_stream=self._open_grep_stream,
+                        pattern=q, is_regex=False, ignore_case=True,
+                        first_match_per_file=True, cancel_check=cancel_check,
+                        max_total_bytes=remaining_bytes,
+                        time_budget_seconds=max(0.001, deadline-time.monotonic()))
+                    remaining_bytes -= sweep["bytes_read"]
+                    matched = bool(sweep["matches"])
+                    if not sweep["coverage_complete"]:
+                        incomplete = incomplete or (sweep["stop_reason"] if sweep["next_cursor"] else "skipped_files")
             if matched:
-                results.append(self._entry(p))
+                results.append(entry)
                 if len(results) >= max_results:
-                    break
+                    return results
+        if incomplete:
+            raise SearchStopped(incomplete, results)
         return results
+
+    @contextmanager
+    def _open_grep_stream(self, entry, offset, expected_version, check=lambda: None):
+        from app.data_sources.clients._streaming_grep import FileChanged
+        from app.data_sources.clients._local_grep_stream import LocalGrepStream
+        path = self._resolve(entry["id"], must_exist=True)
+        with path.open("rb") as stream:
+            if _ext(path.name) not in EMAIL_EXTS:
+                tracked = LocalGrepStream(stream, path, offset, expected_version, check)
+                yield tracked, tracked, tracked.size
+                tracked.validate()
+                return
+            # Rendered email offsets do not correspond to source bytes, so
+            # keep strict source identity and bounded extraction for emails.
+            def identity():
+                stat = os.fstat(stream.fileno())
+                return f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}"
+            version = identity()
+            if expected_version and expected_version != version:
+                raise FileChanged()
+            from app.data_sources.clients._streaming_grep import ScanStopped
+            cap = min(self.max_file_bytes or 20_000_000, 20_000_000)
+            if os.fstat(stream.fileno()).st_size > cap:
+                raise ScanStopped("too_large")
+            data = self._file_text(path, max_chars=cap).encode("utf-8")
+            with io.BytesIO(data) as rendered:
+                rendered.seek(offset)
+                yield rendered, version, len(data)
+            if identity() != version:
+                raise FileChanged()
 
     def grep_files(
         self,
@@ -595,10 +761,11 @@ class NetworkDirClient(DataSourceClient):
         max_bytes_per_file: Optional[int] = None,
         cursor: Optional[str] = None,
         time_budget_seconds: float = 60.0,
+        cancel_check=None,
         **_,
     ) -> Dict[str, Any]:
         """Line-level grep under root: matching lines + context + sweep
-        accounting (see `_grep_common.run_grep_sweep` for the contract).
+        accounting (see `_streaming_grep.run_streaming_grep` for the contract).
 
         Candidates go through the SAME scoping as every other read: explicit
         file_ids resolve via `_resolve` (an off-glob id is reported as an
@@ -611,7 +778,6 @@ class NetworkDirClient(DataSourceClient):
             DEFAULT_MAX_BYTES_PER_FILE,
             SKIP_ACCESS_DENIED,
             SKIP_NOT_FOUND,
-            run_grep_sweep,
         )
 
         root = self._root()
@@ -642,19 +808,21 @@ class NetworkDirClient(DataSourceClient):
                     fnmatch.fnmatch(p.name.lower(), pat) or fnmatch.fnmatch(rel.lower(), pat)
                 ):
                     continue
-                candidates.append({"id": rel, "path": rel, "size": p.stat().st_size})
-
-        def _read(entry: Dict[str, Any]) -> bytes:
-            return self._resolve(entry["id"], must_exist=True).read_bytes()
+                try:
+                    size = p.stat().st_size
+                except FileNotFoundError:
+                    continue  # vanished between the walk and the stat
+                candidates.append({"id": rel, "path": rel, "size": size})
 
         scope_key = "|".join([
             "network_dir", self.root_path, str(folder_id or ""), str(name_pattern or ""),
             str(bool(recursive)), ",".join(sorted(str(f) for f in (file_ids or []))),
             pattern, str(bool(is_regex)), str(bool(ignore_case)),
         ])
-        return run_grep_sweep(
+        from app.data_sources.clients._streaming_grep import run_streaming_grep
+        result = run_streaming_grep(
             candidates=candidates,
-            read_bytes=_read,
+            open_stream=self._open_grep_stream,
             pattern=pattern,
             is_regex=is_regex,
             ignore_case=ignore_case,
@@ -667,7 +835,14 @@ class NetworkDirClient(DataSourceClient):
             scope_key=scope_key,
             cursor=cursor,
             time_budget_seconds=time_budget_seconds,
+            cancel_check=cancel_check,
         )
+        if not file_ids and getattr(self, "_last_walk_truncated", False):
+            result["coverage_complete"] = False
+            if not result["next_cursor"]:
+                result["stop_reason"] = "catalog_limit"
+                result["truncated"] = True
+        return result
 
     def write_file(
         self,
@@ -767,6 +942,7 @@ class NetworkDirClient(DataSourceClient):
                 return meta
         return {}
 
+    @discovery_progress
     def get_schemas(self, progress_callback=None, prior_catalog=None) -> List[Table]:
         """Index the directory into catalog rows per the connection's index tier:
 
@@ -807,9 +983,13 @@ class NetworkDirClient(DataSourceClient):
                 f"File '{f['name']}' (type: {f.get('mime_type') or _ext(f['name']) or 'unknown'})."
             )
             if self.index_content:
+                meta["index_version"] = 2
+                meta["content_coverage"] = "prefix_sample"
+                meta["sample_max_bytes"] = 200_000 if _ext(f["name"]) in TEXT_EXTS | {"csv", "tsv"} else None
                 prior = self._prior_meta(prior_catalog, name)
                 if (
                     prior.get("indexed")
+                    and prior.get("index_version") == 2
                     and prior.get("size") == f.get("size")
                     and prior.get("modified_at") == f.get("modified_at")
                 ):
@@ -818,19 +998,27 @@ class NetworkDirClient(DataSourceClient):
                     meta["keywords"] = prior.get("keywords") or []
                     meta["content_hash"] = prior.get("content_hash")
                     meta["indexed"] = True
+                    meta["content_coverage"] = prior.get("content_coverage", "prefix_sample")
                 else:
                     try:
-                        path = root / f["id"]
+                        # Through the chokepoint, never `root / id`: the
+                        # confinement + scope checks apply to indexing too.
+                        path = self._resolve(f["id"], must_exist=True)
                         text = self._file_text(path)
                         # Index the RELATIVE PATH, not just the basename: a case
                         # folder (`6044534/…`) is how people find these files.
-                        meta["keywords"] = extract_keywords(text, name, self.max_keywords)
+                        meta["keywords"] = extract_file_keywords(text, name, self.max_keywords)
                         meta["content_hash"] = hashlib.sha1(
                             (text or "").encode("utf-8", "ignore")
                         ).hexdigest() if text else None
                         meta["indexed"] = True
+                        if not text:
+                            meta["content_coverage"] = "unavailable"
+                    except IndexingCancelled:
+                        raise
                     except Exception:
                         meta["indexed"] = False
+                description += " Content keywords use a bounded sample."
                 if meta.get("keywords"):
                     description += " Keywords: " + ", ".join(meta["keywords"][:15]) + "."
             tables.append(Table(

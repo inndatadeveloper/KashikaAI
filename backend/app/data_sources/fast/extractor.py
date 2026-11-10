@@ -1,6 +1,6 @@
-"""Bounded, streaming extraction of a custom query into an encrypted artifact.
+"""Bounded, streaming extraction of a custom table into an encrypted artifact.
 
-A custom query is the one place in the product where a deliberately huge scan
+A custom table is the one place in the product where a deliberately huge scan
 can happen — an admin can write `SELECT * FROM orders` against a 2-billion-row
 table. Three independent layers stop that taking the process down:
 
@@ -19,6 +19,7 @@ every existing caller depends on it.
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -102,10 +103,17 @@ class ExtractResult:
     elapsed_ms: int = 0
 
 
-def _source(client):
-    """The extraction source for `client`, or None if it cannot be materialized."""
+def _source(client, sql: str):
+    """The extraction source for `client`, or None if it cannot be materialized.
+
+    Every path that runs a custom-table definition (estimate, preview, refresh)
+    resolves its source here, so this is where the definition is held to a
+    single read-only statement.
+    """
+    from app.ai.code_execution.sql_guard import ensure_read_only
     from app.data_sources.fast.sources import source_for
 
+    ensure_read_only(client, sql)
     return source_for(client)
 
 
@@ -121,7 +129,7 @@ def estimate(client, sql: str) -> Estimate:
     caller falls back to the hard caps. But it downgrades *silently*, so the
     note records what was tried and why it gave up.
     """
-    src = _source(client)
+    src = _source(client, sql)
     if src is None:
         return Estimate(supported=False, note="this connection cannot be materialized")
     try:
@@ -162,12 +170,12 @@ def check_budget(
     if est.rows and est.rows > max_rows:
         raise ExtractionRefused(
             f"Estimated {est.rows:,} rows exceeds the {max_rows:,}-row limit for a "
-            f"custom query. Narrow the query with a WHERE clause or fewer columns."
+            f"custom table. Narrow the query with a WHERE clause or fewer columns."
         )
     if est.total_bytes and est.total_bytes > max_bytes:
         raise ExtractionRefused(
             f"Estimated {est.total_bytes / (1024**3):.1f} GB exceeds the "
-            f"{max_bytes / (1024**3):.1f} GB limit for a custom query. "
+            f"{max_bytes / (1024**3):.1f} GB limit for a custom table. "
             f"Narrow the query with a WHERE clause or fewer columns."
         )
 
@@ -189,7 +197,7 @@ def preview(client, sql: str, limit: int = PREVIEW_ROW_LIMIT) -> tuple[list, lis
     So the bound is applied to the *fetch* instead, which no dialect can
     reinterpret, and the source stops the query once it has enough.
     """
-    src = _source(client)
+    src = _source(client, sql)
     if src is None:
         # No extraction source: the client's execute_query returns a whole
         # DataFrame by contract, so the only bound available is in the SQL.
@@ -215,15 +223,22 @@ def extract_to_artifact(
     max_rows: int = DEFAULT_MAX_ROWS,
     max_bytes: int = DEFAULT_MAX_BYTES,
     max_seconds: int = DEFAULT_MAX_SECONDS,
+    should_abort: Callable[[], bool] | None = None,
 ) -> ExtractResult:
     """Stream `sql` into a fresh encrypted DuckDB artifact.
 
     Writes to a `.tmp` sibling and atomically renames on success, so a crashed
     or aborted refresh can never leave a half-written artifact in place. The
     caller keeps serving the previous artifact until the swap lands.
+
+    ``should_abort`` is polled between batches; when it returns True the
+    extraction stops at the next batch boundary with ``ExtractionAborted``
+    (closing the source generator, which cancels the still-running job on
+    sources that bill for it). A caller whose request was cancelled uses this
+    to stop the source within one batch instead of waiting out the full scan.
     """
     started = time.monotonic()
-    src = _source(client)
+    src = _source(client, sql)
     key = artifacts.new_artifact_key()
     final_path = artifacts.new_artifact_path(connection_id)
     tmp_path = final_path.with_suffix(".tmp")
@@ -233,6 +248,11 @@ def extract_to_artifact(
     con = None
 
     def _elapsed_guard():
+        if should_abort is not None and should_abort():
+            raise ExtractionAborted(
+                "Refresh was cancelled before it completed; "
+                "the previous data is still being served."
+            )
         if time.monotonic() - started > max_seconds:
             raise ExtractionAborted(
                 f"Refresh exceeded the {max_seconds}s limit and was aborted; "
@@ -257,7 +277,7 @@ def extract_to_artifact(
                     if row_count > max_rows:
                         raise ExtractionAborted(
                             f"Query returned more than the {max_rows:,}-row limit "
-                            f"for a custom query and was aborted."
+                            f"for a custom table and was aborted."
                         )
                     con.register("bow_batch", tbl)
                     if first:
@@ -305,6 +325,9 @@ def extract_to_artifact(
         con.close()
         con = None
         tmp_path.replace(final_path)
+        # Object storage: every pod serves this extract, not just this one.
+        from app.services import storage
+        storage.persist(final_path)
 
         return ExtractResult(
             row_count=row_count,

@@ -72,6 +72,7 @@ class PlannerDecision(BaseModel):
 
 
 class PlannerInput(BaseModel):
+    response_locale: Optional[str] = None
     external_platform: Optional[str] = None
     mode: Optional[str] = "chat" # "chat" | "training" | "knowledge"
     user_message: str
@@ -92,6 +93,10 @@ class PlannerInput(BaseModel):
     history_summary: Optional[str] = None
     # Detailed conversation messages context for better planning
     messages_context: Optional[str] = None
+    # The user's earlier messages in this conversation, newest first. Only
+    # used to pick the reply language when the current message is too short
+    # to show one ("ok", "2024"); see prompt_language.reply_language_reminder.
+    recent_user_messages: Optional[List[str]] = None
     # Resources context from metadata resources (git repos, documentation, etc.)
     resources_context: Optional[str] = None
     # Combined resources context (per data source: sample Top-K + names index)
@@ -108,6 +113,8 @@ class PlannerInput(BaseModel):
     available_steps_context: Optional[str] = None
     # Active recurring scheduled tasks for this report (rendered <scheduled_tasks> block)
     scheduled_tasks_context: Optional[str] = None
+    # Failures in this conversation's apps the agent has not seen (services/artifact_activity.py).
+    app_activity_context: Optional[str] = None
     # Rendered <notes> block (per-report agent scratchpad), injected near
     # last_observation. Populated in both the main loop and the knowledge harness.
     notes_context: Optional[str] = None
@@ -157,10 +164,14 @@ class PlannerInput(BaseModel):
     # "CFO, focuses on monthly close metrics"). Both are optional.
     user_name: Optional[str] = None
     user_note: Optional[str] = None
-    # Agent-curated durable memory about the asker (Membership.memory), rendered
-    # as <user_memory>. Written by the update_user_memory tool; treated as the
-    # agent's own recollection of the user, subordinate to org instructions.
+    # Pre-rendered tiered <memory> body for the asker (MemoryContextBuilder:
+    # always / matched tiers + index line). Personal context only — never
+    # business rules; None when user memory is off or empty.
     user_memory: Optional[str] = None
+    # One-line nudge placed next to the ask when the user's message carries
+    # durable personal signals (style correction, role, shorthand, dated
+    # event, focus) and the memory tools are available. None otherwise.
+    memory_hint: Optional[str] = None
     # Job info synced from the org's identity provider (Entra ID Graph /me:
     # jobTitle, department, company, …). Rendered inside <user_profile>. Admin
     # chooses which attributes are included per org. Treated as context, not
@@ -175,9 +186,24 @@ class PlannerInput(BaseModel):
     # so it knows not to attempt to retrieve raw values.
     allow_llm_see_data: bool = True
 
+    # RBAC: when False, the asker's role withholds `view_code`, so the backend
+    # strips generated code out of every payload they receive. Surfaced to the
+    # planner so the prose answer matches — otherwise the model happily pastes
+    # the same SQL into a markdown fence, which no serializer can redact.
+    can_view_code: bool = True
+
+    # Tools the conversation switched off (report.tools); rendered as a
+    # <disabled_tools> context line. The catalog already excludes them.
+    disabled_tools: List[str] = []
+
     # Feature flags
     mcp_tools_enabled: bool = False
     web_fetch_enabled: bool = False
+    # Org Sandbox settings: what create_data's generated code may do
+    # (`http`, `browser`, `lists`). See ai/code_execution/sandbox_helpers.py.
+    sandbox_web_fetch_enabled: bool = False
+    sandbox_browser_enabled: bool = False
+    sandbox_lists_enabled: bool = False
     # Org `enable_ml_training` (default on). Off: the code sandbox rejects
     # sklearn/scipy imports, so the planner must not promise or claim a model.
     ml_training_enabled: bool = True
@@ -210,6 +236,24 @@ class PlannerInput(BaseModel):
     #     (may route back down if the remaining work is clearly simple).
     current_model: Optional[str] = None
     routing_state: Optional[str] = None
+
+    # Sub-agents (docs/design/sub-agents.md). Parent side: whether `delegate` is
+    # in the catalog and the org's posture, plus the rendered <sub_agents>
+    # block (recent waves, one line per child). Child side (mode=subagent):
+    # the sub-agent's title, the profile's prompt addendum and the remaining
+    # step budget rendered in the per-turn head.
+    sub_agents_enabled: bool = False
+    sub_agent_posture: str = "proactive"
+    sub_agents_context: Optional[str] = None
+    sub_agent_title: Optional[str] = None
+    sub_agent_profile_addendum: Optional[str] = None
+    sub_agent_budget: Optional[str] = None
+
+    # In-run efficiency readout (planner/run_efficiency.py): tokens so far,
+    # cache share and identical repeated calls, rendered in the per-turn head.
+    # Empty until the run is long enough or a call repeats; off unless
+    # BOW_RUN_EFFICIENCY is set.
+    run_efficiency: Optional[str] = None
 
     # Native transcript path (opt-in, see planner/transcript_bridge.py). When
     # on, prior steps replay as real assistant(tool_use) / user(tool_result)

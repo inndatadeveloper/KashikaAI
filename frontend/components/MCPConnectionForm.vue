@@ -13,7 +13,7 @@
       />
       <div v-if="!selectedExistingId" class="relative my-4">
         <div class="absolute inset-0 flex items-center"><div class="w-full border-t border-gray-200 dark:border-gray-700" /></div>
-        <div class="relative flex justify-center"><span class="bg-white dark:bg-gray-900 px-2 text-xs text-gray-400">{{ $t('settings.mcpModal.orCreateNew') }}</span></div>
+        <div class="relative flex justify-center"><span class="bg-white dark:bg-gray-900 px-2 text-xs text-ink-muted">{{ $t('settings.mcpModal.orCreateNew') }}</span></div>
       </div>
     </div>
 
@@ -23,12 +23,12 @@
         <div v-if="presetDescription || sampleTools.length" class="-mt-2 space-y-2">
           <p v-if="presetDescription" class="text-sm text-gray-500 dark:text-gray-400">{{ presetDescription }}</p>
           <div v-if="sampleTools.length">
-            <div class="text-[11px] uppercase tracking-wide text-gray-400 mb-1">{{ $t('data.exampleTools') }}</div>
+            <div class="text-2xs uppercase tracking-wide text-ink-muted mb-1">{{ $t('data.exampleTools') }}</div>
             <div class="flex flex-wrap gap-1 items-center">
-              <span v-for="tool in sampleTools.slice(0, 8)" :key="tool" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-300">{{ tool }}</span>
-              <span v-if="sampleTools.length > 8" class="text-[11px] text-gray-400">+{{ sampleTools.length - 8 }}</span>
+              <span v-for="tool in sampleTools.slice(0, 8)" :key="tool" class="text-2xs font-mono px-1.5 py-0.5 rounded bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-300">{{ tool }}</span>
+              <span v-if="sampleTools.length > 8" class="text-2xs text-ink-muted">+{{ sampleTools.length - 8 }}</span>
             </div>
-            <p class="mt-1 text-[11px] text-gray-400">{{ $t('data.toolsDiscoveredHint') }}</p>
+            <p class="mt-1 text-2xs text-ink-muted">{{ $t('data.toolsDiscoveredHint') }}</p>
           </div>
         </div>
 
@@ -59,19 +59,48 @@
             <option v-if="authAllowed('none')" value="none">{{ $t('settings.mcpModal.authNone') }}</option>
             <option v-if="authAllowed('bearer')" value="bearer">{{ $t('settings.mcpModal.authBearer') }}</option>
             <option v-if="authAllowed('api_key')" value="api_key">{{ $t('settings.mcpModal.authApiKey') }}</option>
+            <option v-if="authAllowed('basic')" value="basic">{{ $t('settings.mcpModal.authBasic') }}</option>
             <option v-if="authAllowed('dcr')" value="dcr">{{ $t('data.mcpAuthDcr') }}</option>
             <option v-if="authAllowed('oauth_app')" value="oauth_app">{{ $t('data.mcpAuthOauthApp') }}</option>
           </select>
         </div>
 
-        <div v-if="form.auth_type === 'dcr'" class="text-xs text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
-          {{ $t('data.mcpDcrHintA') }} <strong>{{ $t('data.mcpDcrHintB') }}</strong>
+        <div v-if="form.auth_type === 'dcr'" class="space-y-3">
+          <div class="text-xs text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
+            {{ $t('data.mcpDcrHintA') }} <strong>{{ $t('data.mcpDcrHintB') }}</strong>
+          </div>
+          <!-- Scopes are discovered from the server (its 401 challenge, then its
+               resource metadata). The field is an override for servers whose
+               metadata is wrong or missing; Verify shows what was detected. -->
+          <div>
+            <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">{{ $t('data.mcpDcrScopesLabel') }}</label>
+            <input v-model="form.scopes" type="text" data-test="mcp-dcr-scopes" :placeholder="detectedScopes || $t('data.mcpDcrScopesPlaceholder')" class="w-full border border-gray-300 dark:border-gray-600 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" />
+            <p v-if="detectedScopes" class="mt-1 text-2xs text-gray-500 dark:text-gray-400" data-test="mcp-dcr-detected">
+              {{ $t('data.mcpDcrDetectedScopes', { scopes: detectedScopes }) }}<template v-if="scopesSourceLabel"> · {{ scopesSourceLabel }}</template>
+            </p>
+            <p v-else-if="scopesSource === 'none'" class="mt-1 text-2xs text-gray-500 dark:text-gray-400" data-test="mcp-dcr-detected">
+              {{ $t('data.mcpDcrDetectedNone') }}
+            </p>
+            <p v-else class="mt-1 text-2xs text-gray-500 dark:text-gray-400">{{ $t('data.mcpDcrScopesHint') }}</p>
+          </div>
         </div>
 
         <div v-if="form.auth_type === 'bearer'">
           <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">{{ $t('settings.mcpModal.bearerLabel') }}</label>
           <input v-model="form.token" type="password" :placeholder="isEditMode ? $t('settings.mcpModal.unchanged') : $t('settings.mcpModal.bearerPlaceholder')" class="w-full border border-gray-300 dark:border-gray-600 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" />
           <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ $t('data.mcpTokenSharedHint') }}</p>
+        </div>
+
+        <div v-if="form.auth_type === 'basic'" class="space-y-3" data-test="mcp-basic">
+          <div>
+            <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">{{ $t('settings.mcpModal.basicUsernameLabel') }}</label>
+            <input v-model="form.username" type="text" autocomplete="off" data-test="mcp-basic-username" :placeholder="isEditMode ? $t('settings.mcpModal.unchanged') : $t('settings.mcpModal.basicUsernamePlaceholder')" class="w-full border border-gray-300 dark:border-gray-600 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">{{ $t('settings.mcpModal.basicPasswordLabel') }}</label>
+            <input v-model="form.password" type="password" autocomplete="new-password" data-test="mcp-basic-password" :placeholder="isEditMode ? $t('settings.mcpModal.unchanged') : $t('settings.mcpModal.basicPasswordPlaceholder')" class="w-full border border-gray-300 dark:border-gray-600 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" />
+          </div>
+          <p class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.mcpModal.basicHint') }}</p>
         </div>
 
         <div v-if="form.auth_type === 'api_key'" class="space-y-3">
@@ -130,7 +159,7 @@
           </button>
           <div v-if="advancedOpen" class="mt-2 space-y-4 border border-gray-200 dark:border-gray-700 rounded-md p-3 bg-gray-50 dark:bg-gray-900">
             <template v-if="isPreset">
-              <p class="text-[11px] text-gray-400">{{ $t('data.mcpKnownEndpointsHint') }}</p>
+              <p class="text-2xs text-ink-muted">{{ $t('data.mcpKnownEndpointsHint') }}</p>
               <div>
                 <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">{{ $t('settings.mcpModal.urlLabel') }}</label>
                 <input v-model="form.server_url" type="text" class="w-full border border-gray-300 dark:border-gray-600 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500" />
@@ -167,21 +196,21 @@
             <div class="space-y-4" data-test="mcp-forwarding">
               <div>
                 <div class="text-xs font-semibold text-gray-700 dark:text-gray-200">{{ $t('data.mcpForwardingTitle') }}</div>
-                <p class="text-[11px] text-gray-400 mt-0.5">{{ $t('data.mcpForwardingHint') }}</p>
+                <p class="text-2xs text-ink-muted mt-0.5">{{ $t('data.mcpForwardingHint') }}</p>
               </div>
 
               <!-- Headers -->
               <div>
-                <div class="text-[11px] uppercase tracking-wide text-gray-400 mb-1.5">{{ $t('data.mcpHttpHeaders') }} <span class="normal-case tracking-normal">· {{ $t('data.mcpHttpHeadersHint') }}</span></div>
+                <div class="text-2xs uppercase tracking-wide text-ink-muted mb-1.5">{{ $t('data.mcpHttpHeaders') }} <span class="normal-case tracking-normal">· {{ $t('data.mcpHttpHeadersHint') }}</span></div>
                 <div class="space-y-2">
                   <div v-for="(r, i) in headerRules" :key="'h'+i" class="flex items-center gap-1.5" :data-test="'header-row-'+i">
                     <input v-model="r.header" type="text" placeholder="Header-Name" data-test="header-name" class="flex-1 min-w-0 border border-gray-300 dark:border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500" />
-                    <span class="text-gray-400 text-xs">←</span>
+                    <span class="text-ink-muted text-xs inline-block rtl-flip">←</span>
                     <select v-model="r.kind" data-test="header-source" class="border border-gray-300 dark:border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500">
                       <option v-for="s in SOURCE_KINDS" :key="s.value" :value="s.value">{{ s.label }}</option>
                     </select>
                     <input v-if="needsKey(r.kind)" v-model="r.key" :list="r.kind === 'membership.attr' ? 'mcp-attr-suggestions' : undefined" :placeholder="keyPlaceholder(r.kind)" data-test="header-key" class="w-28 border border-gray-300 dark:border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500" />
-                    <button type="button" @click="headerRules.splice(i, 1)" class="text-gray-400 hover:text-red-500 px-1"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
+                    <button type="button" @click="headerRules.splice(i, 1)" class="text-ink-muted hover:text-red-500 px-1"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
                   </div>
                 </div>
                 <button type="button" data-test="add-header" @click="headerRules.push({ header: '', kind: 'user.email', key: '' })" class="mt-2 text-xs font-medium text-blue-600 hover:text-blue-800">{{ $t('data.addHeader') }}</button>
@@ -189,22 +218,47 @@
 
               <!-- Metadata -->
               <div>
-                <div class="text-[11px] uppercase tracking-wide text-gray-400 mb-1.5">{{ $t('data.mcpToolMetadata') }} <span class="normal-case tracking-normal">· {{ $t('data.mcpToolMetadataHint', { key: metaArgKey }) }}</span></div>
+                <div class="text-2xs uppercase tracking-wide text-ink-muted mb-1.5">{{ $t('data.mcpToolMetadata') }} <span class="normal-case tracking-normal">· {{ $t('data.mcpToolMetadataHint', { key: metaArgKey }) }}</span></div>
                 <div class="space-y-2">
                   <div v-for="(f, i) in metaFields" :key="'m'+i" class="flex items-center gap-1.5" :data-test="'meta-row-'+i">
                     <input v-model="f.name" type="text" placeholder="field name" data-test="meta-name" class="flex-1 min-w-0 border border-gray-300 dark:border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500" />
-                    <span class="text-gray-400 text-xs">←</span>
+                    <span class="text-ink-muted text-xs inline-block rtl-flip">←</span>
                     <select v-model="f.kind" data-test="meta-source" class="border border-gray-300 dark:border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500">
                       <option v-for="s in SOURCE_KINDS" :key="s.value" :value="s.value">{{ s.label }}</option>
                     </select>
                     <input v-if="needsKey(f.kind)" v-model="f.key" :list="f.kind === 'membership.attr' ? 'mcp-attr-suggestions' : undefined" :placeholder="keyPlaceholder(f.kind)" data-test="meta-key" class="w-24 border border-gray-300 dark:border-gray-600 rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500" />
-                    <button type="button" data-test="meta-mode" @click="f.mode = f.mode === 'ai' ? 'locked' : 'ai'" :title="f.mode === 'ai' ? $t('data.mcpModeAiTip') : $t('data.mcpModeLockedTip')" :class="['text-[11px] font-semibold rounded-md px-2 py-1.5 border whitespace-nowrap', f.mode === 'ai' ? 'text-blue-600 border-blue-200 bg-blue-50 dark:bg-blue-950' : 'text-gray-600 border-gray-300 bg-gray-100 dark:bg-gray-800 dark:text-gray-300']">
+                    <button type="button" data-test="meta-mode" @click="f.mode = f.mode === 'ai' ? 'locked' : 'ai'" :title="f.mode === 'ai' ? $t('data.mcpModeAiTip') : $t('data.mcpModeLockedTip')" :class="['text-2xs font-semibold rounded-md px-2 py-1.5 border whitespace-nowrap', f.mode === 'ai' ? 'text-blue-600 border-blue-200 bg-blue-50 dark:bg-blue-950' : 'text-gray-600 border-gray-300 bg-gray-100 dark:bg-gray-800 dark:text-gray-300']">
                       {{ f.mode === 'ai' ? '✨ ' + $t('data.mcpModeAi') : '🔒 ' + $t('data.mcpModeLocked') }}
                     </button>
-                    <button type="button" @click="metaFields.splice(i, 1)" class="text-gray-400 hover:text-red-500 px-1"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
+                    <button type="button" @click="metaFields.splice(i, 1)" class="text-ink-muted hover:text-red-500 px-1"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
                   </div>
                 </div>
                 <button type="button" data-test="add-meta" @click="metaFields.push({ name: '', kind: 'user.email', key: '', mode: 'locked', on_missing: 'empty' })" class="mt-2 text-xs font-medium text-blue-600 hover:text-blue-800">{{ $t('data.mcpAddMetaField') }}</button>
+
+                <!-- Dynamic params: allow-list {key: default} of the per-question
+                     values the caller sends as prompt.metadata (a row above wins). -->
+                <div class="mt-3" data-test="dyn-params">
+                  <label class="flex items-center gap-2 text-xs font-medium text-gray-700 dark:text-gray-200">
+                    <UToggle v-model="dynEnabled" data-test="dyn-params-toggle" />
+                    {{ $t('data.mcpDynamicParams') }}
+                  </label>
+                  <template v-if="dynEnabled">
+                    <p class="text-2xs text-ink-muted mt-1.5">
+                      {{ $t('data.mcpDynamicParamsHint', { key: metaArgKey }) }}
+                      <code dir="ltr" class="font-mono">prompt.metadata</code>
+                    </p>
+                    <textarea
+                      v-model="dynText"
+                      rows="5"
+                      dir="ltr"
+                      spellcheck="false"
+                      :placeholder="DYN_PLACEHOLDER"
+                      data-test="dyn-params-json"
+                      :class="['mt-1.5 w-full font-mono border rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500', dynError ? 'border-red-400' : 'border-gray-300 dark:border-gray-600']"
+                    />
+                    <p v-if="dynError" class="text-2xs text-red-600 mt-1" data-test="dyn-params-error">{{ dynError }}</p>
+                  </template>
+                </div>
               </div>
 
               <datalist id="mcp-attr-suggestions">
@@ -241,7 +295,7 @@
         <span v-else />
         <div class="flex items-center gap-2">
           <UButton color="gray" variant="ghost" size="sm" @click="emit('cancel')">{{ $t('settings.mcpModal.cancel') }}</UButton>
-          <UButton type="submit" color="blue" size="sm" :loading="submitting" :disabled="selectedExistingId ? false : (!form.server_url || !form.name)">
+          <UButton type="submit" color="blue" size="sm" :loading="submitting" :disabled="selectedExistingId ? false : (!form.server_url || !form.name || !!dynError)">
             {{ submitLabel }}
           </UButton>
         </div>
@@ -292,6 +346,9 @@ const form = reactive({
   token: '',
   api_key: '',
   api_key_header: 'X-API-Key',
+  // HTTP Basic (auth_type === 'basic'), e.g. Atlassian email + API token
+  username: '',
+  password: '',
   // OAuth app fields (used when auth_type === 'oauth_app')
   authorize_url: '',
   token_url: '',
@@ -323,6 +380,28 @@ function keyPlaceholder(kind: string): string { return kind === 'static' ? t('da
 const headerRules = reactive<Array<{ header: string; kind: string; key: string }>>([])
 const metaArgKey = ref('custom_metadata')
 const metaFields = reactive<Array<{ name: string; kind: string; key: string; mode: string; on_missing: string }>>([])
+// Dynamic params: the allow-list {key: default} edited as JSON text. Kept when
+// the toggle is off, so switching it back on restores what the admin wrote.
+const dynEnabled = ref(false)
+const dynText = ref('')
+const DYN_PLACEHOLDER = '{\n  "chat_id": null,\n  "message_id": null,\n  "env": "prod"\n}'
+
+// The parsed object, or null when the text is not a JSON object. Blank = {}.
+function parseDynParams(): Record<string, any> | null {
+  const text = dynText.value.trim()
+  if (!text) return {}
+  try {
+    const v = JSON.parse(text)
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : null
+  } catch {
+    return null
+  }
+}
+const dynError = computed<string | null>(() => {
+  if (!dynEnabled.value || parseDynParams() !== null) return null
+  try { JSON.parse(dynText.value) } catch { return t('data.mcpDynamicParamsInvalid') }
+  return t('data.mcpDynamicParamsNotObject')
+})
 const attrSuggestions = ref<string[]>([])
 
 function toSource(kind: string, key: string): string {
@@ -349,7 +428,16 @@ function buildForwarding(): Record<string, any> {
   const fields = metaFields
     .filter(f => (f.name || '').trim())
     .map(f => ({ name: f.name.trim(), source: toSource(f.kind, f.key), mode: f.mode || 'locked', on_missing: f.on_missing || 'empty' }))
-  if (fields.length) out.metadata_injection = { argument_key: (metaArgKey.value || 'custom_metadata').trim() || 'custom_metadata', fields }
+  const dyn = parseDynParams() || {}
+  const hasDyn = dynEnabled.value || Object.keys(dyn).length > 0
+  if (fields.length || hasDyn) {
+    const mi: Record<string, any> = { argument_key: (metaArgKey.value || 'custom_metadata').trim() || 'custom_metadata', fields }
+    if (hasDyn) {
+      mi.dynamic_params_enabled = dynEnabled.value
+      mi.dynamic_params = dyn
+    }
+    out.metadata_injection = mi
+  }
   return out
 }
 
@@ -362,6 +450,9 @@ function hydrateForwarding(config: any) {
   }
   const mi = config?.metadata_injection || {}
   if (mi.argument_key) metaArgKey.value = mi.argument_key
+  dynEnabled.value = !!mi.dynamic_params_enabled
+  const dp = mi.dynamic_params
+  dynText.value = dp && typeof dp === 'object' && Object.keys(dp).length ? JSON.stringify(dp, null, 2) : ''
   for (const f of (mi.fields || [])) {
     const s = fromSource(f.source || '')
     metaFields.push({ name: f.name || '', kind: s.kind, key: s.key, mode: f.mode || 'locked', on_missing: f.on_missing || 'empty' })
@@ -392,6 +483,8 @@ watch(() => props.editConnection, async (conn) => {
         form.token = ''
         form.api_key = ''
         form.api_key_header = config.api_key_header || 'X-API-Key'
+        form.username = ''
+        form.password = ''
         // OAuth app fields — non-secret values come back from the backend in
         // the `credentials_meta` blob so the admin can edit them without
         // re-entering everything. Secrets stay blank (unchanged-placeholder).
@@ -403,6 +496,10 @@ watch(() => props.editConnection, async (conn) => {
         form.scopes = meta.scopes || ''
         form.audience = meta.audience || ''
         form.token_endpoint_auth_method = meta.token_endpoint_auth_method || ''
+        // For DCR: what discovery derived from the server on the last
+        // registration / sign-in, shown as "Detected" next to the override.
+        detectedScopes.value = meta.discovered_scopes || ''
+        scopesSource.value = meta.scopes_source || ''
         hydrateForwarding(config)
         return
       }
@@ -467,6 +564,19 @@ const advancedOpen = ref(false)
 const testing = ref(false)
 const submitting = ref(false)
 const testResult = ref<{ success: boolean; message: string } | null>(null)
+// What DCR discovery derived from the server (from Verify, or from the stored
+// connection in edit mode) — shown next to the scopes override so the admin
+// sees what a sign-in will request instead of guessing.
+const detectedScopes = ref('')
+const scopesSource = ref('')
+const scopesSourceLabel = computed(() => {
+  switch (scopesSource.value) {
+    case 'challenge': return t('data.mcpDcrScopesSourceChallenge')
+    case 'resource_metadata': return t('data.mcpDcrScopesSourceResource')
+    case 'authorization_server': return t('data.mcpDcrScopesSourceAs')
+    default: return ''
+  }
+})
 const submitError = ref<string | null>(null)
 
 // Extract a human-readable message from a useMyFetch error (FetchError) or a
@@ -481,6 +591,7 @@ watch(() => ({ ...form }), () => { submitError.value = null })
 function buildCredentials(): Record<string, any> | undefined {
   if (form.auth_type === 'bearer' && form.token) return { token: form.token }
   if (form.auth_type === 'api_key' && form.api_key) return { api_key: form.api_key, api_key_header: form.api_key_header }
+  if (form.auth_type === 'basic' && form.username && form.password) return { username: form.username, password: form.password }
   if (form.auth_type === 'oauth_app') {
     // Don't send empty strings; backend wants either a complete OAuth app or
     // an updated subset (edit mode).
@@ -493,6 +604,13 @@ function buildCredentials(): Record<string, any> | undefined {
     if (form.audience) c.audience = form.audience
     if (form.token_endpoint_auth_method) c.token_endpoint_auth_method = form.token_endpoint_auth_method
     return Object.keys(c).length ? c : undefined
+  }
+  if (form.auth_type === 'dcr') {
+    // Optional override of the scopes discovery derives from the server. In
+    // edit mode it is sent even when empty so clearing the field clears the
+    // override (credentials merge on update; an empty override defers to the
+    // discovered scopes again).
+    if (form.scopes || isEditMode.value) return { scopes: form.scopes }
   }
   return undefined
 }
@@ -539,6 +657,12 @@ async function testConnection() {
       testResult.value = { success: false, message: errorMessage(response.error.value, t('settings.mcpModal.testFailed')) }
     } else {
       testResult.value = response.data.value as any
+      // DCR: Verify ran discovery — surface what a sign-in will request.
+      const detected = (response.data.value as any)?.detected
+      if (detected) {
+        detectedScopes.value = detected.scopes || ''
+        scopesSource.value = detected.scopes_source || ''
+      }
     }
   } catch (e: any) {
     testResult.value = { success: false, message: e?.data?.detail || t('settings.mcpModal.testFailed') }
@@ -551,6 +675,11 @@ async function handleSubmit() {
   if (selectedExisting.value) {
     const conn = existingConnections.value.find((c: any) => c.id === selectedExisting.value.id)
     if (conn) emit('saved', conn, { existing: true })
+    return
+  }
+
+  if (dynError.value) {
+    submitError.value = dynError.value
     return
   }
 

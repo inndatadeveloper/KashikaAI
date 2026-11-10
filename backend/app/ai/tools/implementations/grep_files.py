@@ -34,18 +34,27 @@ _SWEEP_TIME_BUDGET_SECONDS = 90.0
 
 
 async def _grep_session_files(data, runtime_ctx: Dict[str, Any]):
-    """Sweep the report's attached files (uploads / attach_file results) with
-    the shared grep engine. Returns None when the report has no files (caller
-    surfaces a routing hint). The candidate list IS the allow-list: only files
-    associated with this report, org-checked, are ever read."""
+    """Sweep the conversation's files (uploads / attach_file results, project
+    files, the run agents' library files) with the shared grep engine.
+    Returns None when there are no files (caller surfaces a routing hint).
+    The candidate list IS the allow-list: only files in this conversation's
+    file space, org-checked, are ever read."""
     import asyncio as _asyncio
     import fnmatch
 
+    from app.ai.context.agent_files import merge_files
     from app.data_sources.clients._grep_common import run_grep_sweep
 
     report = runtime_ctx.get("report")
     organization = runtime_ctx.get("organization")
-    files = list(getattr(report, "files", None) or []) if report else []
+    if not report:
+        return None
+    # Same file space read_file resolves: report uploads, project files and
+    # the run agents' library files.
+    files = merge_files(
+        merge_files(getattr(report, "files", None) or [], runtime_ctx.get("project_files")),
+        runtime_ctx.get("agent_files"),
+    )
     if not files:
         return None
 
@@ -67,6 +76,8 @@ async def _grep_session_files(data, runtime_ctx: Dict[str, Any]):
         entry = {"id": fid, "path": name}
         try:
             import os as _os
+            from app.services import storage
+            await storage.aensure_local(f.path)
             entry["size"] = _os.path.getsize(f.path)
         except Exception:
             pass
@@ -114,8 +125,14 @@ class GrepFilesTool(Tool):
             name="grep_files",
             description=(
                 "Extract matching LINES (with line numbers and context) from "
-                "text files on a Files & Directories or S3 connection — "
-                "deterministic regex over raw file bytes, like grep -n. Scans "
+                "text files — the files in this conversation's <files> block "
+                "(uploads and the agent's own library files, e.g. catalogues, "
+                "glossaries, YAML/TSV references; leave connection_id empty) or "
+                "files on a Files & Directories / S3 connection (pass its "
+                "connection_id). Deterministic regex over raw file bytes, like "
+                "grep -n. THE way to look things up in a large text file: grep "
+                "it for the keywords you need (pass file_ids to target specific "
+                "files) instead of paging through it with read_file. Scans "
                 "many files per call with explicit budgets and a resumable "
                 "cursor, and reports the total match count — use it to reduce "
                 "logs/text at the source instead of reading whole files. Any "
@@ -246,6 +263,9 @@ class GrepFilesTool(Tool):
             "truncated": sweep.get("truncated", False),
             "stop_reason": sweep.get("stop_reason", "complete"),
             "next_cursor": sweep.get("next_cursor"),
+            "bytes_read": sweep.get("bytes_read", 0),
+            "verification_bytes": sweep.get("verification_bytes", 0),
+            "coverage_complete": sweep.get("coverage_complete", not (sweep.get("skipped_files") or sweep.get("truncated") or sweep.get("next_cursor"))),
         }
 
         # Observation carries the accounting even when the lines don't fit —
@@ -258,9 +278,13 @@ class GrepFilesTool(Tool):
         if len(output["matches"]) < output["total_matches"]:
             bits.append(f"showing {len(output['matches'])}")
         if output["files_skipped"]:
-            bits.append(f"{len(output['files_skipped'])} file(s) skipped")
+            reasons = ", ".join(sorted({s["reason"] for s in output["files_skipped"]}))
+            bits.append(f"{len(output['files_skipped'])} file(s) skipped ({reasons})")
+        if not output["coverage_complete"]:
+            bits.append("coverage incomplete")
         if output["stop_reason"] != "complete":
-            bits.append(f"stopped: {output['stop_reason']} — continue with cursor")
+            action = "continue with cursor" if output["next_cursor"] else "narrow the scope or inspect skipped files"
+            bits.append(f"stopped: {output['stop_reason']} — {action}")
         observation: Dict[str, Any] = {"summary": " — ".join(bits), "success": True}
         # The planner reads the observation, not the raw output — ship the
         # matched lines themselves (grep-style, capped) or the whole sweep is

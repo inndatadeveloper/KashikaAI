@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import json
@@ -5,6 +6,7 @@ import os
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from app.core.egress import check_google_token_uri
 from typing import List, Generator, Optional
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
@@ -60,14 +62,22 @@ class BigqueryClient(DataSourceClient):
                 info = json.loads(self.credentials_json)
                 if not isinstance(info, dict):
                     raise ValueError("Parsed credentials JSON is not an object")
-                self.credentials = service_account.Credentials.from_service_account_info(info)
             except (json.JSONDecodeError, ValueError):
+                info = None
+            if info is not None:
+                # token_uri is where google-auth POSTs the signed assertion.
+                check_google_token_uri(info)
+                self.credentials = service_account.Credentials.from_service_account_info(info)
+            else:
                 # Fall back to treating the string as a file path on the server
                 if not os.path.isfile(self.credentials_json):
                     raise ValueError(
                         "Provided BigQuery credentials are neither valid JSON content nor a readable server file path."
                     )
-                self.credentials = service_account.Credentials.from_service_account_file(self.credentials_json)
+                with open(self.credentials_json) as fh:
+                    info = json.load(fh)
+                check_google_token_uri(info)
+                self.credentials = service_account.Credentials.from_service_account_info(info)
         elif self.credentials_json is None:
             raise ValueError("Either access_token or credentials_json must be provided")
         else:
@@ -118,11 +128,14 @@ class BigqueryClient(DataSourceClient):
         """Get tables with graceful fallback if enriched query fails."""
         try:
             return self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             return self._get_tables_basic()
 
     def _get_tables_enriched(self) -> List[Table]:
         """Get tables with column/table descriptions. May fail on some BigQuery configurations."""
+        discovery_phase('reading_columns')
         with self.connect() as conn:
             if self._datasets:
                 datasets = self._datasets
@@ -130,7 +143,7 @@ class BigqueryClient(DataSourceClient):
                 datasets = [d.dataset_id for d in conn.list_datasets()]
 
             tables = {}
-            for ds in datasets:
+            for ds in discovery_items(datasets, 'datasets', label=str):
                 # Query with column descriptions and table descriptions
                 sql = f"""
                     SELECT
@@ -147,7 +160,7 @@ class BigqueryClient(DataSourceClient):
                 query_job = conn.query(sql)
                 results = query_job.result().to_dataframe()
 
-                for _, row in results.iterrows():
+                for _, row in discovery_items(results.iterrows(), 'columns', total=len(results), label=lambda pair: ds + '.' + str(pair[1]['table_name']) + '.' + str(pair[1]['column_name'])):
                     table_name = row["table_name"]
                     column_name = row["column_name"]
                     data_type = row["data_type"]
@@ -175,6 +188,7 @@ class BigqueryClient(DataSourceClient):
 
     def _get_tables_basic(self) -> List[Table]:
         """Get tables without descriptions (original query - always works)."""
+        discovery_phase('metadata_fallback')
         try:
             with self.connect() as conn:
                 if self._datasets:
@@ -183,7 +197,7 @@ class BigqueryClient(DataSourceClient):
                     datasets = [d.dataset_id for d in conn.list_datasets()]
 
                 tables = {}
-                for ds in datasets:
+                for ds in discovery_items(datasets, 'datasets', label=str):
                     sql = f"""
                         SELECT table_name, column_name, data_type
                         FROM `{self.project_id}.{ds}.INFORMATION_SCHEMA.COLUMNS`
@@ -192,7 +206,7 @@ class BigqueryClient(DataSourceClient):
                     query_job = conn.query(sql)
                     results = query_job.result().to_dataframe()
 
-                    for _, row in results.iterrows():
+                    for _, row in discovery_items(results.iterrows(), 'columns', total=len(results), label=lambda pair: ds + '.' + str(pair[1]['table_name']) + '.' + str(pair[1]['column_name'])):
                         table_name = row["table_name"]
                         column_name = row["column_name"]
                         data_type = row["data_type"]
@@ -206,7 +220,10 @@ class BigqueryClient(DataSourceClient):
                         tables[key].columns.append(TableColumn(name=column_name, dtype=data_type))
 
                 return list(tables.values())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("bigquery catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -215,7 +232,8 @@ class BigqueryClient(DataSourceClient):
         raise NotImplementedError(
             "get_schema() is obsolete. Use get_tables() instead.")
 
-    def get_schemas(self):
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
         """Get schemas for all tables in the specified dataset."""
         return self.get_tables()
 

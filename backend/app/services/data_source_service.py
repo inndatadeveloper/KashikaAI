@@ -1,11 +1,16 @@
+from app.data_sources.client_parameters import merge_client_credentials, filter_client_parameters
 import asyncio
 import logging
+import os
 
+from app.models.connection import RUNTIME_CONFIG_KEYS
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
 from app.models.organization import Organization
 from app.models.data_source import DataSource
+from app.errors.redact import redact_error
+from app.core.egress import acheck_connection_params as _acheck_connection_destination
 from app.schemas.data_source_registry import (
     list_available_data_sources,
     config_schema_for,
@@ -77,7 +82,15 @@ from app.models.metadata_resource import MetadataResource
 from app.models.metadata_indexing_job import MetadataIndexingJob, IndexingJobStatus
 from app.models.git_repository import GitRepository
 
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+class _UncommittedInSession(Exception):
+    """A row the parallel overlay sync could not see from a fresh session.
+
+    Raised so the caller falls back to its own session rather than reporting a
+    spurious failure for a data source that simply has not been committed yet.
+    """
 from sqlalchemy.future import select
 from app.schemas.data_source_schema import (
     DataSourceCreate, DataSourceBase, DataSourceSchema, DataSourceUpdate,
@@ -101,11 +114,13 @@ from app.schemas.datasource_table_schema import DataSourceTableSchema
 from app.models.datasource_table import DataSourceTable  # Add this import at the top of the file
 from app.models.user_data_source_overlay import UserDataSourceTable as UserOverlayTable, UserDataSourceColumn as UserOverlayColumn
 from app.models.webhook_data_source_association import webhook_data_source_association
+from app.models.project import project_data_source_association
 from app.models.eval import TestSuite
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import selectinload, lazyload
 from app.services.instruction_service import InstructionService
+from app.services.table_preview_service import is_previewable_table
 from app.schemas.instruction_schema import InstructionCreate
 from app.core.telemetry import telemetry
 from app.ee.audit.service import audit_service
@@ -132,10 +147,67 @@ def normalize_overlay_fks(fks) -> list:
     return out
 
 
+# First-read overlay warming is per (data source, user, connection), and a
+# connection the user legitimately sees nothing on writes no rows — so "has no
+# rows" can never mean "already warmed". These remember the attempt instead, so
+# such a connection is re-crawled once per window rather than on every read.
+# Process-local and best-effort: a restart or a second worker just re-attempts.
+_WARM_ATTEMPTS: dict[tuple, float] = {}
+_WARM_RETRY_S = 300.0
+_WARM_ATTEMPTS_MAX = 10000
+
+
+# Every table holding a foreign key to data_sources whose database rule does
+# not delete or null it on its own (no ON DELETE CASCADE / SET NULL) must be
+# listed in exactly one of these, or deleting an agent stops on that key —
+# after the delete has already removed the agent's instructions and saved
+# queries. tests/unit/test_agent_delete_covers_every_reference.py enforces it.
+#
+# Cleared by delete_data_source (explicitly, or via an ORM relationship on
+# DataSource that deletes the rows):
+AGENT_DELETE_CLEARS = frozenset({
+    "data_source_file_association",      # DataSource.files (secondary)
+    "data_source_memberships",           # explicit delete
+    "datasource_tables",                 # delete_data_source_tables (+ retry)
+    "dream_runs",                        # explicit delete (nightly-learning log)
+    "entity_data_source_association",    # _delete_agent_scoped_entities
+    "git_repositories",                  # explicit delete
+    "instruction_data_source_association",  # _delete_agent_scoped_instructions
+    "instruction_directories",           # _delete_agent_scoped_instructions
+    "metadata_indexing_jobs",            # explicit delete
+    "metadata_resources",                # explicit delete
+    "project_data_source_association",   # explicit detach (Project-side M2M)
+    "prompt_data_source_association",    # DataSource.prompts (secondary)
+    "report_data_source_association",    # DataSource.reports (secondary)
+    "table_feedback_events",             # DataSource.table_feedback_events (cascade)
+    "table_stats",                       # DataSource.table_stats (cascade)
+    "table_usage_events",                # DataSource.table_usage_events (cascade)
+    "user_data_source_credentials",      # explicit delete
+    "webhook_data_source_association",   # explicit detach (Webhook-side M2M)
+})
+# Deliberately left pointing at the deleted id: history, and no database-level
+# constraint (the model declares a ForeignKey, the migration never created it).
+AGENT_DELETE_KEEPS = frozenset({
+    "llm_usage_records",                 # b1c2d3e4f5a6 adds the column without an FK
+})
+
+
+
+def _invalidate_agent_schema_cache(organization) -> None:
+    """Drop the org's cached agent schema context after a table/column
+    selection change. ContextHub caches the built schema for minutes; without
+    this the planner kept answering from the previous selection (a column the
+    manager just hid, or a table just deselected) until the TTL ran out."""
+    try:
+        from app.ai.context.context_hub import invalidate_schema_cache
+        invalidate_schema_cache(str(organization.id) if organization is not None else None)
+    except Exception:
+        logger.debug("schema cache invalidation skipped", exc_info=True)
+
 class DataSourceService:
 
     def __init__(self):
-        pass
+        self.last_discovery_diagnostics = []
 
     async def _bulk_connection_aux(
         self,
@@ -603,6 +675,7 @@ class DataSourceService:
         use_llm_sync = data_source_dict.pop("use_llm_sync", False)
         channel_availability = data_source_dict.pop("channel_availability", None)
         member_user_ids = data_source_dict.pop("member_user_ids", [])
+        member_bindings = data_source_dict.pop("member_bindings", None)
         auth_policy = data_source_dict.get("auth_policy", "system_only")
         
         # Check if linking to existing connection(s)
@@ -692,6 +765,10 @@ class DataSourceService:
             
             # Extract connection-related fields
             ds_type = data_source_dict.pop("type", None)
+            # Save-time guards (the validation above is skipped for user_required).
+            from app.services.connection_service import _check_network_dir_root, _reject_unsafe_google_keys
+            _check_network_dir_root(ds_type, config)
+            _reject_unsafe_google_keys(credentials)
             allowed_user_auth_modes = data_source_dict.pop("allowed_user_auth_modes", None)
 
             # Default allowed_user_auth_modes for user_required connections —
@@ -701,6 +778,13 @@ class DataSourceService:
             if auth_policy == "user_required" and not allowed_user_auth_modes:
                 from app.services.connection_service import default_user_auth_modes
                 allowed_user_auth_modes = default_user_auth_modes(ds_type, config, credentials)
+
+            from app.services.connection_service import _check_mcp_forwarding
+            _check_mcp_forwarding(ds_type, config)
+            from app.services.connection_service import check_member_bindings
+            member_bindings = check_member_bindings(
+                ds_type, config, auth_policy, allowed_user_auth_modes, member_bindings
+            )
 
             # Check enterprise license for restricted data sources
             from app.ee.license import is_datasource_allowed
@@ -730,6 +814,7 @@ class DataSourceService:
                 is_active=True,
                 auth_policy=auth_policy,
                 allowed_user_auth_modes=allowed_user_auth_modes,
+                member_bindings=member_bindings or None,
             )
             
             # Encrypt and store credentials on connection
@@ -879,19 +964,28 @@ class DataSourceService:
         # instead discover their tools now so the connector is immediately usable
         # by the agent (execute_mcp gates on ConnectionTool rows). Members can't
         # call the connection refresh-tools route, so we do it here on create.
+        # Everything above is committed first and ids are kept as plain strings:
+        # discovery is best-effort, and a failed flush must be rolled back —
+        # otherwise the reload below raised PendingRollbackError and the whole
+        # create 500'd — without losing the agent or touching expired objects.
+        new_data_source_id = str(new_data_source.id)
         try:
             tps = tool_provider_types()
             conns_for_tools = connections_to_link if connections_to_link else [new_connection]
-            tool_conns = [c for c in conns_for_tools if getattr(c, "type", None) in tps]
-            if tool_conns:
+            tool_conn_ids = [str(c.id) for c in conns_for_tools if getattr(c, "type", None) in tps]
+            if tool_conn_ids:
+                await db.commit()
                 from app.services.connection_service import ConnectionService
                 _csvc = ConnectionService()
-                for c in tool_conns:
+                for conn_id in tool_conn_ids:
                     try:
+                        c = await db.get(Connection, conn_id, populate_existing=True)
                         await _csvc.refresh_tools(db, c, current_user)
                     except Exception as _te:
-                        logger.warning(f"create_data_source: tool discovery failed for connection {getattr(c,'id',None)}: {_te}")
+                        await db.rollback()
+                        logger.warning(f"create_data_source: tool discovery failed for connection {conn_id}: {_te}")
         except Exception as _te:
+            await db.rollback()
             logger.warning(f"create_data_source: tool-provider refresh skipped: {_te}")
 
         # Reload the data source with relationships to avoid serialization issues
@@ -902,7 +996,7 @@ class DataSourceService:
                 selectinload(DataSource.connections),
                 selectinload(DataSource.tables),
             )
-            .where(DataSource.id == new_data_source.id)
+            .where(DataSource.id == new_data_source_id)
         )
         result = await db.execute(stmt)
         final_data_source = result.scalar_one()
@@ -950,12 +1044,23 @@ class DataSourceService:
             user_status=connections_list[0].user_status if connections_list else None,
         )
 
+    async def _default_model_for(self, db: AsyncSession, organization: Organization, current_user: User | None):
+        """The model generation runs on: the caller's group/org default, gated
+        by their model access. A restricted org default must not run for a
+        member whose group can't use it. No user (system jobs, or the blank
+        ``User()`` llm_sync passes) keeps the plain org default."""
+        from app.services.llm_service import LLMService
+        user = current_user if getattr(current_user, "id", None) else None
+        return await LLMService().get_default_model(db, organization, user)
+
     async def generate_data_source_items(self, db: AsyncSession, item: str, data_source_id: str, organization: Organization, current_user: User):
         # get data source by id
         result = await db.execute(select(DataSource).filter(DataSource.id == data_source_id, DataSource.organization_id == organization.id))
         data_source = result.scalar_one_or_none()
+        if not data_source:
+            raise HTTPException(status_code=404, detail="Data source not found")
 
-        model = await organization.get_default_llm_model(db)
+        model = await self._default_model_for(db, organization, current_user)
         if not model:
             raise HTTPException(status_code=400, detail="No default LLM model found")
 
@@ -1031,7 +1136,7 @@ class DataSourceService:
         """
         result: dict = {}
 
-        model = await organization.get_default_llm_model(db)
+        model = await self._default_model_for(db, organization, current_user)
 
         # Load the data source model instance for context and schema sync
         ds_q = await db.execute(
@@ -1176,7 +1281,9 @@ class DataSourceService:
 
         return result
 
-    async def get_data_source(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User = None) -> DataSourceSchema:
+    async def get_data_source(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User = None, include_config: bool = True) -> DataSourceSchema:
+        # include_config=False: view-level callers. Connection config carries
+        # internal topology that belongs on manage-gated surfaces only.
         # lazyload("*") suppresses the model-level lazy="selectin" cascade
         # (reports → widgets/queries/completions/…). The detail schema does
         # surface git_repository and memberships, so keep those eager. We
@@ -1224,6 +1331,7 @@ class DataSourceService:
             indexing_by_conn=indexing_by_conn,
             table_count_by_conn=table_count_by_conn,
             legacy_count_by_ds=legacy_count_by_ds,
+            include_config=include_config,
         )
 
         # Get first connection for legacy fields
@@ -1231,7 +1339,7 @@ class DataSourceService:
 
         # Parse config from connection (may be stored as JSON string)
         conn_config = None
-        if conn and conn.config:
+        if include_config and conn and conn.config:
             conn_config = json.loads(conn.config) if isinstance(conn.config, str) else conn.config
 
         # Serialize primary_instruction if present
@@ -1416,6 +1524,8 @@ class DataSourceService:
             query = query.filter(or_(*clauses))
         result = await db.execute(query)
         data_sources = result.scalars().all()
+        from app.services.connected_application_service import filter_agents
+        data_sources = await filter_agents(db, data_sources, organization.id)
         # Non-published agents (draft/disabled) are only visible to managers.
         is_gov, manage_ids, resolved = await self._publish_visibility(db, current_user, organization)
         # Batch the per-connection indexing + table-count lookups across the
@@ -1495,7 +1605,7 @@ class DataSourceService:
 
 
     async def _cached_table_names_by_ds(self, db: AsyncSession, data_sources) -> dict:
-        """{data_source_id: [names]} of ACTIVATED BOW custom queries.
+        """{data_source_id: [names]} of ACTIVATED BOW custom tables.
 
         One grouped query for the whole list — a per-agent lookup here would add
         a round trip per row to every agent-list render.
@@ -1614,6 +1724,8 @@ class DataSourceService:
 
         result = await db.execute(stmt)
         data_sources = result.scalars().all()
+        from app.services.connected_application_service import filter_agents
+        data_sources = await filter_agents(db, data_sources, organization.id)
 
         # Batch the per-connection indexing + table-count lookups across the
         # whole list so building N agents doesn't issue N×(queries) — the N+1
@@ -1794,12 +1906,29 @@ class DataSourceService:
             # Channel availability gating (external channels only).
             if not d.is_available_in(channel):
                 continue
-            conn = d.connections[0] if d.connections else None
-            # Only include data sources with system_only auth policy
-            # Skip user_required data sources since channel mentions can't use individual user credentials
-            auth_policy = conn.auth_policy if conn else "system_only"
-            if auth_policy == "user_required":
+            # Only include data sources every channel member can actually
+            # query. A channel mention is public and cannot stand in for an
+            # individual's credentials, so ANY delegated connection disqualifies
+            # the agent — not just the first one.
+            #
+            # This asked `connections[0]`, so a MIXED agent (system_only
+            # warehouse first, delegated Power BI second) reported
+            # "system_only" and was offered in the channel anyway — precisely
+            # what this filter exists to prevent. Channel members who have not
+            # connected their own account then get "Connect required" from an
+            # agent the channel advertised, and an owner or admin mentioning it
+            # reaches the system-credentials fallback in a public channel.
+            if any(
+                (getattr(c, "auth_policy", None) or "system_only") == "user_required"
+                for c in (d.connections or [])
+            ):
                 continue
+            # Legacy response fields only: the schema still carries a single
+            # `type` and `auth_policy`, so they report the first connection's.
+            # Everything that decides BEHAVIOUR above is per connection; these
+            # two are display shape the API has always had.
+            conn = d.connections[0] if d.connections else None
+            auth_policy = (getattr(conn, "auth_policy", None) or "system_only") if conn else "system_only"
 
             connections_list = await self._build_connections_list(
                 db=db,
@@ -1930,7 +2059,16 @@ class DataSourceService:
                 "setup_guide": meta.get("setup_guide"),
                 "auth": {
                     "default": entry.credentials_auth.default,
-                    "by_auth": {k: {"title": v.title} for k, v in (entry.credentials_auth.by_auth or {}).items() if allowed(k)},
+                    # scopes + catalog_ownership let a form tell a shared
+                    # (service) option from a per-user one without a type list.
+                    "by_auth": {
+                        k: {
+                            "title": v.title,
+                            "scopes": list(v.scopes or []),
+                            "catalog_ownership": v.catalog_ownership or entry.catalog_ownership,
+                        }
+                        for k, v in (entry.credentials_auth.by_auth or {}).items() if allowed(k)
+                    },
                     "policy": auth_policy or "system_only",
                 },
                 # False when no variant has the `user` scope: the form hides the
@@ -1953,6 +2091,29 @@ class DataSourceService:
         # Capture details before deletion for audit
         data_source_name = data_source.name
 
+        # Refuse BEFORE deleting anything if a reference this procedure does
+        # not clear still points at the agent: the steps below commit as they
+        # go, so a key that blocks the final DELETE would otherwise leave the
+        # agent in place with its instructions and saved queries already gone.
+        await self._assert_nothing_blocks_agent_delete(db, data_source_id, data_source_name)
+
+        # 0) Content scoped ONLY to this agent goes with it: instructions,
+        #    saved queries (entities) and eval test cases attached to this
+        #    agent and to no other are deleted; anything shared with another
+        #    agent is merely detached from this one; global content is
+        #    untouched. Dropping only the association rows would leave e.g. an
+        #    instruction with no data sources, which the app treats as
+        #    *global* (visible to every org member and loaded into every
+        #    agent's context) — a silent org-wide publish of this agent's
+        #    private knowledge. The agent's instruction folders go too.
+        await self._delete_agent_scoped_instructions(
+            db, data_source, organization=organization, current_user=current_user
+        )
+        await self._delete_agent_scoped_entities(
+            db, data_source, organization=organization, current_user=current_user
+        )
+        await self._delete_agent_scoped_test_cases(db, data_source_id)
+
         # 1) Delete per-user overlay columns and tables (they hard-FK the data source)
         #    Delete columns via subquery of overlay table ids, then overlay tables.
         overlay_ids_subq = select(UserOverlayTable.id).where(UserOverlayTable.data_source_id == data_source_id)
@@ -1972,6 +2133,9 @@ class DataSourceService:
         await db.execute(
             delete(UserDataSourceCredentials).where(UserDataSourceCredentials.data_source_id == data_source_id)
         )
+        # Nightly-learning run log for this agent (history of a deleted agent).
+        from app.models.dream_run import DreamRun
+        await db.execute(delete(DreamRun).where(DreamRun.data_source_id == data_source_id))
 
         # A suite's data_source_id is only its Drafts home, not ownership.
         # Preserve the suite and its cases as org-level content when its agent
@@ -1992,6 +2156,15 @@ class DataSourceService:
         await db.execute(
             delete(webhook_data_source_association).where(
                 webhook_data_source_association.c.data_source_id == data_source_id
+            )
+        )
+
+        # 2c) Same for projects that list this agent among their defaults
+        #     (Project.data_sources is declared only on the Project side). The
+        #     project stays; it just no longer offers this agent.
+        await db.execute(
+            delete(project_data_source_association).where(
+                project_data_source_association.c.data_source_id == data_source_id
             )
         )
 
@@ -2066,6 +2239,234 @@ class DataSourceService:
 
         return {"message": "Data source deleted successfully"}
 
+    async def _delete_agent_scoped_instructions(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        *,
+        organization: Organization,
+        current_user: User,
+    ) -> List[str]:
+        """Remove an agent's instruction scope before the agent row is deleted.
+
+        - Instructions attached to this agent and to no other are soft-deleted
+          together through ``InstructionService.bulk_delete_instructions``
+          (pending suggestions are voided, ONE removal build is recorded),
+          plus an ``instruction.deleted`` audit row per instruction.
+        - The remaining association rows (shared instructions) are dropped so
+          the shared instruction keeps only its other agents.
+        - The agent's folders and their placements are deleted. Folders
+          hard-FK the agent with no ON DELETE rule, so on Postgres leaving them
+          behind makes the parent DELETE fail.
+
+        Returns the ids of the instructions that were deleted.
+        """
+        from app.models.instruction import Instruction, instruction_data_source_association as assoc
+        from app.models.instruction_directory import InstructionDirectory, InstructionDirectoryPlacement
+
+        data_source_id = str(data_source.id)
+
+        attached_elsewhere = (
+            select(assoc.c.instruction_id)
+            .where(assoc.c.data_source_id != data_source_id)
+        )
+        only_here_q = await db.execute(
+            select(Instruction.id, Instruction.title)
+            .join(assoc, assoc.c.instruction_id == Instruction.id)
+            .where(
+                assoc.c.data_source_id == data_source_id,
+                Instruction.organization_id == str(organization.id),
+                Instruction.deleted_at.is_(None),
+                ~Instruction.id.in_(attached_elsewhere),
+            )
+        )
+        titles = {str(row[0]): row[1] for row in only_here_q.fetchall()}
+        only_here = list(titles)
+
+        # One soft-delete + one removal build for the whole set. Calling
+        # delete_instruction per row built, finalized and promoted a full copy
+        # of main for every instruction (O(agent instructions x org
+        # instructions), each promote waiting on the shared main-build lock),
+        # and committed each delete on its own, so a request that died midway
+        # left the agent alive with part of its instructions already gone.
+        if only_here:
+            instruction_service = InstructionService()
+            result = await instruction_service.bulk_delete_instructions(
+                db, only_here, current_user=current_user, organization=organization
+            )
+            deleted = [iid for iid in only_here if iid not in set(result.failed_ids)]
+            # bulk_delete_instructions writes no audit rows; keep the
+            # per-instruction trail the single delete path records.
+            for instruction_id in deleted:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="instruction.deleted",
+                    user_id=str(current_user.id),
+                    resource_type="instruction",
+                    resource_id=instruction_id,
+                    details={"title": titles[instruction_id]},
+                    commit=False,
+                )
+            await db.commit()
+            only_here = deleted
+
+        # Detach whatever is still linked (instructions shared with other
+        # agents, plus the rows of the instructions just soft-deleted).
+        await db.execute(delete(assoc).where(assoc.c.data_source_id == data_source_id))
+        # The ORM already holds this collection (lazy="selectin"); expire it so
+        # the parent DELETE does not try to remove the same rows again.
+        db.expire(data_source, ["instructions"])
+
+        directory_ids = select(InstructionDirectory.id).where(
+            InstructionDirectory.data_source_id == data_source_id
+        )
+        await db.execute(
+            delete(InstructionDirectoryPlacement).where(
+                InstructionDirectoryPlacement.directory_id.in_(directory_ids)
+            )
+        )
+        await db.execute(
+            delete(InstructionDirectory).where(InstructionDirectory.data_source_id == data_source_id)
+        )
+
+        if only_here:
+            logger.info(
+                "Deleted %d instruction(s) scoped only to data source %s",
+                len(only_here), data_source_id,
+            )
+        return only_here
+
+    @staticmethod
+    async def _assert_nothing_blocks_agent_delete(db: AsyncSession, data_source_id: str, name: str) -> None:
+        """Raise before any delete when a table this procedure does not clear
+        (see AGENT_DELETE_CLEARS) still references the agent through a foreign
+        key the database would enforce."""
+        from sqlalchemy import func
+        from app.models.base import metadata
+        from app.errors import AppError, ErrorCode
+
+        for table in metadata.tables.values():
+            if table.name in AGENT_DELETE_CLEARS or table.name in AGENT_DELETE_KEEPS:
+                continue
+            for fk in table.foreign_keys:
+                if fk.column.table.name != "data_sources":
+                    continue
+                if (fk.ondelete or "").upper() in ("CASCADE", "SET NULL"):
+                    continue
+                count = (await db.execute(
+                    select(func.count()).select_from(table).where(fk.parent == data_source_id)
+                )).scalar() or 0
+                if count:
+                    raise AppError.conflict(
+                        ErrorCode.DATA_SOURCE_IN_USE,
+                        f'Agent "{name}" is still referenced by {table.name}, so it cannot be deleted. Nothing was deleted.',
+                        agent=name, reference=table.name,
+                    )
+
+    async def _delete_agent_scoped_entities(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        *,
+        organization: Organization,
+        current_user: User,
+    ) -> List[str]:
+        """Same rule as instructions, for saved queries (entities).
+
+        Entities attached to this agent and to no other are deleted through
+        ``EntityService.delete_entity`` (audit row written); entities shared
+        with another agent lose only this agent's association row.
+        Returns the ids of the entities that were deleted.
+        """
+        from app.models.entity import Entity, entity_data_source_association as assoc
+        from app.services.entity_service import EntityService
+
+        data_source_id = str(data_source.id)
+
+        attached_elsewhere = (
+            select(assoc.c.entity_id)
+            .where(assoc.c.data_source_id != data_source_id)
+        )
+        only_here_q = await db.execute(
+            select(Entity.id)
+            .join(assoc, assoc.c.entity_id == Entity.id)
+            .where(
+                assoc.c.data_source_id == data_source_id,
+                Entity.organization_id == str(organization.id),
+                Entity.deleted_at.is_(None),
+                ~Entity.id.in_(attached_elsewhere),
+            )
+        )
+        only_here = [str(row[0]) for row in only_here_q.fetchall()]
+
+        entity_service = EntityService()
+        for entity_id in only_here:
+            await entity_service.delete_entity(
+                db, entity_id, organization=organization, current_user=current_user
+            )
+
+        # Detach the shared entities; the ORM collection is lazy="select" and
+        # not loaded, so expiring it keeps the parent DELETE from reloading
+        # (and re-deleting) these rows.
+        await db.execute(delete(assoc).where(assoc.c.data_source_id == data_source_id))
+        db.expire(data_source, ["entities"])
+
+        if only_here:
+            logger.info(
+                "Deleted %d entity(ies) scoped only to data source %s",
+                len(only_here), data_source_id,
+            )
+        return only_here
+
+    async def _delete_agent_scoped_test_cases(self, db: AsyncSession, data_source_id: str) -> List[str]:
+        """Same rule as instructions, for eval test cases.
+
+        A case targets agents through ``TestCase.data_source_ids_json``. A case
+        targeting only this agent is soft-deleted (the same soft delete
+        ``TestCaseService.delete_case`` performs — TestResult rows FK the case,
+        so it is never hard-deleted). A case that also targets other agents
+        just loses this agent's id; an agent-less case runs against every
+        agent and is untouched. The suite the cases live in is not touched
+        here: ``delete_data_source`` re-homes it to the org (see the
+        ``TestSuite`` update there).
+        Returns the ids of the cases that were deleted.
+        """
+        from app.core.eval_scope import _targets_agent
+        from app.models.eval import TestCase
+
+        data_source_id = str(data_source_id)
+        rows = (await db.execute(
+            select(TestCase)
+            .join(TestSuite, TestCase.suite_id == TestSuite.id)
+            .where(
+                TestCase.deleted_at.is_(None),
+                _targets_agent(TestCase.data_source_ids_json, data_source_id),
+            )
+        )).scalars().all()
+
+        deleted: List[str] = []
+        now = datetime.utcnow()
+        for case in rows:
+            targets = [str(x) for x in (case.data_source_ids_json or [])]
+            if data_source_id not in targets:
+                # Textual pre-filter false positive (id embedded in another value).
+                continue
+            remaining = [x for x in targets if x != data_source_id]
+            if remaining:
+                case.data_source_ids_json = remaining
+            else:
+                case.deleted_at = now
+                deleted.append(str(case.id))
+            db.add(case)
+
+        if deleted:
+            logger.info(
+                "Deleted %d eval case(s) scoped only to data source %s",
+                len(deleted), data_source_id,
+            )
+        return deleted
+
     async def delete_data_source_tables(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User):
         result = await db.execute(select(DataSourceTable).filter(DataSourceTable.datasource_id == data_source_id))
         tables = result.scalars().all()
@@ -2074,7 +2475,9 @@ class DataSourceService:
         await db.commit()
         return {"message": "Data source tables deleted successfully"}
     
-    async def test_data_source_connection(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User):
+    async def test_data_source_connection(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User, persist: bool = True):
+        """``persist=False`` (view-level callers) returns the probe result
+        without writing connection status or the agent's ``is_active``."""
         from datetime import datetime, timezone
         from sqlalchemy.orm import selectinload
         from app.services.connection_service import ConnectionService
@@ -2107,6 +2510,7 @@ class DataSourceService:
                         connection_id=str(conn.id),
                         organization=organization,
                         current_user=current_user,
+                        persist=persist,
                     )
                     success = bool(last_status.get("success")) if isinstance(last_status, dict) else bool(last_status)
                     if not success:
@@ -2115,15 +2519,30 @@ class DataSourceService:
                     all_success = False
                     last_status = {"success": False, "message": str(e)}
 
-            # Reflect connectivity on org-wide flag only for system creds
-            if getattr(data_source, "auth_policy", "system_only") == "system_only":
-                if not all_success:
+            # Reflect connectivity on the org-wide flag only when every
+            # connection is shared (system_only): then a failed probe means the
+            # agent is broken for everybody. On a per-user connection it says
+            # something about the caller only (not signed in, an expired
+            # token). The policy lives on the connection; the agent no longer
+            # carries one, so reading it there always saw the default.
+            shared_only = all(
+                (getattr(conn, "auth_policy", None) or "system_only") == "system_only"
+                for conn in data_source.connections
+            )
+            if persist and shared_only:
+                # Follow the connections' own flags rather than this one probe:
+                # test_connection deactivates a shared connection only after
+                # several failures in a row, and the agent must agree with it.
+                for conn in data_source.connections:
+                    await db.refresh(conn, attribute_names=["is_active"])
+                connections_up = all(bool(conn.is_active) for conn in data_source.connections)
+                if not connections_up:
                     data_source.is_active = False
                 elif data_source.is_active == False:
                     data_source.is_active = True
                 await db.commit()
+                await db.refresh(data_source)
 
-            await db.refresh(data_source)
             connection_status = last_status or {"success": all_success}
 
         except Exception as e:
@@ -2144,6 +2563,20 @@ class DataSourceService:
             data_source_type = payload.get("type")
             config = payload.get("config") or {}
             credentials = payload.get("credentials") or {}
+
+            # SSRF guard for MCP / custom API URLs (the clients' pinned
+            # transport guards the connect itself, rebinding included).
+            from app.services.connection_service import (
+                _check_network_dir_root,
+                _check_tool_provider_url,
+                _reject_unsafe_google_keys,
+            )
+            try:
+                _check_tool_provider_url(data_source_type, config)
+                _check_network_dir_root(data_source_type, config)
+                _reject_unsafe_google_keys(credentials)
+            except HTTPException as e:
+                return {"success": False, "message": e.detail}
 
             # Instantiate client by type using same naming convention as DataSource.get_client
             client = self._resolve_client_by_type(
@@ -2170,7 +2603,11 @@ class DataSourceService:
                 }
 
             # Step 2: Validate schema access by attempting to get tables
-            schema_status = await self._avalidate_schema_access(client)
+            # Warehouse query tag: this catalog read is part of a connection
+            # check, not indexing (app/data_sources/query_tag.py).
+            from app.data_sources.query_tag import query_tag_defaults
+            with query_tag_defaults(source="connection_test"):
+                schema_status = await self._avalidate_schema_access(client)
             
             # Combine results
             if not schema_status.get("success"):
@@ -2187,6 +2624,7 @@ class DataSourceService:
             message = _connected_message(
                 data_source_type, table_count,
                 approximate=bool(schema_status.get("table_count_approximate")),
+                config=config,
             )
             return {
                 "success": True,
@@ -2216,6 +2654,7 @@ class DataSourceService:
             from app.services.connection_service import (
                 VALIDATION_FILE_CAP,
                 _acount_files_for_validation,
+                _acount_tables_for_validation,
             )
             file_count = await _acount_files_for_validation(
                 client, limit=VALIDATION_FILE_CAP
@@ -2227,22 +2666,26 @@ class DataSourceService:
                     "table_count_approximate": file_count >= VALIDATION_FILE_CAP,
                 }
 
-            # Try aget_schemas first (most clients), fall back to get_tables
-            tables = None
-            if hasattr(client, "aget_schemas"):
-                tables = await client.aget_schemas()
-            elif hasattr(client, "get_tables"):
-                import asyncio
-                tables = await asyncio.to_thread(client.get_tables)
+            # Tabular sources that can count from a catalog view skip the full
+            # column introspection — the test only needs the count.
+            table_count = await _acount_tables_for_validation(client)
+            if table_count is None:
+                # Try aget_schemas first (most clients), fall back to get_tables
+                tables = None
+                if hasattr(client, "aget_schemas"):
+                    tables = await client.aget_schemas()
+                elif hasattr(client, "get_tables"):
+                    import asyncio
+                    tables = await asyncio.to_thread(client.get_tables)
 
-            if tables is None:
-                return {
-                    "success": False,
-                    "message": "Client does not support schema introspection",
-                    "table_count": 0,
-                }
+                if tables is None:
+                    return {
+                        "success": False,
+                        "message": "Client does not support schema introspection",
+                        "table_count": 0,
+                    }
 
-            table_count = len(tables) if tables else 0
+                table_count = len(tables) if tables else 0
 
             # Note: Empty databases are allowed - schema can be refreshed later when tables are added
             return {
@@ -2271,7 +2714,14 @@ class DataSourceService:
         
         # user_required → require per-user credentials
         if not current_user:
-            raise HTTPException(status_code=403, detail="User credentials required")
+            from app.services.access_errors import CredentialsRequiredError
+
+            raise CredentialsRequiredError("User credentials required")
+        from app.services.member_identity import member_mapped
+        if member_mapped(conn):
+            # Admin-mapped identity: stored per-user rows never apply.
+            from app.services.connection_service import ConnectionService
+            return await ConnectionService().resolve_credentials(db, conn, current_user)
         row = await db.execute(
             select(UserDataSourceCredentials)
             .where(
@@ -2285,7 +2735,7 @@ class DataSourceService:
         if not row:
             # No data-source-level creds — delegate to the connection-level resolver,
             # the single source of truth for delegated/OBO tokens, the admin
-            # query-identity toggle, OAuth refresh, the legacy owner/admin system
+            # query-identity toggle, OAuth refresh, the legacy admin system
             # fallback, and the "connect required" 403.
             from app.services.connection_service import ConnectionService
             return await ConnectionService().resolve_credentials(db, conn, current_user)
@@ -2310,28 +2760,12 @@ class DataSourceService:
         # Merge config and creds
         config = json.loads(conn.config) if isinstance(conn.config, str) else (conn.config or {})
         creds = await self.resolve_credentials(db=db, data_source=data_source, current_user=current_user)
-        params = {**(config or {}), **(creds or {})}
+        params = merge_client_credentials(config, creds)
         # Strip meta keys and oauth override keys
-        meta_keys = {"auth_type", "auth_policy", "allowed_user_auth_modes"}
+        meta_keys = {"auth_policy", "allowed_user_auth_modes"} | RUNTIME_CONFIG_KEYS
         params = {k: v for k, v in (params or {}).items() if v is not None and k not in meta_keys and not k.startswith("oauth_")}
-        # Narrow to constructor signature — same VAR_KEYWORD-aware logic as
-        # ConnectionService.construct_client. Forwarder subclasses (e.g.
-        # `class OnedriveClient(GraphDriveClient): def __init__(self, **kw): super().__init__(**kw)`)
-        # only expose `self` + `kwargs` to inspect; narrowing on that would
-        # strip every real arg (access_token, tenant_id, …). When the ctor
-        # accepts **kwargs, pass everything through.
-        try:
-            import inspect
-            sig = inspect.signature(ClientClass.__init__)
-            accepts_var_kwargs = any(
-                p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-            if accepts_var_kwargs:
-                allowed = params
-            else:
-                allowed = {k: v for k, v in params.items() if k in sig.parameters and k != "self"}
-        except Exception:
-            allowed = params
+        allowed = filter_client_parameters(ClientClass, params)
+        await _acheck_connection_destination(conn.type, params)
         return ClientClass(**allowed)
 
     @staticmethod
@@ -2454,6 +2888,8 @@ class DataSourceService:
 
         With no current_user (system/scheduled contexts) nothing is filtered.
         """
+        from app.services.connected_application_service import filter_agents
+        data_sources = await filter_agents(db, data_sources, organization.id)
         if current_user is None:
             return list(data_sources or [])
 
@@ -2527,7 +2963,10 @@ class DataSourceService:
                 skipped.append(getattr(ds, "name", str(getattr(ds, "id", "?"))))
         return usable, skipped
 
-    async def construct_clients(self, db: AsyncSession, data_source: DataSource, current_user: User | None) -> Dict[str, Any]:
+    async def construct_clients(
+        self, db: AsyncSession, data_source: DataSource, current_user: User | None,
+        *, connection_errors: Optional[list] = None,
+    ) -> Dict[str, Any]:
         """
         Construct clients for ALL connections in the domain.
 
@@ -2536,8 +2975,16 @@ class DataSourceService:
 
         For backward compatibility with legacy code, also adds aliases:
         - "{domain_name}" (only if single connection, for legacy ds_clients.get("name") pattern)
+
+        By default the first connection that fails aborts the whole data
+        source. Passing a `connection_errors` list opts into building each
+        connection independently: a connection that fails is appended to it
+        (data_source_id/_name, connection_id/_name, error) and its key holds an
+        UnavailableConnectionClient that raises that error only when queried,
+        so sibling connections still serve. If EVERY connection fails, the
+        first error is raised as before and nothing is appended — callers keep
+        reporting that as a data-source-level failure.
         """
-        import inspect
         from typing import Dict, Any
 
         # Access backstop: never build a credentialed client for a data source
@@ -2547,6 +2994,10 @@ class DataSourceService:
         # sources regardless of what a (possibly stale or hand-crafted) report
         # snapshot claims. `current_user is None` means a trusted system/scheduled
         # context, which is not filtered (mirrors filter_user_*_data_sources).
+        from app.services.connected_application_service import agent_ceiling
+        ceiling = await agent_ceiling(db, data_source.organization_id)
+        if ceiling is not None and str(data_source.id) not in ceiling:
+            raise AppError.forbidden(ErrorCode.APPLICATION_AGENT_FORBIDDEN, "Application has no access to this agent")
         if current_user is not None:
             from app.core.permission_resolver import user_can_access_data_source
             if not await user_can_access_data_source(
@@ -2576,71 +3027,98 @@ class DataSourceService:
         ]
 
         clients: Dict[str, Any] = {}
-        meta_keys = {"auth_type", "auth_policy", "allowed_user_auth_modes"}
+        meta_keys = {"auth_policy", "allowed_user_auth_modes"} | RUNTIME_CONFIG_KEYS
+        failed: list = []
 
         for conn in active_connections:
             key = f"{data_source.name}:{conn.name}"
-
-            # Resolve client class from registry
-            ClientClass = resolve_client_class(conn.type)
-
-            # Merge config and creds
-            config = json.loads(conn.config) if isinstance(conn.config, str) else (conn.config or {})
-
-            # Resolve credentials for this specific connection
-            creds = await self.resolve_credentials_for_connection(
-                db=db,
-                connection=conn,
-                data_source=data_source,
-                current_user=current_user
-            )
-
-            params = {**(config or {}), **(creds or {})}
-            params = {k: v for k, v in params.items() if v is not None and k not in meta_keys}
-
-            # Narrow to constructor signature (VAR_KEYWORD-aware; see
-            # ConnectionService.construct_client for the reasoning).
+            # A connection's clients are committed to `clients` only once they
+            # all built, so a failure part-way never leaves half of them behind.
+            built: Dict[str, Any] = {}
             try:
-                sig = inspect.signature(ClientClass.__init__)
-                accepts_var_kwargs = any(
-                    p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                # Resolve client class from registry
+                ClientClass = resolve_client_class(conn.type)
+
+                # Merge config and creds
+                config = json.loads(conn.config) if isinstance(conn.config, str) else (conn.config or {})
+
+                # Resolve credentials for this specific connection
+                creds = await self.resolve_credentials_for_connection(
+                    db=db,
+                    connection=conn,
+                    data_source=data_source,
+                    current_user=current_user
                 )
-                if accepts_var_kwargs:
-                    allowed = params
-                else:
-                    allowed = {k: v for k, v in params.items() if k in sig.parameters and k != "self"}
-            except Exception:
-                allowed = params
 
-            client = ClientClass(**allowed)
-            self._attach_client_quota_metadata(client, data_source, conn, key)
-            await self._attach_stored_table_metadata(db, client, data_source, conn, current_user=current_user)
-            clients[key] = client
+                params = merge_client_credentials(config, creds)
+                params = {k: v for k, v in params.items() if v is not None and k not in meta_keys}
 
-            # Accelerated (FAST) relations for this connection, exposed as a
-            # sibling client speaking DuckDB SQL. Only relations this agent has
-            # ACTIVATED are attached — that filtering is the authorization
-            # boundary and it is structural, since a relation absent from the
-            # DuckDB catalog cannot be named at all.
-            fast_client = await self._construct_fast_client(
-                db, data_source, conn, current_user=current_user
-            )
-            if fast_client is not None:
-                fast_key = f"{key}::fast"
-                self._attach_client_quota_metadata(fast_client, data_source, conn, fast_key)
-                clients[fast_key] = fast_client
+                allowed = filter_client_parameters(ClientClass, params)
+
+                await _acheck_connection_destination(conn.type, params)
+                client = ClientClass(**allowed)
+                self._attach_client_quota_metadata(client, data_source, conn, key)
+                await self._attach_stored_table_metadata(db, client, data_source, conn, current_user=current_user)
+                await self._attach_table_scope(db, client, data_source, conn)
+                built[key] = client
+
+                # Accelerated (FAST) relations for this connection, exposed as a
+                # sibling client speaking DuckDB SQL. Only relations this agent has
+                # ACTIVATED are attached — that filtering is the authorization
+                # boundary and it is structural, since a relation absent from the
+                # DuckDB catalog cannot be named at all.
+                fast_client = await self._construct_fast_client(
+                    db, data_source, conn, current_user=current_user
+                )
+                if fast_client is not None:
+                    fast_key = f"{key}::fast"
+                    self._attach_client_quota_metadata(fast_client, data_source, conn, fast_key)
+                    built[fast_key] = fast_client
+            except Exception as e:
+                if connection_errors is None:
+                    raise
+                failed.append({
+                    "data_source_id": str(data_source.id),
+                    "data_source_name": data_source.name,
+                    "connection_id": str(conn.id),
+                    "connection_name": conn.name,
+                    "error": e,
+                })
+                from app.data_sources.clients._unavailable_client import UnavailableConnectionClient
+                clients[key] = UnavailableConnectionClient(e)
+                continue
+            clients.update(built)
+
+        if failed:
+            if len(failed) == len(active_connections):
+                # Nothing usable: the same data-source-level failure as before.
+                # The stand-ins ride along, so a caller that still runs this
+                # source's charts (a reader's run) hands their code a client
+                # that fails with this cause, not a missing-key error.
+                error = failed[0]["error"]
+                stand_ins = dict(clients)
+                if len(active_connections) == 1:
+                    only_key = f"{data_source.name}:{active_connections[0].name}"
+                    if only_key in stand_ins:
+                        stand_ins[data_source.name] = stand_ins[only_key]
+                try:
+                    error.unavailable_clients = stand_ins
+                except Exception:
+                    pass
+                raise error
+            connection_errors.extend(failed)
 
         # Backward compatibility: add legacy key aliases for single-connection domains
         if len(active_connections) == 1:
-            first_key = next(iter(clients.keys()))
-            first_client = clients[first_key]
-            clients[data_source.name] = first_client
+            only_key = f"{data_source.name}:{active_connections[0].name}"
+            if only_key in clients:
+                clients[data_source.name] = clients[only_key]
 
         return clients
 
     async def _construct_fast_client(self, db: AsyncSession, data_source: DataSource,
                                      connection, current_user: User | None = None):
-        """Build the FastQueryClient for the custom queries this agent activated.
+        """Build the FastQueryClient for the custom tables this agent activated.
 
         Returns None when the agent has activated none — most agents, most of the
         time — so no extra client appears in the common case.
@@ -2716,16 +3194,16 @@ class DataSourceService:
             # Attaching an unlinked row to a sibling connection's client is
             # harmless — resolution is by name, and a name it does not own simply
             # will not match (this is what the old no-rows fallback already did).
-            # NB: no is_active filter. This map only resolves a query target
-            # (table name → dataset GUID); it grants no access — the delegated
-            # token still gates executeQueries. On a user_required source the
-            # canonical row for a delegated dataset is inactive (the service
-            # principal that indexed the catalog has no access to it), so an
-            # is_active filter left the map empty and every viewer run failed
-            # with "Could not resolve Power BI dataset". The GUID is present on
-            # the inactive row, so keep it.
+            # Only ACTIVATED rows resolve a query target. Activation is the
+            # agent manager's table selection and it must hold at query time
+            # too, not just in the prompt: a generated query naming a table the
+            # manager left out would otherwise still resolve its dataset GUID
+            # and run. A user-discovered delegated dataset gets its canonical
+            # row on overlay sync (see _upsert_user_overlay), so activating it
+            # in the tables wizard is what makes it queryable — the same rule
+            # as a service-principal-indexed table.
             rows = (await db.execute(
-                select(DataSourceTable.name, DataSourceTable.metadata_json)
+                select(DataSourceTable.id, DataSourceTable.name, DataSourceTable.metadata_json, DataSourceTable.is_active)
                 .outerjoin(ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id)
                 .where(
                     DataSourceTable.datasource_id == str(data_source.id),
@@ -2735,33 +3213,110 @@ class DataSourceService:
                     ),
                 )
             )).all()
-            attach = {name: metadata_json for name, metadata_json in rows}
+            attach: dict[str, Any] = {}
+            blocked: dict[str, Any] = {}
+            active_by_id: dict[str, Any] = {}
+            blocked_by_id: dict[str, Any] = {}
+            for row_id, name, metadata_json, is_active in rows:
+                if is_active:
+                    attach[name] = metadata_json
+                    active_by_id[str(row_id)] = metadata_json
+                    blocked.pop(name, None)
+                elif name not in attach:
+                    blocked[name] = metadata_json
+                    blocked_by_id[str(row_id)] = metadata_json
 
-            # Merge the executing user's overlay metadata. A delegated dataset
-            # can enter the catalog ONLY through a user's own discovery, so for
-            # a viewer whose overlay carries the GUID but whose canonical row is
-            # missing entirely, the overlay is the sole source of the mapping.
-            # Overlay values win — they were discovered under this user's creds.
+            # Merge the executing user's overlay metadata for ACTIVATED tables.
+            # A delegated dataset is discovered under the user's own creds, so
+            # the overlay row can carry a GUID the canonical row lacks (e.g. the
+            # service principal never saw the model). Overlay values win for a
+            # name the manager activated; a name that is not activated is never
+            # made resolvable by the overlay — that would let a user's broader
+            # upstream access widen the agent past its manager's selection.
+            #
+            # Activation follows the overlay's `data_source_table_id` link (the
+            # id was matched on dataset/table identity at sync time), with the
+            # name as a fallback for unlinked legacy overlays. After a dataset
+            # rename the overlay's display name differs from the canonical one
+            # the service principal indexed, and it is the overlay's name that
+            # the user's schema context shows — so that name must resolve too.
             if current_user is not None:
                 from app.models.user_data_source_overlay import UserDataSourceTable
                 ov = (await db.execute(
-                    select(UserDataSourceTable.table_name, UserDataSourceTable.metadata_json)
+                    select(
+                        UserDataSourceTable.table_name,
+                        UserDataSourceTable.metadata_json,
+                        UserDataSourceTable.data_source_table_id,
+                    )
                     .where(
                         UserDataSourceTable.data_source_id == str(data_source.id),
                         UserDataSourceTable.user_id == str(current_user.id),
                         UserDataSourceTable.is_accessible == True,
                     )
                 )).all()
-                for name, metadata_json in ov:
-                    if metadata_json:
+                for name, metadata_json, linked_id in ov:
+                    linked_id = str(linked_id) if linked_id else None
+                    if linked_id and linked_id in active_by_id:
+                        attach[name] = metadata_json or active_by_id[linked_id]
+                        blocked.pop(name, None)
+                    elif linked_id and linked_id in blocked_by_id:
+                        if name not in attach:
+                            blocked[name] = metadata_json or blocked_by_id[linked_id]
+                    elif metadata_json and name in attach:
                         attach[name] = metadata_json
 
             client.attach_table_metadata(
                 [{"name": name, "metadata_json": metadata_json} for name, metadata_json in attach.items()]
             )
+            # Clients that address a whole model per query (Power BI: one
+            # dataset GUID, any table in its DAX body) also get the NOT
+            # activated tables of the catalog, so they can refuse a query body
+            # that reaches past the activated set. Opt-in hook.
+            if hasattr(client, "attach_blocked_table_metadata"):
+                client.attach_blocked_table_metadata(
+                    [{"name": name, "metadata_json": metadata_json} for name, metadata_json in blocked.items()]
+                )
         except Exception:
             # Non-fatal: the client falls back to live discovery.
             logger.debug("attach_stored_table_metadata failed", exc_info=True)
+
+    async def _attach_table_scope(self, db: AsyncSession, client, data_source: DataSource, connection) -> None:
+        """Attach the agent's table selection to a SQL client so it holds at
+        query time (enforced by the code-execution wrapper, see
+        app/ai/code_execution/table_scope.py).
+
+        Covers the rows of THIS connection plus unlinked legacy rows, the same
+        set `_attach_stored_table_metadata` reads. Nothing is attached when the
+        data source has no table rows (never indexed: there is no selection to
+        enforce) or the client is not a SQL dialect the check can parse.
+
+        Errors propagate: a client that should be scoped must not be handed
+        out unscoped.
+        """
+        from app.ai.code_execution.sql_guard import dialect_for_client
+        from app.ai.code_execution.table_scope import TABLE_SCOPE_ATTR, TableScope
+        from app.models.datasource_table import DataSourceTable
+        from app.models.connection_table import ConnectionTable
+
+        if not dialect_for_client(client):
+            return
+        rows = (await db.execute(
+            select(DataSourceTable.name, DataSourceTable.is_active)
+            .outerjoin(ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id)
+            .where(
+                DataSourceTable.datasource_id == str(data_source.id),
+                or_(
+                    ConnectionTable.connection_id == str(connection.id),
+                    DataSourceTable.connection_table_id.is_(None),
+                ),
+            )
+        )).all()
+        if not rows:
+            return
+        setattr(client, TABLE_SCOPE_ATTR, TableScope.from_names(
+            active=[name for name, is_active in rows if is_active],
+            inactive=[name for name, is_active in rows if not is_active],
+        ))
 
     def _attach_client_quota_metadata(self, client, data_source: DataSource, connection, client_key: str) -> None:
         try:
@@ -2807,6 +3362,11 @@ class DataSourceService:
         auth_policy = connection.auth_policy or "system_only"
 
         # For user_required, resolve per-user credentials.
+        from app.services.member_identity import member_mapped
+        if auth_policy == "user_required" and current_user and member_mapped(connection):
+            # Admin-mapped identity: stored per-user rows never apply.
+            from app.services.connection_service import ConnectionService
+            return await ConnectionService().resolve_credentials(db, connection, current_user)
         if auth_policy == "user_required" and current_user:
             # Data-source-level per-user creds (legacy user/pass keyed on the DS).
             from app.services.user_data_source_credentials_service import UserDataSourceCredentialsService
@@ -2826,7 +3386,7 @@ class DataSourceService:
             # Connection-level resolution. ConnectionService.resolve_credentials is the
             # single source of truth: it handles delegated/OBO tokens, the admin
             # query-identity toggle (service account vs self), OAuth refresh, the legacy
-            # owner/admin system fallback for non-delegated connections, and the
+            # admin system fallback for non-delegated connections, and the
             # "connect required" 403 for a self-identity user with no token.
             from app.services.connection_service import ConnectionService
             return await ConnectionService().resolve_credentials(db, connection, current_user)
@@ -2843,14 +3403,18 @@ class DataSourceService:
         try:
             ClientClass = resolve_client_class(data_source_type)
 
-            client_params = (config or {}).copy()
-            if credentials:
-                client_params.update(credentials)
+            client_params = merge_client_credentials(config, credentials)
 
             # Strip meta keys, empty values, and oauth override keys (not part of client signatures)
-            meta_keys = {"auth_type", "auth_policy", "allowed_user_auth_modes"}
+            meta_keys = {"auth_policy", "allowed_user_auth_modes"} | RUNTIME_CONFIG_KEYS
             client_params = {k: v for k, v in (client_params or {}).items() if v is not None and v != "" and k not in meta_keys and not k.startswith("oauth_")}
 
+            client_params = filter_client_parameters(
+                ClientClass, client_params, only={"auth_type"}
+            )
+
+            from app.core.egress import check_connection_params
+            check_connection_params(data_source_type, client_params)
             return ClientClass(**client_params)
         except (ImportError, AttributeError) as e:
             raise ValueError(f"Unable to load data source client for {data_source_type}: {str(e)}")
@@ -2876,7 +3440,28 @@ class DataSourceService:
         connection_fields = {'config', 'credentials', 'auth_policy'}
         connection_updates = {k: update_data.pop(k) for k in list(update_data.keys()) if k in connection_fields}
         connection_changed = bool(connection_updates)
-        
+
+        # Rewriting config/credentials/auth_policy mutates the underlying
+        # (possibly shared) Connection, so it needs the same authorization as
+        # PUT /connections/{id}: `manage_connection` on that connection.
+        # `manage` on the data source alone is not enough.
+        if connection_changed and data_source_db.connections:
+            from app.core.permissions_decorator import check_resource_permissions
+            try:
+                await check_resource_permissions(
+                    db,
+                    str(current_user.id),
+                    str(organization.id),
+                    "connection",
+                    [str(c.id) for c in data_source_db.connections[:1]],
+                    "manage_connection",
+                )
+            except HTTPException:
+                raise HTTPException(
+                    status_code=403,
+                    detail="You don't have permission to modify this connection",
+                )
+
         # Handle membership updates
         newly_added_member_ids: List[str] = []
         if 'member_user_ids' in update_data:
@@ -2956,9 +3541,18 @@ class DataSourceService:
                 conn = data_source_db.connections[0]
                 if conn.auth_policy == "system_only":
                     try:
+                        # Own session: refresh_schema rolls back on failure, which
+                        # would expire this request's objects (data source, org,
+                        # user) and break the reads below with greenlet_spawn.
+                        from app.dependencies import async_session_maker
+                        from app.models.connection import Connection
                         from app.services.connection_service import ConnectionService
-                        conn_svc = ConnectionService()
-                        await conn_svc.refresh_schema(db, conn, current_user)
+                        async with async_session_maker() as refresh_db:
+                            refresh_conn = await refresh_db.get(Connection, conn.id)
+                            if refresh_conn is not None:
+                                await ConnectionService().refresh_schema(
+                                    refresh_db, refresh_conn, current_user
+                                )
                     except Exception:
                         # Non-fatal: tables refresh can fail without blocking update
                         pass
@@ -3001,7 +3595,7 @@ class DataSourceService:
             )
         except Exception as e:
             await db.rollback()
-            raise HTTPException(status_code=500, detail=f"Failed to update data source: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to update data source: {redact_error(e)}")
 
     def _extract_fields_from_schema(self, schema: BaseModel):
         main_model_schema = schema.model_json_schema()  # (1)!
@@ -3036,7 +3630,7 @@ class DataSourceService:
             raise
         except Exception as e:
             print(f"Error getting data source schema: {e}")
-            raise HTTPException(status_code=500, detail=f"Error getting data source schema: {e}")
+            raise HTTPException(status_code=500, detail=f"Error getting data source schema: {redact_error(e)}")
     
     async def get_data_source_schema(self, db: AsyncSession, data_source_id: str, include_inactive: bool = False, organization: Organization = None, current_user: User = None, with_stats: bool = False):
         result = await db.execute(
@@ -3049,57 +3643,211 @@ class DataSourceService:
         if not data_source:
             raise HTTPException(status_code=404, detail="Data source not found")
         
-        # Get auth_policy from the first connection (auth_policy is now on Connection, not DataSource)
-        auth_policy = "system_only"
-        if data_source.connections:
-            auth_policy = data_source.connections[0].auth_policy or "system_only"
-            
-        # For user_required policy, read from the persisted user overlay first.
-        # Cache-first keeps page renders fast and avoids hammering Drive APIs on
-        # every UI navigation.
+        # Per-connection identity scoping. This used to read auth_policy off
+        # `connections[0]` and then return EITHER the caller's overlay OR the
+        # canonical catalog for the whole agent. On a mixed agent (delegated
+        # Power BI + system_only warehouse) that either/or dropped every table
+        # belonging to the other connections.
         #
-        # On a cache miss (no overlay rows yet) fall back to the live per-user
-        # fetch, which resolves credentials with the owner/admin system-creds
-        # fallback and persists the overlay (warming the cache for next time).
-        # This is the populate-on-first-read path; it also restores the owner
-        # fallback on shared-catalog user_required sources (e.g. SQLite), where
-        # an owner refresh stores tables as inactive canonical rows that a
-        # cache-only read would miss. If the live fetch can't run (no creds yet,
-        # e.g. OneDrive before OAuth) it raises and we drop to the canonical
-        # schema below — typically empty for per-user catalogs.
-        if auth_policy == "user_required" and current_user is not None:
-            # Gate on the user's CURRENT access, not just the (possibly stale)
-            # overlay. The overlay's is_accessible flag tracks the last sync, not
-            # live credential validity — a disconnected user's rows can linger as
-            # accessible. Classify access fresh and serve accordingly.
-            effective_auth = await self._resolve_effective_auth(db, data_source, current_user)
-            if effective_auth == "user":
-                # User has their own creds → their overlay/live catalog only.
-                # Never fall through to the canonical (admin) catalog: for shared
-                # user_required sources (e.g. Fabric) that would leak tables the
-                # user can't actually query.
-                try:
-                    overlay = await self.read_user_data_source_schema(db=db, data_source=data_source, user=current_user)
-                    if overlay:
-                        return overlay
-                    live = await self.get_user_data_source_schema(db=db, data_source=data_source, user=current_user)
-                    return live or []
-                except Exception:
-                    return []
-            elif effective_auth == "none":
-                # No proven access (disconnected, expired, revoked) → no tables
-                # for a plain member; do NOT leak the canonical catalog to them.
-                # Owner/admin fall through to the canonical catalog below — they
-                # already see it via connection management endpoints, and hiding
-                # it here only breaks agent configuration before first sign-in.
-                if not await self._admin_catalog_access(db, data_source, current_user):
-                    return []
-            # effective_auth == "system" → owner/admin via service account:
-            # fall through to the canonical full catalog below.
+        # The two halves are not interchangeable and must be merged, not chosen
+        # between: overlay rows carry per-user COLUMN masking, canonical rows do
+        # not, so serving canonical rows for a delegated connection would widen
+        # what that user sees. So: overlay tables for the connections the caller
+        # runs delegated on, canonical tables for the open ones.
+        delegated_conns = [
+            c for c in (data_source.connections or [])
+            if (getattr(c, "auth_policy", None) or "system_only") == "user_required"
+        ]
 
-        schemas = await data_source.get_schemas(db=db, include_inactive=include_inactive, with_stats=with_stats)
+        if not delegated_conns or current_user is None:
+            return await data_source.get_schemas(
+                db=db, include_inactive=include_inactive, with_stats=with_stats
+            )
 
-        return schemas
+        # Populate-on-first-read: warm the overlay when the caller runs with
+        # their own token and has no rows yet, so the first render after
+        # connecting isn't empty. A no-op once warm.
+        await self._warm_user_overlay_if_empty(db, data_source, current_user, delegated_conns)
+
+        buckets = await self.classify_connection_access(db, data_source, current_user)
+        scope = await self._resolve_catalog_scope(
+            db, data_source, current_user, buckets=buckets
+        )
+        visible_ids = {
+            str(row) for row in (await db.execute(
+                scope(select(DataSourceTable.id).where(
+                    DataSourceTable.datasource_id == str(data_source.id)
+                ))
+            )).scalars().all()
+        }
+        if not visible_ids:
+            return []
+
+        # The overlay speaks ONLY for the connections the caller currently runs
+        # delegated on. An overlay row survives a connection moving to a service
+        # account (query identity switched to `service_account`, so the
+        # classifier now calls it open), and keeping that stale personal row
+        # suppressed the canonical schema through `covered` below — the agent
+        # kept serving one user's narrowed column set for a connection everyone
+        # now shares. Same NULL-provenance rule as the row predicate.
+        open_ids, overlay_ids, denied_ids = buckets
+        allowed_conn_ids = set(overlay_ids)
+        allow_unattributed = bool(overlay_ids) and not denied_ids
+
+        def _overlay_row_allowed(t) -> bool:
+            cid = getattr(t, "connection_id", None)
+            if not cid:
+                return allow_unattributed
+            return str(cid) in allowed_conn_ids
+
+        overlay_tables = []
+        try:
+            overlay_tables = [
+                t for t in await self.read_user_data_source_schema(
+                    db=db, data_source=data_source, user=current_user,
+                    active_only=not include_inactive,
+                )
+                if str(getattr(t, "id", "")) in visible_ids and _overlay_row_allowed(t)
+            ]
+        except Exception:
+            logger.warning(
+                "Overlay read failed for data source %s / user %s; serving open connections only",
+                data_source.id, getattr(current_user, "id", None), exc_info=True,
+            )
+
+        # Canonical rows for the OPEN connections only. Canonical rows carry the
+        # full column set as the service account discovered it, so serving one
+        # for a delegated connection hands the caller columns their own token
+        # cannot see. Anything a delegated connection owns therefore comes from
+        # the overlay list or not at all — including when the overlay read above
+        # raised, where falling back to canonical would turn a transient failure
+        # into a masking bypass.
+        canonical_eligible = await self._open_catalog_table_ids(
+            db, data_source, open_ids=open_ids, candidate_ids=visible_ids
+        )
+        covered = {str(getattr(t, "id", "")) for t in overlay_tables}
+        canonical_tables = await data_source.get_schemas(
+            db=db, include_inactive=include_inactive, with_stats=with_stats,
+            visible_table_ids={i for i in canonical_eligible if i not in covered},
+        )
+
+        return overlay_tables + canonical_tables
+
+    async def _open_catalog_table_ids(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        open_ids: list[str],
+        candidate_ids: set[str],
+    ) -> set[str]:
+        """Of `candidate_ids`, the rows canonical (unmasked) schema may serve.
+
+        That is: rows belonging to an open connection, plus unlinked legacy rows
+        that no delegated user's own sync contributed (`discovered_by != "user"`
+        — the shared catalog of a pre-connection agent). A row a delegated user
+        discovered under their own token is theirs, has per-user columns, and
+        must come from the overlay.
+        """
+        from app.models.connection_table import ConnectionTable
+
+        if not candidate_ids:
+            return set()
+
+        discovered_by = self._json_text(db, DataSourceTable.metadata_json, "discovered_by")
+        branches = [
+            and_(
+                DataSourceTable.connection_table_id.is_(None),
+                or_(discovered_by.is_(None), discovered_by != "user"),
+            )
+        ]
+        if open_ids:
+            branches.append(DataSourceTable.connection_table_id.in_(
+                select(ConnectionTable.id).where(ConnectionTable.connection_id.in_(open_ids))
+            ))
+
+        # Filtered by data source rather than by the candidate id list: that
+        # list is one bind parameter per table and a delegated catalog runs to
+        # tens of thousands, past PostgreSQL's 32767 ceiling. Intersect locally.
+        rows = (await db.execute(
+            select(DataSourceTable.id).where(
+                DataSourceTable.datasource_id == str(data_source.id),
+                or_(*branches),
+            )
+        )).scalars().all()
+        return {str(r) for r in rows} & candidate_ids
+
+    async def _warm_user_overlay_if_empty(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        current_user: User,
+        delegated_conns: list,
+    ) -> None:
+        """Populate this caller's overlay on first read, PER CONNECTION.
+
+        Warming used to short-circuit on the first overlay row found anywhere on
+        the agent, so a delegated connection attached after the user's first
+        read stayed permanently un-warmed: its catalog was missing until someone
+        hit an explicit refresh. Each connection is now warmed on its own.
+
+        Cheap no-op once warm; failures are non-fatal (the caller falls back to
+        whatever the scope predicate admits).
+        """
+        try:
+            rows = (await db.execute(
+                select(UserOverlayTable.connection_id).where(
+                    UserOverlayTable.data_source_id == str(data_source.id),
+                    UserOverlayTable.user_id == str(current_user.id),
+                ).distinct()
+            )).scalars().all()
+            warm_conn_ids = {str(r) for r in rows if r}
+            has_legacy_rows = any(r is None for r in rows)
+
+            for conn in delegated_conns:
+                conn_id = str(conn.id)
+                if conn_id in warm_conn_ids:
+                    continue
+                # Rows written before overlays were connection-aware carry no
+                # connection; on a single-connection agent they ARE that
+                # connection's catalog, so warming again would re-crawl a source
+                # that is already warm.
+                if has_legacy_rows and len(delegated_conns) == 1:
+                    continue
+                if self._warm_attempted(data_source, current_user, conn_id):
+                    # A connection the user legitimately sees nothing on writes
+                    # no rows, so "no rows" can never mean "warm". Without this
+                    # the read path would re-crawl the source on every request.
+                    continue
+                eff = await self._resolve_effective_auth(
+                    db, data_source, current_user, connection=conn
+                )
+                if eff != "user":
+                    continue
+                self._mark_warm_attempted(data_source, current_user, conn_id)
+                await self._sync_user_overlay_for_connection(
+                    db=db, data_source=data_source, user=current_user, connection=conn
+                )
+        except Exception:
+            logger.warning(
+                "Overlay warm failed for data source %s / user %s",
+                data_source.id, getattr(current_user, "id", None), exc_info=True,
+            )
+
+    def _warm_key(self, data_source: DataSource, user: User, connection_id: str) -> tuple:
+        return (str(data_source.id), str(getattr(user, "id", "")), connection_id)
+
+    def _warm_attempted(self, data_source: DataSource, user: User, connection_id: str) -> bool:
+        import time
+
+        at = _WARM_ATTEMPTS.get(self._warm_key(data_source, user, connection_id))
+        return at is not None and (time.monotonic() - at) < _WARM_RETRY_S
+
+    def _mark_warm_attempted(self, data_source: DataSource, user: User, connection_id: str) -> None:
+        import time
+
+        if len(_WARM_ATTEMPTS) > _WARM_ATTEMPTS_MAX:
+            _WARM_ATTEMPTS.clear()
+        _WARM_ATTEMPTS[self._warm_key(data_source, user, connection_id)] = time.monotonic()
 
     async def _admin_catalog_access(self, db: AsyncSession, data_source: DataSource, current_user: User) -> bool:
         """May this not-yet-connected caller see the CANONICAL catalog for
@@ -3128,29 +3876,260 @@ class DataSourceService:
         except Exception:
             return False
 
-    async def _resolve_effective_auth(self, db: AsyncSession, data_source: DataSource, current_user: User) -> str:
-        """Classify a user's CURRENT access to a (user_required) data source.
+    async def _resolve_effective_auth(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        current_user: User,
+        connection=None,
+        cred_index=None,
+    ) -> str:
+        """Classify a user's CURRENT access to a (user_required) CONNECTION.
 
         Returns one of:
           'user'   — the user has their own active credentials (use their overlay)
-          'system' — owner/admin using the service-account fallback (full catalog)
+          'system' — admin using the service-account fallback (full catalog)
           'none'   — no proven access (use nothing)
 
         Fails closed to 'none' so a stale overlay can't keep serving tables after
-        access is lost. Owner/admin reliably classify as 'system', so the closed
+        access is lost. Admins reliably classify as 'system', so the closed
         default never hides the canonical catalog from them.
         """
         try:
-            conn = data_source.connections[0] if getattr(data_source, "connections", None) else None
+            # `connection` is the connection being classified. It defaults to the
+            # first one only for legacy single-connection callers; anything that
+            # scopes a multi-connection agent MUST pass the connection explicitly,
+            # because auth_policy and credentials are per connection.
+            conn = connection
+            if conn is None:
+                conn = data_source.connections[0] if getattr(data_source, "connections", None) else None
             if conn is None:
                 return "none"
             from app.services.user_data_source_credentials_service import UserDataSourceCredentialsService
             status = await UserDataSourceCredentialsService().build_user_status_for_connection(
-                db, conn, current_user, data_source=data_source, live_test=False
+                db, conn, current_user, data_source=data_source, live_test=False,
+                cred_index=cred_index,
             )
             return status.effective_auth or "none"
         except Exception:
             return "none"
+
+    @staticmethod
+    def _json_text(db: AsyncSession, column, key: str):
+        """Cross-dialect JSON text extraction (PostgreSQL ->> vs SQLite json_extract)."""
+        bind = db.get_bind()
+        dialect_name = bind.dialect.name if bind else "sqlite"
+        if dialect_name == "postgresql":
+            return column.op('->>')(key)
+        return func.json_extract(column, f'$.{key}')
+
+    async def classify_connection_access(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        current_user: User,
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Sort an agent's connections into (open, overlay, denied) for a caller.
+
+          open    — system_only, or delegated-but-effective-auth is 'system'
+                    (service account), or an owner/admin viewing a connection
+                    they have not personally connected (display fallback; query
+                    execution still fails closed in resolve_credentials).
+          overlay — delegated and the caller runs with their OWN token: only the
+                    tables their per-user overlay marks accessible.
+          denied  — delegated, no proven access, not an owner/admin: nothing.
+
+        THE authority on "what may this user see on this agent", shared by the
+        tables selector (`_resolve_catalog_scope`) and the agent's schema
+        context (`SchemaContextBuilder`). Both used to answer it independently
+        from `connections[0]`, and both got it wrong in the same two ways: a
+        delegated connection sorting first hid every other connection, and one
+        sorting second skipped scoping entirely. One classifier means a third
+        call site cannot drift into a third variant of the same bug.
+        """
+        conns = list(getattr(data_source, "connections", None) or [])
+        delegated = [
+            c for c in conns
+            if (getattr(c, "auth_policy", None) or "system_only") == "user_required"
+        ]
+
+        # Load this user's credential rows for EVERY delegated connection up
+        # front. Resolving them one connection at a time cost 9 statements per
+        # connection (one credential lookup plus the relationship loads it
+        # drags behind it), serialized — measured dead linear, so an agent with
+        # 100 delegated connections spent ~900 round trips on a question this
+        # answers in two. `UserCredentialIndex` is the same prefetch the
+        # agent-list endpoints already use for exactly this reason.
+        cred_index = None
+        if delegated and current_user is not None:
+            from app.services.connection_identity import UserCredentialIndex
+            cred_index = await UserCredentialIndex.build(
+                db, current_user,
+                connection_ids=[str(c.id) for c in delegated],
+                data_source_ids=[str(data_source.id)],
+            )
+
+        # The owner/admin display fallback is a property of the CALLER and the
+        # agent, not of any one connection, so resolve it at most once instead
+        # of per denied connection (it resolves the full permission set).
+        admin_fallback: bool | None = None
+
+        open_ids: list[str] = []
+        overlay_ids: list[str] = []
+        denied_ids: list[str] = []
+        for conn in conns:
+            if (getattr(conn, "auth_policy", None) or "system_only") != "user_required":
+                open_ids.append(str(conn.id))
+                continue
+            if current_user is None:
+                # No user in context (background job, system caller): the
+                # canonical catalog is the right thing to serve.
+                open_ids.append(str(conn.id))
+                continue
+            eff_auth = await self._resolve_effective_auth(
+                db, data_source, current_user, connection=conn, cred_index=cred_index,
+            )
+            if eff_auth == "user":
+                overlay_ids.append(str(conn.id))
+            elif eff_auth == "none":
+                if admin_fallback is None:
+                    admin_fallback = await self._admin_catalog_access(
+                        db, data_source, current_user
+                    )
+                if admin_fallback:
+                    open_ids.append(str(conn.id))
+                else:
+                    denied_ids.append(str(conn.id))
+            else:  # 'system' — service account / admin SP sees the full catalog
+                open_ids.append(str(conn.id))
+        return open_ids, overlay_ids, denied_ids
+
+    @staticmethod
+    def _overlay_connection_predicate(overlay_ids: list[str], denied_ids: list[str]):
+        """Which of a caller's overlay rows their CURRENT access still justifies.
+
+        A row names the connection it describes, except for rows written before
+        overlays were connection-aware (and rows the migration could not
+        attribute, because the canonical table was never linked). Those keep
+        connection_id NULL, which is unknown provenance, not permission — and
+        the rule for unknown provenance is what this decides:
+
+          * no delegated connection authorized  -> nothing. The rows only record
+            what the caller COULD see before access was revoked.
+          * some connection denied              -> named rows on authorized
+            connections only. A NULL row may well BE the denied connection's,
+            and admitting it on the strength of a different connection the
+            caller happens to still hold is exactly the leak: deactivate A's
+            credentials while B stays valid and A's legacy models stayed
+            visible. They come back when a proven identity rediscovers them.
+          * nothing denied                      -> NULL rows too. There is no
+            revoked connection for them to have come from, and excluding them
+            would drop a legacy single-connection agent's whole catalog.
+        """
+        if not overlay_ids:
+            return sa_false()
+        named = UserOverlayTable.connection_id.in_(overlay_ids)
+        if denied_ids:
+            return named
+        return or_(UserOverlayTable.connection_id.is_(None), named)
+
+    async def _resolve_catalog_scope(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        current_user: User,
+        buckets: tuple[list[str], list[str], list[str]] | None = None,
+    ):
+        """Build the row predicate for "which of this agent's tables may this
+        caller see", resolved per connection.
+
+        `buckets` lets a caller that already ran `classify_connection_access`
+        hand the result in rather than pay for it twice.
+
+        Returns a callable that takes a query selecting over DataSourceTable and
+        returns it narrowed. Every count, total, page and filter dropdown in the
+        tables view runs through the SAME callable, so a row can never be hidden
+        from the grid while still being counted in "Showing 1-20 of N" or named
+        in the schema dropdown.
+
+        Each connection lands in exactly one bucket:
+          open    — system_only, or delegated-but-effective-auth is 'system'
+                    (service account), or an owner/admin viewing a connection
+                    they have not personally connected (display fallback; query
+                    execution still fails closed in resolve_credentials).
+          overlay — delegated and the caller runs with their OWN token: only the
+                    tables their per-user overlay marks accessible.
+          denied  — delegated, no proven access, not an owner/admin: nothing.
+        """
+        from app.models.connection_table import ConnectionTable
+
+        conns = list(getattr(data_source, "connections", None) or [])
+        if current_user is None or not conns:
+            return lambda q: q
+
+        open_ids, overlay_ids, denied_ids = buckets or await self.classify_connection_access(
+            db, data_source, current_user
+        )
+
+        # Nothing delegated in play: the whole catalog is visible, and no extra
+        # predicate is added at all (identical SQL to a single system_only agent).
+        if not overlay_ids and not denied_ids:
+            return lambda q: q
+
+        def _tables_of(conn_ids: list[str]):
+            # Connection ids are per agent (a handful), so a bound IN list here
+            # costs a handful of parameters — unlike a per-table id list.
+            return select(ConnectionTable.id).where(
+                ConnectionTable.connection_id.in_(conn_ids)
+            )
+
+        # The caller's own accessible overlay rows. A SUBQUERY, not a
+        # materialized id list: a delegated source can overlay tens of thousands
+        # of tables for one user and `id.in_([...])` spends one bind parameter
+        # per row — past PostgreSQL's 32767-parameter ceiling that is a hard
+        # InterfaceError, so the entire Tables view would 500 rather than merely
+        # slow down. Always filtered by user_id, so anything it admits is the
+        # caller's own permitted set.
+        overlay_rows = select(UserOverlayTable.data_source_table_id).where(
+            UserOverlayTable.data_source_id == str(data_source.id),
+            UserOverlayTable.user_id == str(current_user.id),
+            UserOverlayTable.is_accessible == True,  # noqa: E712
+            UserOverlayTable.data_source_table_id.isnot(None),
+        )
+        overlay_rows = overlay_rows.where(
+            self._overlay_connection_predicate(overlay_ids, denied_ids)
+        )
+
+        branches = []
+        if open_ids:
+            branches.append(DataSourceTable.connection_table_id.in_(_tables_of(open_ids)))
+        if overlay_ids:
+            branches.append(and_(
+                DataSourceTable.connection_table_id.in_(_tables_of(overlay_ids)),
+                DataSourceTable.id.in_(overlay_rows),
+            ))
+        # Rows with no connection link at all fall into two very different
+        # groups, and telling them apart matters for both halves of this bug:
+        #   * legacy name-keyed rows from the old save_or_update_tables path —
+        #     genuine tables, no per-user meaning; keep them visible, exactly as
+        #     before, or a mixed agent would lose its legacy catalog.
+        #   * rows a delegated user's own sync contributed (tagged
+        #     discovered_by="user" in _upsert_user_overlay) — these are ONE
+        #     user's Power BI/Fabric models living on a shared agent. Admitting
+        #     them unconditionally is how a second user saw the first user's
+        #     semantic models whenever the delegated connection was not first.
+        discovered_by = self._json_text(db, DataSourceTable.metadata_json, "discovered_by")
+        branches.append(and_(
+            DataSourceTable.connection_table_id.is_(None),
+            or_(
+                discovered_by.is_(None),
+                discovered_by != "user",
+                DataSourceTable.id.in_(overlay_rows),
+            ),
+        ))
+
+        predicate = or_(*branches) if branches else sa_false()
+        return lambda q: q.where(predicate)
 
     async def get_data_source_schema_paginated(
         self,
@@ -3208,50 +4187,44 @@ class DataSourceService:
         def _active(q):
             return q.where(DataSourceTable.is_active == True) if restrict_to_active else q
 
-        # Identity-aware scoping: for a user_required (delegated) source, the tables
-        # selector must show what the CURRENT effective identity can see — the same
-        # rule the agent's schema context and query execution follow:
+        # Identity-aware scoping, resolved PER CONNECTION. For a user_required
+        # (delegated) connection the tables selector must show what the CURRENT
+        # effective identity can see on THAT connection — the same rule the
+        # agent's schema context and query execution follow:
         #   'user'   (toggle = Me, has token) → only the user's overlay tables
         #   'none'   (Me, not connected)      → nothing
         #   'system' (toggle = Service account / admin SP) → full catalog
-        # `overlay_scope is None` means "no restriction" (full catalog);
-        # `overlay_deny_all` means "restrict to nothing".
-        overlay_scope = None
-        overlay_deny_all = False
-        conn0 = data_source.connections[0] if getattr(data_source, "connections", None) else None
-        if current_user is not None and conn0 is not None and (conn0.auth_policy or "system_only") == "user_required":
-            eff_auth = await self._resolve_effective_auth(db, data_source, current_user)
-            if eff_auth == "user":
-                # A SUBQUERY, not a materialized id list. A delegated source can
-                # overlay tens of thousands of tables for a single user, and
-                # `id.in_([...])` spends one bind parameter per row — past
-                # PostgreSQL's 32767-parameter ceiling that is a hard
-                # InterfaceError, so the entire Tables view would 500 rather
-                # than merely slow down. The subquery costs zero parameters at
-                # any catalog size.
-                overlay_scope = (
-                    select(UserOverlayTable.data_source_table_id).where(
-                        UserOverlayTable.data_source_id == str(data_source_id),
-                        UserOverlayTable.user_id == str(current_user.id),
-                        UserOverlayTable.is_accessible == True,  # noqa: E712
-                        UserOverlayTable.data_source_table_id.isnot(None),
-                    )
-                )
-            elif eff_auth == "none":
-                # Not connected yet. For a plain member this fails closed
-                # (nothing). An owner/admin, however, already sees the canonical
-                # catalog through connection management (the Add Connection
-                # modal's "Discovered N tables", GET /connections/{id}/tables) —
-                # hiding the same names here only breaks agent configuration, so
-                # show them the full catalog. Query time stays fail-closed via
-                # resolve_credentials.
-                if not await self._admin_catalog_access(db, data_source, current_user):
-                    overlay_deny_all = True
+        #
+        # Per connection, not per data source. An agent can hold a delegated
+        # Power BI connection AND a system_only warehouse at once. Deciding once
+        # from `connections[0]` (as this did) filtered the WHOLE catalog through
+        # an overlay that only ever describes ONE connection, so every other
+        # connection's tables silently vanished from the rows, the counts and
+        # the filter dropdowns — and because `DataSource.connections` has no
+        # deterministic order, which connection survived could flip between
+        # requests. The reverse ordering leaked instead of hid: with the
+        # system_only connection first no scoping was applied at all, so one
+        # user saw another user's delegated-catalog tables.
+        #
+        # Populate-on-first-read, exactly as the unpaginated
+        # `get_data_source_schema` does. The scope predicate below filters a
+        # delegated connection through a per-user overlay, and on a freshly
+        # created agent nothing has written that overlay yet. Only an explicit
+        # refresh or the login-time OBO provisioning writes it, so without this
+        # warm the tables selector — which ALWAYS paginates, and is therefore
+        # the only path real users take — renders "No tables found" and does
+        # not heal on its own: the admin saves the agent with zero tables.
+        # A no-op once warm.
+        delegated_conns = [
+            c for c in (data_source.connections or [])
+            if (getattr(c, "auth_policy", None) or "system_only") == "user_required"
+        ]
+        if delegated_conns and current_user is not None:
+            await self._warm_user_overlay_if_empty(
+                db, data_source, current_user, delegated_conns
+            )
 
-        def _scope(q):
-            if overlay_deny_all:
-                return q.where(sa_false())
-            return q if overlay_scope is None else q.where(DataSourceTable.id.in_(overlay_scope))
+        _scope = await self._resolve_catalog_scope(db, data_source, current_user)
 
         # Exclude file-source catalog rows from the Tables view: a file connection
         # (network_dir / s3 / SharePoint / OneDrive / Drive) is surfaced as Files,
@@ -3260,8 +4233,10 @@ class DataSourceService:
         # with the conditional joins below). NULL connection_table_id (legacy
         # tables) is kept.
         _FILE_SOURCE_TYPES = [
-            "network_dir", "s3", "sharepoint", "sharepoint_onprem", "onedrive", "google_drive",
+            "network_dir", "s3", "sharepoint", "sharepoint_onprem", "documentum", "onedrive", "google_drive",
             "outlook_mail", "gmail_mail",
+            "github_repo", "gitlab_repo", "bitbucket_repo",
+            "kms_lighthouse",
         ]
         _file_ct_subq = None
         # Per-user file catalogs (OneDrive, Outlook, personal Drive) have no
@@ -3380,15 +4355,30 @@ class DataSourceService:
                 base_query = base_query.where(or_(*schema_conditions))
                 count_query = count_query.where(or_(*schema_conditions))
 
-        # Apply connection filter (via connection_table -> connection relationship)
+        # Apply connection filter. A subquery on connection_table_id rather than
+        # a JOIN: the JOIN dropped every unlinked row before the filter could
+        # consider it, so a delegated user filtering to their Power BI
+        # connection lost exactly the models only they can see. The provenance
+        # tag carries those rows.
         if connection_filter and len(connection_filter) > 0:
-            # Join with ConnectionTable to filter by connection_id
-            base_query = base_query.join(
-                ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id
-            ).where(ConnectionTable.connection_id.in_(connection_filter))
-            count_query = count_query.join(
-                ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id
-            ).where(ConnectionTable.connection_id.in_(connection_filter))
+            _ct_ids = select(ConnectionTable.id).where(
+                ConnectionTable.connection_id.in_(connection_filter)
+            )
+            _discovered = self._json_text(db, DataSourceTable.metadata_json, "discovered_connection_id")
+            # Local binds: the conditional `from sqlalchemy import or_` in the
+            # schema-filter branch above makes `or_` a function-local name for
+            # this whole method, so referencing it here would raise
+            # UnboundLocalError whenever no schema filter was supplied.
+            from sqlalchemy import or_ as _or_cf, and_ as _and_cf
+            _conn_pred = _or_cf(
+                DataSourceTable.connection_table_id.in_(_ct_ids),
+                _and_cf(
+                    DataSourceTable.connection_table_id.is_(None),
+                    _discovered.in_(list(connection_filter)),
+                ),
+            )
+            base_query = base_query.where(_conn_pred)
+            count_query = count_query.where(_conn_pred)
 
         # Apply search filter
         if search and search.strip():
@@ -3422,7 +4412,10 @@ class DataSourceService:
             .where(DataSourceTable.datasource_id == data_source_id)
             .distinct()
         )
-        connections_query = _active(connections_query)
+        # Scoped identically to the rows. Unscoped, this dropdown listed every
+        # connection on the agent while the grid showed one connection's tables —
+        # the visible symptom users reported as "it only shows one source".
+        connections_query = _active(_scope(connections_query))
         if exclude_file_source_types:
             connections_query = connections_query.where(Connection.type.notin_(_FILE_SOURCE_TYPES))
         connections_result = await db.execute(connections_query)
@@ -3437,7 +4430,7 @@ class DataSourceService:
         schema_expr = get_schema_expr()
         if has_multi_connection:
             schemas_result = await db.execute(
-                _active(
+                _active(_scope(
                     select(schema_expr, Connection.name)
                     .select_from(DataSourceTable)
                     .join(ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id)
@@ -3445,18 +4438,18 @@ class DataSourceService:
                     .where(DataSourceTable.datasource_id == data_source_id)
                     .where(schema_expr.isnot(None))
                     .distinct()
-                )
+                ))
             )
             distinct_schemas = [
                 f"{row[1]}:{row[0]}" for row in schemas_result.fetchall() if row[0]
             ]
         else:
             schemas_result = await db.execute(
-                _active(
+                _active(_scope(
                     select(func.distinct(schema_expr))
                     .where(DataSourceTable.datasource_id == data_source_id)
                     .where(schema_expr.isnot(None))
-                )
+                ))
             )
             distinct_schemas = [row[0] for row in schemas_result.fetchall() if row[0]]
 
@@ -3468,7 +4461,39 @@ class DataSourceService:
             sort_column = DataSourceTable.is_active
         elif sort_by == "richness":
             sort_column = DataSourceTable.richness
-        
+        elif sort_by == "usage_count":
+            # Order by the same usage number the grid shows. Usage lives on
+            # TableStats, not on DataSourceTable, matched to a row by id and
+            # falling back to the name-keyed legacy row — exactly the lookup
+            # the per-row stats merge below performs. A correlated scalar
+            # subquery (not a join) so the page query can never fan out and
+            # inflate the row set, and so this stays a no-op when stats are
+            # absent. Covers all rows regardless of `with_stats`, which only
+            # decides whether the number is also returned for display.
+            from app.models.table_stats import TableStats
+            from sqlalchemy import or_ as _or_us, and_ as _and_us
+            usage_subq = (
+                select(TableStats.usage_count)
+                .where(
+                    TableStats.report_id.is_(None),
+                    TableStats.data_source_id == data_source_id,
+                    _or_us(
+                        TableStats.datasource_table_id == DataSourceTable.id,
+                        _and_us(
+                            TableStats.datasource_table_id.is_(None),
+                            func.lower(TableStats.table_fqn) == func.lower(DataSourceTable.name),
+                        ),
+                    ),
+                )
+                # Prefer the id-matched row over a name-keyed fallback, like the
+                # display: is_(None) sorts False (id match) before True.
+                .order_by(TableStats.datasource_table_id.is_(None))
+                .limit(1)
+                .correlate(DataSourceTable)
+                .scalar_subquery()
+            )
+            sort_column = func.coalesce(usage_subq, 0)
+
         if sort_dir.lower() == "desc":
             base_query = base_query.order_by(sort_column.desc().nullslast())
         else:
@@ -3490,10 +4515,11 @@ class DataSourceService:
         # Fetch stats if requested
         # Stats are matched by row id where the stats row records one, and only
         # fall back to the lowercased name where it doesn't. Name alone is not
-        # an identity: a custom query named `album` and a source table named
+        # an identity: a custom table named `album` and a source table named
         # `Album` are different relations that collided into one bucket, so the
         # new relation displayed the other one's usage count. The same applies
         # to two connections on one agent that both have an `orders`.
+        _conn_by_id = {str(c.id): c for c in (data_source.connections or [])}
         stats_by_id = {}
         stats_by_name = {}
         if with_stats:
@@ -3523,7 +4549,13 @@ class DataSourceService:
                     # better exists for this relation.
                     stats = stats_by_name.get((table.name or '').lower())
 
-            # Extract connection info from relationship
+            # Extract connection info from relationship, falling back to the
+            # provenance tag. A table a delegated user discovered with their own
+            # token has NO ConnectionTable to link to (the service principal
+            # cannot see it), so without this fallback it rendered with a blank
+            # connection: unattributable in the grid's connection column and
+            # unmatchable by the connection filter, on the very connection the
+            # user came to configure.
             conn_id = None
             conn_name = None
             conn_type = None
@@ -3532,22 +4564,45 @@ class DataSourceService:
                 conn_id = str(conn.id)
                 conn_name = conn.name
                 conn_type = conn.type
+            else:
+                meta = table.metadata_json if isinstance(table.metadata_json, dict) else {}
+                discovered = meta.get("discovered_connection_id")
+                if discovered and str(discovered) in _conn_by_id:
+                    conn = _conn_by_id[str(discovered)]
+                    conn_id = str(conn.id)
+                    conn_name = conn.name
+                    conn_type = conn.type
 
+            # Column hiding is a manager's curation; readers get the same
+            # stripped view the non-paginated path (to_prompt_table) serves.
+            # Managers keep every column so the selector can toggle them.
+            if restrict_to_active and table.excluded_columns:
+                from app.ai.prompt_formatters import filter_columns, filter_fks
+                _cols = filter_columns(table.columns, table.excluded_columns)
+                _pks = filter_columns(table.pks, table.excluded_columns)
+                _fks = filter_fks(table.fks, table.excluded_columns)
+                _excluded = None
+            else:
+                _cols, _pks, _fks = table.columns or [], table.pks or [], table.fks or []
+                _excluded = table.excluded_columns or None
             table_schema = DataSourceTableSchema(
                 id=str(table.id),
                 name=table.name,
-                columns=table.columns or [],
+                columns=_cols,
                 no_rows=table.no_rows or 0,
                 datasource_id=str(table.datasource_id),
-                pks=table.pks or [],
-                fks=table.fks or [],
+                pks=_pks,
+                fks=_fks,
                 is_active=table.is_active,
                 metadata_json=table.metadata_json,
+                excluded_columns=_excluded,
                 # Connection info
                 connection_id=conn_id,
                 connection_name=conn_name,
                 connection_type=conn_type,
                 custom_query_id=str(table.connection_table.id) if table.connection_table and table.connection_table.kind == "bow" else None,
+                connection_table_id=str(table.connection_table.id) if table.connection_table and table.connection_table.kind == "table" else None,
+                preview_supported=bool(table.connection_table) and is_previewable_table(conn_type, table.connection_table),
                 last_refreshed_at=table.connection_table.last_refreshed_at if table.connection_table and table.connection_table.kind == "bow" else None,
                 last_refresh_status=table.connection_table.last_refresh_status if table.connection_table and table.connection_table.kind == "bow" else None,
                 rls_enabled=bool(table.connection_table.rls_enabled) if table.connection_table and table.connection_table.kind == "bow" else False,
@@ -3693,6 +4748,7 @@ class DataSourceService:
         update_query = update_query.values(is_active=new_status)
         result = await db.execute(update_query)
         await db.commit()
+        _invalidate_agent_schema_cache(organization)
         
         affected_count = result.rowcount
         
@@ -3704,7 +4760,22 @@ class DataSourceService:
             )
         )
         total_selected = selected_count_result.scalar() or 0
-        
+
+        # Loud when an agent crosses the point where its context stops listing
+        # every table. Not an error and not a cap: the roster keeps every
+        # connection named and describe_tables still reaches any of them. But
+        # this is the line past which "the agent didn't see my table" becomes
+        # possible, and it should be visible in the logs when it is crossed
+        # rather than inferred later from a confused answer.
+        if new_status and total_selected > self.CONTEXT_TABLE_SOFT_LIMIT:
+            logger.warning(
+                "data source %s now has %d active tables, over the %d the schema "
+                "context lists individually; past this the agent sees a "
+                "round-robin sample per connection plus the <connections> roster, "
+                "and reaches the rest through describe_tables",
+                data_source_id, total_selected, self.CONTEXT_TABLE_SOFT_LIMIT,
+            )
+
         return DeltaUpdateTablesResponse(
             activated_count=affected_count if new_status else 0,
             deactivated_count=affected_count if not new_status else 0,
@@ -3719,10 +4790,14 @@ class DataSourceService:
         activate: List[str] = None,
         deactivate: List[str] = None,
         current_user: User = None,
+        excluded_columns: Optional[Dict[str, List[str]]] = None,
     ):
         """
         Update table is_active status using delta (lists of table names to activate/deactivate).
         More efficient than sending all tables.
+
+        `excluded_columns` maps a table id to the complete list of column
+        names hidden from the agent's context for that table.
         """
         from sqlalchemy import update, func
         from app.schemas.datasource_table_schema import DeltaUpdateTablesResponse
@@ -3781,8 +4856,47 @@ class DataSourceService:
 
         if deactivate:
             deactivated_count = await _set_active(deactivate, False)
-        
+
+        columns_updated_count = 0
+        if excluded_columns:
+            from app.core.sql_chunk import chunked as _chunked
+            ids = [str(k) for k in excluded_columns.keys()]
+            for chunk in _chunked(ids):
+                rows = (await db.execute(
+                    select(DataSourceTable).where(
+                        DataSourceTable.datasource_id == data_source_id,
+                        DataSourceTable.id.in_(chunk),
+                    )
+                )).scalars().all()
+                for row in rows:
+                    requested = excluded_columns.get(str(row.id)) or []
+                    # Keep only names the table actually has (case-insensitive,
+                    # stored with the catalog's spelling). A table with no
+                    # canonical columns (e.g. per-user only) keeps the names
+                    # as sent: there is nothing to validate against.
+                    known = {
+                        str(c.get("name")).lower(): str(c.get("name"))
+                        for c in (row.columns or []) if isinstance(c, dict) and c.get("name")
+                    }
+                    cleaned: list[str] = []
+                    seen: set[str] = set()
+                    for name in requested:
+                        if not isinstance(name, str) or not name.strip():
+                            continue
+                        key = name.lower()
+                        if key in seen:
+                            continue
+                        if known and key not in known:
+                            continue
+                        seen.add(key)
+                        cleaned.append(known.get(key, name))
+                    new_value = sorted(cleaned) or None
+                    if (row.excluded_columns or None) != new_value:
+                        row.excluded_columns = new_value
+                        columns_updated_count += 1
+
         await db.commit()
+        _invalidate_agent_schema_cache(organization)
         
         # Get new total selected count
         selected_count_result = await db.execute(
@@ -3820,15 +4934,22 @@ class DataSourceService:
             activated_count=activated_count,
             deactivated_count=deactivated_count,
             total_selected=total_selected,
+            columns_updated_count=columns_updated_count,
         )
 
-    async def read_user_data_source_schema(self, db: AsyncSession, data_source: DataSource, user: User):
+    async def read_user_data_source_schema(self, db: AsyncSession, data_source: DataSource, user: User, active_only: bool = False):
         """Return the user's catalog from persisted UserOverlayTable rows.
 
         Cache-first — does NOT touch the live source. Use this for every
         read-shaped surface: /mentions, prompt builds, /full_schema, list
         renderers. Refreshes happen explicitly via `get_user_data_source_schema`
         (post-OAuth, manual refresh, OBO auto-provision).
+
+        `active_only=True` additionally keeps only tables whose canonical
+        DataSourceTable row is activated — the agent manager's selection —
+        so a user's broader upstream access never widens an agent-facing
+        surface (mentions, prompt schema) past what the manager selected.
+        A table with no canonical row is treated as not activated.
 
         Empty list when the overlay hasn't been populated yet (first sign-in
         before the post-OAuth refresh completes). Callers can decide whether
@@ -3848,6 +4969,30 @@ class DataSourceService:
             )
         )
         overlay_rows = rows_q.scalars().all()
+        if overlay_rows and active_only:
+            # The overlay's `data_source_table_id` link is the authority (it
+            # was matched on dataset/table identity at sync time, and the two
+            # rows can carry different display names after a rename); the
+            # name is only a fallback for unlinked legacy overlays.
+            active_rows = (await db.execute(
+                select(DataSourceTable.id, DataSourceTable.name, DataSourceTable.excluded_columns).where(
+                    DataSourceTable.datasource_id == str(data_source.id),
+                    DataSourceTable.is_active.is_(True),
+                )
+            )).all()
+            active_ids = {str(i) for i, _, _ in active_rows}
+            active_names = {n for _, n, _ in active_rows}
+            # Agent-facing read: also honour the columns the agent manager hid.
+            excluded_by_id = {str(i): ex for i, _, ex in active_rows if ex}
+            excluded_by_name = {n: ex for _, n, ex in active_rows if ex}
+            overlay_rows = [
+                r for r in overlay_rows
+                if (
+                    str(r.data_source_table_id) in active_ids
+                    if r.data_source_table_id
+                    else r.table_name in active_names
+                )
+            ]
         if not overlay_rows:
             return []
 
@@ -3869,9 +5014,24 @@ class DataSourceService:
             for c in col_q.scalars().all():
                 cols_by_table.setdefault(str(c.user_data_source_table_id), []).append(c)
 
+        from app.ai.prompt_formatters import apply_column_exclusions
+
         tables: list[Table] = []
         for row in overlay_rows:
-            tables.append(Table(
+            excluded = None
+            if active_only:
+                excluded = (
+                    excluded_by_id.get(str(row.data_source_table_id))
+                    if row.data_source_table_id
+                    else excluded_by_name.get(row.table_name)
+                )
+            tables.append(apply_column_exclusions(Table(
+                # The CANONICAL DataSourceTable id, not the overlay row's own.
+                # Callers that merge this list with canonical rows key off it to
+                # tell which tables the overlay already describes; without it
+                # every overlay table looked unidentifiable, the merge dropped
+                # them all and served the canonical (unmasked) columns instead.
+                id=str(row.data_source_table_id) if row.data_source_table_id else None,
                 name=row.table_name,
                 columns=[
                     TableColumn(name=c.column_name, dtype=c.data_type)
@@ -3879,17 +5039,256 @@ class DataSourceService:
                 ],
                 pks=[],
                 fks=[],
+                connection_id=str(row.connection_id) if row.connection_id else None,
                 metadata_json=row.metadata_json,
-            ))
+            ), excluded))
         return tables
+
+    def _per_user_catalog_connections(self, data_source: DataSource) -> list:
+        """The connections whose catalog is per user: delegated (user_required,
+        e.g. Power BI / Fabric OBO) and per_user-owned (OneDrive, personal
+        Drive). A system_only warehouse on the same agent has one shared
+        catalog and is not synced per user."""
+        from app.schemas.data_source_registry import connection_catalog_ownership
+
+        out = []
+        for conn in (getattr(data_source, "connections", None) or []):
+            if (getattr(conn, "auth_policy", None) or "system_only") == "user_required":
+                out.append(conn)
+                continue
+            try:
+                if connection_catalog_ownership(conn) == "per_user":
+                    out.append(conn)
+            except Exception:
+                continue
+        return out
+
+    async def _construct_user_catalog_client(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        connection,
+        user: User,
+    ):
+        """Build a discovery client for ONE connection with that connection's
+        own credentials resolved for `user`.
+
+        `construct_client` cannot be used here: it always builds the FIRST
+        connection's client, which is why the per-user overlay only ever
+        described one connection no matter how many an agent had."""
+
+        ClientClass = resolve_client_class(connection.type)
+        config = json.loads(connection.config) if isinstance(connection.config, str) else (connection.config or {})
+        creds = await self.resolve_credentials_for_connection(
+            db=db, connection=connection, data_source=data_source, current_user=user
+        )
+        params = merge_client_credentials(config, creds)
+        meta_keys = {"auth_policy", "allowed_user_auth_modes"} | RUNTIME_CONFIG_KEYS
+        params = {
+            k: v for k, v in (params or {}).items()
+            if v is not None and k not in meta_keys and not k.startswith("oauth_")
+        }
+        allowed = filter_client_parameters(ClientClass, params)
+        await _acheck_connection_destination(connection.type, params)
+        return ClientClass(**allowed)
 
     async def get_user_data_source_schema(
         self,
         db: AsyncSession,
         data_source: DataSource,
         user: User,
+        prefetched_tables=None,
+        progress_callback=None,
+        force_refresh: bool = False,
+    ):
+        """Sync + return this user's catalog across EVERY per-user connection.
+
+        One agent can hold more than one delegated connection, and each has its
+        own token, its own catalog and its own overlay rows. This fans out over
+        them and concatenates; per-connection reconciliation lives in
+        `_upsert_user_overlay`.
+
+        `prefetched_tables` may be a dict keyed by connection id (what
+        `refresh_data_source_schema` collects when it has already crawled with
+        this user's credentials) or, for legacy single-connection callers, a
+        plain list — which is only reused when there is exactly one per-user
+        connection to attribute it to.
+        """
+        self.last_discovery_diagnostics = []
+        conns = self._per_user_catalog_connections(data_source)
+        if not conns:
+            return []
+
+        if isinstance(prefetched_tables, dict):
+            prefetched_by_conn = {str(k): v for k, v in prefetched_tables.items()}
+        elif prefetched_tables is not None and len(conns) == 1:
+            prefetched_by_conn = {str(conns[0].id): prefetched_tables}
+        else:
+            # A merged list across connections cannot be attributed safely: it
+            # would hand one connection's tables to another connection's
+            # overlay, which is how they leak. Re-fetch instead.
+            prefetched_by_conn = {}
+
+        tables: list = []
+        last_error: Exception | None = None
+        failed = 0
+
+        async def _sync_one(conn, sync_db, ds, usr):
+            return await self._sync_user_overlay_for_connection(
+                db=sync_db, data_source=ds, user=usr, connection=conn,
+                prefetched_tables=prefetched_by_conn.get(str(conn.id)),
+                progress_callback=progress_callback,
+                force_refresh=force_refresh,
+            )
+
+        log_connection_ids = {id(conn): str(conn.id) for conn in conns}
+        log_data_source_id, log_user_id = str(data_source.id), str(user.id)
+
+        def _note_failure(conn, e):
+            nonlocal failed, last_error
+            # One unreachable connection must not cost the user the catalogs
+            # of the others.
+            failed += 1
+            last_error = e
+            logger.warning(
+                "Per-user overlay sync failed for connection %s (data source %s, user %s)",
+                log_connection_ids[id(conn)], log_data_source_id, log_user_id,
+                exc_info=True,
+            )
+
+        if len(conns) <= 1:
+            # Single connection: stay on the caller's session. Opening another
+            # would not help, and callers whose data_source is still uncommitted
+            # in this transaction would not be able to see it from a new one.
+            for conn in conns:
+                try:
+                    tables.extend(await _sync_one(conn, db, data_source, user))
+                except Exception as e:
+                    _note_failure(conn, e)
+        else:
+            # Each connection is a live network round trip (a Drive walk, a
+            # tenant crawl), so syncing them one after another made a user's
+            # first sign-in scale linearly with the agent's connection count —
+            # about five minutes for a 100-connection SharePoint agent. Crawl a
+            # few at a time, each on its own session: one AsyncSession is not
+            # concurrency-safe, and the overlay rows a task writes are scoped to
+            # its own connection, so they never collide.
+            # Preserve the caller's engine when invoked by background OBO or
+            # indexing; the global request pool belongs to a different loop.
+            session_factory = async_sessionmaker(db.bind, expire_on_commit=False)
+            from app.models.connection import Connection as _Connection
+
+            sem = asyncio.Semaphore(self._RELOAD_CONCURRENCY)
+            ds_id, user_id = str(data_source.id), str(user.id)
+
+            async def _run(conn_id: str):
+                async with sem:
+                    async with session_factory() as sync_db:
+                        ds = (await sync_db.execute(
+                            select(DataSource)
+                            .options(selectinload(DataSource.connections))
+                            .where(DataSource.id == ds_id)
+                        )).scalars().first()
+                        usr = await sync_db.get(User, user_id)
+                        conn = await sync_db.get(_Connection, conn_id)
+                        if ds is None or usr is None or conn is None:
+                            # Not visible from a fresh session (e.g. still
+                            # uncommitted): let the caller's session handle it.
+                            raise _UncommittedInSession(conn_id)
+                        out = await _sync_one(conn, sync_db, ds, usr)
+                        await sync_db.commit()
+                        return out
+
+            results = await asyncio.gather(
+                *(_run(str(c.id)) for c in conns), return_exceptions=True
+            )
+            for conn, res in zip(conns, results):
+                if isinstance(res, _UncommittedInSession):
+                    try:
+                        tables.extend(await _sync_one(conn, db, data_source, user))
+                    except Exception as e:
+                        _note_failure(conn, e)
+                elif isinstance(res, BaseException):
+                    _note_failure(conn, res)
+                else:
+                    tables.extend(res or [])
+        if failed == len(conns) and last_error is not None:
+            # Nothing synced at all. Callers distinguish "this user legitimately
+            # sees no tables" from "the fetch could not run" by the exception —
+            # returning [] here would silently look like revoked access and let
+            # a reconciliation revoke a live overlay.
+            raise last_error
+        return tables
+
+    async def refresh_user_connection_catalog(self, db, connection, user,
+                                              progress_callback=None, force_refresh=True):
+        """Discover once, then publish this user's connection overlays atomically.
+
+        Other connections on the same agents are outside this refresh's scope.
+        """
+        from app.models.domain_connection import domain_connection
+        connection_id = str(connection.id)
+        agents = (await db.execute(
+            select(DataSource).join(domain_connection,
+                domain_connection.c.data_source_id == DataSource.id).where(
+                domain_connection.c.connection_id == connection_id,
+                DataSource.deleted_at.is_(None),
+            ).order_by(DataSource.id)
+        )).scalars().all()
+        self.last_discovery_diagnostics = []
+        tables = None
+        count = 0
+        try:
+            from app.data_sources.clients.discovery import ValidatedDiscovery
+            self._last_overlay_explicit_complete = False
+            for agent in agents:
+                result = await self._sync_user_overlay_for_connection(
+                    db, agent, user, connection, prefetched_tables=tables,
+                    progress_callback=progress_callback, force_refresh=force_refresh,
+                    commit=False,
+                )
+                if tables is None:
+                    # Reuse the first discovery for the other agents, keeping
+                    # whether it explicitly confirmed an empty catalog.
+                    tables = ValidatedDiscovery(
+                        result, explicit_complete=self._last_overlay_explicit_complete)
+                count += 1
+            if progress_callback:
+                progress_callback("saving", None, None, None)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return tables or [], count
+
+    async def _sync_user_overlay_for_connection(
+        self, db, data_source, user, connection, prefetched_tables=None,
+        progress_callback=None, force_refresh=False, commit=True,
+    ):
+        # Discovery failures have no catalog writes to revert. Avoid rolling
+        # back/expiring unrelated caller state in that read-only phase.
+        write_state = []
+        try:
+            return await self._write_user_overlay_for_connection(
+                db, data_source, user, connection, prefetched_tables,
+                progress_callback, force_refresh, commit, write_state,
+            )
+        except BaseException:
+            if commit and write_state:
+                await db.rollback()
+            raise
+
+    async def _write_user_overlay_for_connection(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        user: User,
+        connection,
         prefetched_tables: Optional[list] = None,
         progress_callback=None,
+        force_refresh: bool = False,
+        commit: bool = True,
+        write_state: list | None = None,
     ):
         """Fetch live schema with user creds, persist overlay rows, and return a user-scoped Table list.
 
@@ -3925,8 +5324,18 @@ class DataSourceService:
             prior_tables = None
             try:
                 rows = (await db.execute(
-                    select(DataSourceTable).where(DataSourceTable.datasource_id == data_source.id)
+                    select(DataSourceTable)
+                    .options(selectinload(DataSourceTable.connection_table))
+                    .where(DataSourceTable.datasource_id == data_source.id)
                 )).scalars().all()
+                # Only this connection's known tables are a valid "already
+                # indexed" hint for this connection's crawl.
+                _cid = str(connection.id)
+                rows = [
+                    r for r in rows
+                    if getattr(r, "connection_table", None) is None
+                    or str(r.connection_table.connection_id) == _cid
+                ]
                 prior_tables = {
                     r.name: {
                         "columns": r.columns or [],
@@ -3936,9 +5345,45 @@ class DataSourceService:
                     }
                     for r in rows if r.metadata_json
                 } or None
+                if connection.type == "powerbi":
+                    from app.utils.powerbi_catalog import powerbi_identity, qualified_powerbi_name
+                    # A later sign-in must not overwrite a user's freshly read
+                    # columns with an older (or broader) service-account schema.
+                    own_tables = [
+                        t for t in await self.read_user_data_source_schema(db, data_source, user)
+                        if t.connection_id == _cid and powerbi_identity(t.metadata_json) is not None
+                    ]
+                    canonical = {
+                        powerbi_identity(entry["metadata_json"]): entry
+                        for entry in (prior_tables or {}).values()
+                    }
+                    own_models = {powerbi_identity(t.metadata_json)[:2] for t in own_tables}
+                    prior_tables = {
+                        name: entry for name, entry in (prior_tables or {}).items()
+                        if (powerbi_identity(entry["metadata_json"]) or ())[:2] not in own_models
+                    }
+                    for table in own_tables:
+                        entry = canonical.get(powerbi_identity(table.metadata_json)) or {}
+                        columns = {c["name"]: c for c in entry.get("columns", [])}
+                        same_columns = set(columns) == {c.name for c in table.columns}
+                        prior_name = table.name
+                        if (prior_name in prior_tables and
+                            powerbi_identity(prior_tables[prior_name]["metadata_json"]) != powerbi_identity(table.metadata_json)):
+                            prior_name = qualified_powerbi_name(prior_name, table.metadata_json)
+                        prior_tables[prior_name] = {
+                            "columns": [
+                                {**columns.get(c.name, {}), "name": c.name, "dtype": c.dtype}
+                                for c in table.columns
+                            ],
+                            "pks": entry.get("pks", []) if same_columns else [],
+                            "fks": entry.get("fks", []) if same_columns else [],
+                            "metadata_json": table.metadata_json,
+                        }
             except Exception:
                 prior_tables = None
-            client = await self.construct_client(db=db, data_source=data_source, current_user=user)
+            client = await self._construct_user_catalog_client(
+                db=db, data_source=data_source, connection=connection, user=user
+            )
             from app.data_sources.clients.base import _accepts_kwarg
             # Only pass what the client actually accepts, and only when there is
             # something to pass: a bare `aget_schemas(self)` — every stub client
@@ -3948,6 +5393,8 @@ class DataSourceService:
             # callback (every path except the tracked background job) get exactly
             # the call they made before.
             kwargs = {}
+            if force_refresh and _accepts_kwarg(client.aget_schemas, "force_refresh"):
+                kwargs["force_refresh"] = True
             if prior_tables and _accepts_kwarg(client.aget_schemas, "prior_tables"):
                 kwargs["prior_tables"] = prior_tables
             if progress_callback is not None and _accepts_kwarg(
@@ -3955,10 +5402,29 @@ class DataSourceService:
             ):
                 kwargs["progress_callback"] = progress_callback
             fresh = await client.aget_schemas(**kwargs)
+            # Record diagnostics first: an incomplete discovery raises below.
+            self.last_discovery_diagnostics.extend(
+                getattr(client, "discovery_diagnostics", []) or []
+            )
+            from app.data_sources.clients.discovery import require_complete_discovery
+            fresh = require_complete_discovery(client, fresh)
+            self._last_overlay_explicit_complete = getattr(fresh, "explicit_complete", False)
         if fresh is None:
             # No snapshot is not an authoritative empty snapshot. A successful
             # empty list must still reconcile and revoke the previous overlay.
             raise ValueError("Schema discovery returned no snapshot")
+
+        if not fresh:
+            from app.data_sources.clients.discovery import reject_unconfirmed_empty
+            prior_overlay = (await db.execute(
+                select(UserOverlayTable.id).where(
+                    UserOverlayTable.data_source_id == str(data_source.id),
+                    UserOverlayTable.user_id == str(user.id),
+                    UserOverlayTable.connection_id == str(connection.id),
+                    UserOverlayTable.is_accessible.is_(True),
+                ).limit(1)
+            )).first()
+            reject_unconfirmed_empty(fresh, has_existing=prior_overlay is not None)
 
         # Normalize
         from app.schemas.datasource_table_schema import normalize_indexed_columns as normalize_columns
@@ -3987,7 +5453,12 @@ class DataSourceService:
                 }
 
         # Persist overlays
-        await self._upsert_user_overlay(db=db, data_source=data_source, user=user, normalized=normalized)
+        if write_state is not None:
+            write_state.append(True)
+        await self._upsert_user_overlay(
+            db=db, data_source=data_source, user=user, normalized=normalized,
+            connection=connection, commit=commit,
+        )
 
         # Build Table models compatible with prompt formatters
         from app.ai.prompt_formatters import Table, TableColumn, ForeignKey as PromptForeignKey
@@ -4011,7 +5482,15 @@ class DataSourceService:
 
         return tables
 
-    async def _upsert_user_overlay(self, db: AsyncSession, data_source: DataSource, user: User, normalized: dict[str, dict]):
+    async def _upsert_user_overlay(
+        self,
+        db: AsyncSession,
+        data_source: DataSource,
+        user: User,
+        normalized: dict[str, dict],
+        connection=None,
+        commit: bool = True,
+    ):
         """Upsert per-user table/column overlay based on normalized schema.
 
         Tables/columns present in `normalized` are marked accessible. Any rows
@@ -4019,30 +5498,82 @@ class DataSourceService:
         `is_accessible=False, status='revoked'` so consumers (LLM schema context,
         UI) stop surfacing them when the user loses permissions upstream. Rows
         are kept (not hard-deleted) so audit history survives across syncs.
-        """
-        now = datetime.now(timezone.utc)
-        # Load canonical mapping to link if present
-        existing_q = await db.execute(select(DataSourceTable).where(DataSourceTable.datasource_id == data_source.id))
-        existing_canonical = list(existing_q.scalars().all())
-        canonical_by_name = {row.name: row for row in existing_canonical}
 
-        def _dataset_table_key(meta) -> tuple | None:
-            """Stable identity for a Power BI table independent of display name:
-            (datasetId, tableName). Lets a user's row match an existing canonical
-            row even if the dataset was renamed or two datasets share a name."""
-            try:
-                pbi = (meta or {}).get("powerbi") if isinstance(meta, dict) else None
-                if pbi and pbi.get("datasetId") and pbi.get("tableName"):
-                    return (str(pbi["datasetId"]), str(pbi["tableName"]))
-            except Exception:
-                pass
+        `connection` is the connection this snapshot came from, and scopes BOTH
+        halves of that reconciliation. Without it, syncing one connection
+        revoked every other connection's rows for this user — one agent with two
+        delegated connections would flip-flop, each sync revoking the other's
+        tables — and the rows it wrote could not be attributed to a connection
+        at read time.
+        """
+        from app.models.connection_table import ConnectionTable
+
+        now = datetime.now(timezone.utc)
+        conn_id = str(connection.id) if connection is not None else None
+
+        # Load canonical mapping to link if present.
+        existing_q = await db.execute(
+            select(DataSourceTable)
+            .options(selectinload(DataSourceTable.connection_table))
+            .where(DataSourceTable.datasource_id == data_source.id)
+        )
+        existing_canonical = list(existing_q.scalars().all())
+
+        def _canonical_connection_id(row) -> str | None:
+            """Which connection a canonical row belongs to, linked or not."""
+            ct = getattr(row, "connection_table", None)
+            if ct is not None and getattr(ct, "connection_id", None):
+                return str(ct.connection_id)
+            meta = getattr(row, "metadata_json", None)
+            if isinstance(meta, dict) and meta.get("discovered_connection_id"):
+                return str(meta["discovered_connection_id"])
             return None
 
-        canonical_by_dataset_table = {}
+        # Name alone is not an identity on a multi-connection agent: two
+        # connections can each have an `orders`. Linking this user's overlay to
+        # whichever row happened to sort first pointed their per-user
+        # accessibility at ANOTHER connection's table — so the table they can
+        # really query disappeared and one they cannot appeared in its place.
+        # Prefer this connection's own row, never adopt another connection's,
+        # and fall back to an unattributed (legacy) row.
+        canonical_by_name: dict = {}
+        for row in existing_canonical:
+            row_conn = _canonical_connection_id(row)
+            if conn_id is not None and row_conn is not None and row_conn != conn_id:
+                continue
+            prev = canonical_by_name.get(row.name)
+            if prev is None or (
+                conn_id is not None
+                and row_conn == conn_id
+                and _canonical_connection_id(prev) is None
+            ):
+                canonical_by_name[row.name] = row
+
+        from app.utils.powerbi_catalog import powerbi_identity, reconcile_powerbi_names
+        _dataset_table_key = powerbi_identity
+        normalized = reconcile_powerbi_names(normalized, canonical_by_name)
+
+        # Connection-scoped on the SAME rule as canonical_by_name, and for the
+        # same reason: this index is consulted FIRST, so indexing every row here
+        # put both connections' overlays on one canonical row whenever the same
+        # semantic model was reachable through two delegated connections —
+        # undoing the per-connection attribution, activation and filtering the
+        # name index had just established.
+        canonical_by_dataset_table: dict = {}
         for row in existing_canonical:
             k = _dataset_table_key(getattr(row, "metadata_json", None))
-            if k is not None:
-                canonical_by_dataset_table.setdefault(k, row)
+            if k is None:
+                continue
+            row_conn = _canonical_connection_id(row)
+            if conn_id is not None and row_conn is not None and row_conn != conn_id:
+                continue
+            prev = canonical_by_dataset_table.get(k)
+            if prev is None or (
+                conn_id is not None
+                and row_conn == conn_id
+                and _canonical_connection_id(prev) is None
+            ):
+                canonical_by_dataset_table[k] = row
 
         # Decide whether this connection's catalog should be UNIONED with the
         # user's own discovery (create canonical rows on demand from the user's
@@ -4063,9 +5594,13 @@ class DataSourceService:
         is_per_user_catalog = False
         try:
             from app.schemas.data_source_registry import get_entry
-            conn = (data_source.connections or [None])[0]
+            # The connection this snapshot came from. Falls back to the first
+            # only for legacy single-connection callers that pass none.
+            conn = connection or (data_source.connections or [None])[0]
             if conn is not None:
-                is_per_user_catalog = get_entry(conn.type).catalog_ownership == "per_user"
+                from app.schemas.data_source_registry import connection_catalog_ownership
+                get_entry(conn.type)  # unknown type → fall through to the except
+                is_per_user_catalog = connection_catalog_ownership(conn) == "per_user"
                 is_delegated = (conn.auth_policy or "system_only") == "user_required"
                 union_user_discovery = is_per_user_catalog or is_delegated
         except Exception:
@@ -4105,6 +5640,12 @@ class DataSourceService:
                 # row alone; it survives until no user can access it.
                 row_meta = dict(meta) if isinstance(meta, dict) else {}
                 row_meta.setdefault("discovered_by", "user")
+                if connection is not None:
+                    # Which connection contributed this unlinked row. The row has
+                    # no ConnectionTable to link to (the service principal cannot
+                    # see it), so this tag is the only provenance the read path
+                    # has for grouping and scoping it.
+                    row_meta.setdefault("discovered_connection_id", str(connection.id))
                 row = DataSourceTable(
                     # Client-side id: the overlay rows below reference it, so
                     # generating it here avoids a flush() per contributed table
@@ -4133,7 +5674,26 @@ class DataSourceService:
                 UserOverlayTable.deleted_at.is_(None),
             )
         )
-        prior_by_name = {row.table_name: row for row in all_prior_q.scalars().all()}
+        # Scope the reconciliation to THIS connection. Rows belonging to the
+        # agent's other connections are not part of this snapshot and must not
+        # be revoked by it. NULL connection_id rows predate connection-aware
+        # overlays (or point at a canonical row the service principal never
+        # linked, so the migration could not backfill them); the first
+        # connection to sync adopts them by stamping its own id, which heals
+        # them permanently.
+        prior_by_name = {}
+        for row in all_prior_q.scalars().all():
+            row_conn = str(row.connection_id) if row.connection_id else None
+            if conn_id is not None and row_conn is not None and row_conn != conn_id:
+                continue
+            prior_by_name[row.table_name] = row
+            if conn_id is not None and row_conn is None:
+                row.connection_id = conn_id
+                db.add(row)
+        prior_by_identity = {
+            _dataset_table_key(row.metadata_json): row for row in prior_by_name.values()
+            if _dataset_table_key(row.metadata_json) is not None
+        }
         new_table_names = set(normalized.keys())
 
         # Batch-load every prior column overlay in ONE pass instead of querying
@@ -4165,8 +5725,20 @@ class DataSourceService:
         # per-table round trips this loop was rewritten to avoid.
         rows_by_name: dict[str, UserOverlayTable] = {}
         for table_name, payload in normalized.items():
-            t_row = prior_by_name.get(table_name)
+            identity = _dataset_table_key(payload.get("metadata_json"))
+            t_row = prior_by_identity.get(identity) if identity is not None else prior_by_name.get(table_name)
+            if t_row is not None and t_row.table_name != table_name:
+                # Rename in place so selections and per-column state survive.
+                prior_by_name.pop(t_row.table_name, None)
+                t_row.table_name = table_name
+                prior_by_name[table_name] = t_row
             if t_row is None:
+                conflicting = prior_by_name.get(table_name)
+                if conflicting is not None:
+                    historical_name = f"{table_name} [revoked {conflicting.id}]"
+                    conflicting.table_name = historical_name
+                    prior_by_name[historical_name] = prior_by_name.pop(table_name)
+                    await db.flush()
                 t_row = UserOverlayTable(
                     # Assign the id up front: the column rows below need it as an
                     # FK, and generating it here removes a per-table `flush()`
@@ -4174,6 +5746,7 @@ class DataSourceService:
                     id=str(uuid.uuid4()),
                     data_source_id=str(data_source.id),
                     user_id=str(user.id),
+                    connection_id=conn_id,
                     table_name=table_name,
                     data_source_table_id=str(canonical_by_name.get(table_name).id) if canonical_by_name.get(table_name) else None,
                     is_accessible=True,
@@ -4257,7 +5830,10 @@ class DataSourceService:
                     c.is_accessible = False
                     db.add(c)
 
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
     
     async def update_table_status_in_schema(self, db: AsyncSession, data_source_id: str, tables: list[DataSourceTableSchema], organization: Organization):
         data_source = await self.get_data_source(db=db, data_source_id=data_source_id, organization=organization)
@@ -4274,8 +5850,19 @@ class DataSourceService:
         
         return data_source
     
-    # Maximum tables to set as active when auto-selecting
-    MAX_ACTIVE_TABLES = 500
+    # How many of an agent's active tables the LLM context can actually carry.
+    # Mirrors agent_v2.INDEX_LIMIT: beyond this the schema context lists a
+    # round-robin sample across connections rather than every table. Every
+    # connection stays named in the <connections> roster and remains reachable
+    # with describe_tables, so nothing disappears — but the agent no longer has
+    # every table name in front of it.
+    #
+    # This replaces a `MAX_ACTIVE_TABLES = 500` that was declared here and
+    # referenced nowhere: it read like an enforced cap on activation and was
+    # not one. Activation is deliberately NOT capped — "Select all" means what
+    # it says, and silently activating 500 of 5,000 would be worse than
+    # activating them all — so this is a threshold to report, not to enforce.
+    CONTEXT_TABLE_SOFT_LIMIT = 1000
     
     # Onboarding: auto-select a focused set of tables
     ONBOARDING_MAX_TABLES = 0
@@ -4397,13 +5984,13 @@ class DataSourceService:
 
         except Exception as e:
             print(f"Error saving tables: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to save database tables: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to save database tables: {redact_error(e)}")
 
         # Return full schema including inactive for downstream context
         schemas = await data_source.get_schemas(db=db, include_inactive=True)
         return schemas
 
-    async def _select_active_tables_sql(self, db: AsyncSession, datasource_id: str, max_active: int):
+    async def _select_active_tables_sql(self, db: AsyncSession, datasource_id: str, max_active: int, *, commit: bool = True):
         """
         Select top tables based on:
         1. Schema distribution (spread across schemas proportionally)
@@ -4500,9 +6087,92 @@ class DataSourceService:
                 params
             )
         
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
         
     
+    #: How many of an agent's connections a single Reload crawls at once.
+    #: The crawl is network-bound, so refreshing them one after another made an
+    #: agent-level Reload scale linearly with connection count — 5m17s for a
+    #: 100-connection agent, with no progress shown anywhere.
+    #: Override with BOW_RELOAD_CONCURRENCY.
+    _RELOAD_CONCURRENCY = max(1, int(os.environ.get("BOW_RELOAD_CONCURRENCY", "4")))
+
+    async def _refresh_shared_connections(
+        self, shared_conns, current_user: User, caller_id: "str | None",
+    ) -> dict:
+        """Refresh each shared connection's catalog, a few at a time.
+
+        Every task gets its OWN session and its OWN ConnectionService: a single
+        AsyncSession is not safe for concurrent use, and the post-refresh stash
+        (`last_refresh_fresh_tables` / `last_refresh_identity_user_id`) is
+        instance state that concurrent runs would otherwise overwrite for each
+        other. The tasks touch disjoint rows — one connection each — and this
+        mirrors what the background indexer already does per job.
+
+        Returns the per-connection prefetch map the overlay sync reuses, so a
+        Reload still crawls each source only once.
+        """
+        from app.dependencies import async_session_maker
+        from app.models.connection import Connection
+        from app.services.connection_service import ConnectionService
+        from app.services.connection_indexing_service import ConnectionIndexingService
+
+        prefetched_by_conn: dict = {}
+        sem = asyncio.Semaphore(self._RELOAD_CONCURRENCY)
+        timeouts: list = []
+        # Connections whose refresh_schema already synced every linked agent.
+        self._published_conn_ids = set()
+
+        async def _one(conn_id: str, auth_policy: str) -> None:
+            async with sem:
+                async with async_session_maker() as conn_db:
+                    conn = await conn_db.get(Connection, conn_id)
+                    if conn is None:
+                        return
+                    user_in_session = (
+                        await conn_db.get(User, str(current_user.id))
+                        if current_user is not None else None
+                    )
+                    # Wait for any active indexing run before refreshing.
+                    try:
+                        await ConnectionIndexingService().wait_for_active(conn_db, conn_id)
+                    except TimeoutError as exc:
+                        timeouts.append(str(exc))
+                        return
+                    logger.info(
+                        f"refresh_data_source_schema: refresh_schema for connection {conn_id} "
+                        f"(auth_policy={auth_policy})"
+                    )
+                    svc = ConnectionService()
+                    # Explicit Reload must pick up column-level changes.
+                    await svc.refresh_schema(
+                        db=conn_db, connection=conn, current_user=user_in_session,
+                        introspection="full",
+                    )
+                    await conn_db.commit()
+                    if getattr(svc, "_catalog_discovery_complete", False):
+                        self._published_conn_ids.add(conn_id)
+                    fetched = getattr(svc, "last_refresh_fresh_tables", None)
+                    fetched_as = getattr(svc, "last_refresh_identity_user_id", None)
+                    if fetched is not None and fetched_as is not None and fetched_as == caller_id:
+                        prefetched_by_conn[conn_id] = fetched
+
+        results = await asyncio.gather(
+            *(_one(str(c.id), getattr(c, "auth_policy", None)) for c in shared_conns),
+            return_exceptions=True,
+        )
+        if timeouts:
+            raise HTTPException(status_code=504, detail=timeouts[0])
+        for r in results:
+            if isinstance(r, BaseException):
+                # One unreachable connection must not sink the whole Reload —
+                # the others' catalogs are still worth returning.
+                logger.warning(f"refresh_data_source_schema: connection refresh failed: {r}")
+        return prefetched_by_conn
+
     async def refresh_data_source_schema(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User):
         # Get the DataSource model instance with connections eagerly loaded
         result = await db.execute(
@@ -4550,7 +6220,9 @@ class DataSourceService:
                     continue
                 ownership = "shared"
                 try:
-                    ownership = get_entry(conn.type).catalog_ownership
+                    from app.schemas.data_source_registry import connection_catalog_ownership
+                    get_entry(conn.type)  # unknown type → "shared" via the except
+                    ownership = connection_catalog_ownership(conn)
                 except Exception:
                     ownership = "shared"
                 (per_user_conns if ownership == "per_user" else shared_conns).append(conn)
@@ -4581,122 +6253,117 @@ class DataSourceService:
                 # second time in the same request (on Power BI/Fabric OBO each
                 # crawl is a full tenant walk; the duplicate doubled Reload time).
                 caller_id = str(current_user.id) if current_user is not None else None
-                caller_fetched_tables: list = []
-                all_fetched_as_caller = caller_id is not None
+                # Keyed BY CONNECTION. Merging every connection's crawl into one
+                # list threw away the only thing that made it reusable — which
+                # connection each table came from — so it could not be handed to
+                # a per-connection overlay sync without cross-contaminating them.
+                prefetched_by_conn: dict[str, list] = await self._refresh_shared_connections(
+                    shared_conns, current_user=current_user, caller_id=caller_id,
+                )
 
-                for conn in shared_conns:
-                    # Wait for any active indexing run before refreshing synchronously.
-                    try:
-                        await indexing_service.wait_for_active(db, str(conn.id))
-                    except TimeoutError as exc:
-                        raise HTTPException(status_code=504, detail=str(exc)) from exc
-                    logger.info(f"refresh_data_source_schema: refresh_schema for connection {conn.id} (auth_policy={conn.auth_policy})")
-                    # Interactive reload: only introspect NEW datasets; known
-                    # ones are rebuilt from the indexed catalog (column-level
-                    # drift is picked up by scheduled/background reindexing,
-                    # which runs with the default full introspection).
-                    await connection_service.refresh_schema(
-                        db=db, connection=conn, current_user=current_user,
-                        introspection="incremental",
-                    )
-                    fetched = getattr(connection_service, "last_refresh_fresh_tables", None)
-                    fetched_as = getattr(connection_service, "last_refresh_identity_user_id", None)
-                    if fetched is not None and fetched_as is not None and fetched_as == caller_id:
-                        caller_fetched_tables.extend(fetched)
-                    else:
-                        all_fetched_as_caller = False
-
-                prefetched = caller_fetched_tables if all_fetched_as_caller else None
+                prefetched = prefetched_by_conn or None
 
                 # Sync ConnectionTable -> DataSourceTable (linked). Reconciles/heals
                 # any legacy unlinked orphan rows; keep existing is_active state.
+                # refresh_schema already synced this agent for connections it
+                # published; only sync the rest (failed or skipped refreshes).
                 for conn in shared_conns:
+                    if str(conn.id) in self._published_conn_ids:
+                        continue
                     await self.sync_domain_tables_from_connection(
                         db, data_source, conn, max_auto_select=None
                     )
                 if not per_user_conns:
-                    user_scoped = await self._refresh_shared_user_overlay(
-                        db, data_source, current_user, prefetched_tables=prefetched
+                    return await self._reloaded_schema_for(
+                        db, data_source, organization, current_user, prefetched
                     )
-                    if user_scoped is not None:
-                        return user_scoped
-                    schemas = await data_source.get_schemas(db=db, include_inactive=True)
-                    return schemas
 
-            # Per-user catalogs: fetch the caller's own catalog against their creds.
-            if per_user_conns and current_user is not None:
-                schemas = await self.get_user_data_source_schema(db=db, data_source=data_source, user=current_user)
-                return schemas or []
-
-            # Mixed (shared + per-user) already refreshed the shared side above.
-            if shared_conns:
-                user_scoped = await self._refresh_shared_user_overlay(
-                    db, data_source, current_user, prefetched_tables=prefetched
+            # Per-user catalogs (and mixed agents, whose shared side refreshed
+            # above): one merged, identity-scoped answer either way.
+            if per_user_conns or shared_conns:
+                return await self._reloaded_schema_for(
+                    db, data_source, organization, current_user,
+                    prefetched if shared_conns else None,
                 )
-                if user_scoped is not None:
-                    return user_scoped
-                schemas = await data_source.get_schemas(db=db, include_inactive=True)
-                return schemas
 
         # No connections at all: legacy direct fetch (nothing to link against).
         schemas = await self.save_or_update_tables(db=db, data_source=data_source, organization=organization, should_set_active=False, current_user=current_user)
         return schemas or []
 
-    async def _refresh_shared_user_overlay(
+    async def _reloaded_schema_for(
         self,
         db: AsyncSession,
         data_source: DataSource,
+        organization: Organization,
         current_user: User,
-        prefetched_tables: Optional[list] = None,
+        prefetched_tables=None,
     ):
-        """On an explicit reload of a SHARED-catalog, user_required (delegated/OBO,
-        e.g. Fabric/PowerBI) source, also refresh the CALLER's per-user overlay.
+        """The answer a Reload returns: every connection this caller may see.
 
-        The shared-catalog refresh above only updates the canonical catalog
-        (ConnectionTable -> DataSourceTable). But the tables selector is
-        overlay-scoped for a caller running with their own delegated token
-        (effective_auth == "user"), so without this the caller sees ZERO tables
-        right after reloading and only sees them later, once an unrelated path
-        (sign-in, OAuth connect, credential upsert) lazily warms the overlay.
+        Warms the caller's per-user overlay for the delegated / per-user
+        connections (without this, a caller running on their own token saw ZERO
+        tables straight after a reload and only recovered when some unrelated
+        path lazily warmed the overlay), then returns ONE merged catalog —
+        overlay tables for delegated connections, canonical tables for the open
+        ones.
 
-        Returns the caller's user-scoped schema list when the overlay applies, or
-        None to signal the caller should get the full canonical catalog (admin via
-        service account, or a non-delegated source).
+        Returning just one of those two is what made a multi-connection agent
+        come back from a Reload looking single-connection.
         """
-        conns = getattr(data_source, "connections", None) or []
-        auth_policy = (conns[0].auth_policy if conns else "system_only") or "system_only"
-        if auth_policy != "user_required" or current_user is None:
-            return None
-        effective_auth = await self._resolve_effective_auth(db, data_source, current_user)
-        if effective_auth == "user":
-            # Caller runs with their own token: populate + return their overlay so
-            # the reload reflects exactly the tables they can query.
+        from app.services.access_errors import CredentialsRequiredError
+
+        per_user_connections = self._per_user_catalog_connections(data_source)
+        if current_user is not None and per_user_connections:
             try:
-                schemas = await self.get_user_data_source_schema(
+                await self.get_user_data_source_schema(
                     db=db, data_source=data_source, user=current_user,
                     prefetched_tables=prefetched_tables,
+                    force_refresh=True,
                 )
-                return schemas or []
-            except Exception as e:
-                # Degrading to "no tables" is deliberate (a live fetch against the
-                # user's token can fail for reasons we can't fix here), but stay
-                # loud about it: a swallowed DB error here reads downstream as an
-                # empty overlay, which is indistinguishable from "user sees
-                # nothing" and cost real debugging time once already.
+            except HTTPException as e:
+                # A tokenless caller can still use the system catalog, and so can a
+                # refused caller who may see a connection that takes no login: it has
+                # nothing to connect, whatever the agent's other connections need.
+                # Other discovery/publication failures must propagate, not look
+                # successful.
+                if not isinstance(e, CredentialsRequiredError) and not (
+                    e.status_code == 403
+                    and await self._caller_sees_a_no_login_connection(
+                        db, data_source, current_user, per_user_connections
+                    )
+                ):
+                    raise
+                # Degrading here is deliberate (a live fetch against the user's
+                # token can fail for reasons we can't fix), but stay loud: a
+                # swallowed error reads downstream as an empty overlay, which is
+                # indistinguishable from "user sees nothing".
                 logger.warning(
-                    "Per-user overlay refresh failed for data source %s / user %s: %s",
-                    data_source.id, getattr(current_user, "id", None), e, exc_info=True,
+                    "Per-user overlay refresh failed for data source %s / user %s",
+                    data_source.id, getattr(current_user, "id", None), exc_info=True,
                 )
-                return []
-        if effective_auth == "none":
-            # No proven access (disconnected/expired) → nothing to show for a
-            # plain member. Owner/admin get the canonical catalog (display
-            # fallback, same rule as get_data_source_schema_paginated).
-            if await self._admin_catalog_access(db, data_source, current_user):
-                return None
-            return []
-        # effective_auth == "system": admin via service account → full catalog.
-        return None
+
+        return await self.get_data_source_schema(
+            db=db,
+            data_source_id=str(data_source.id),
+            include_inactive=True,
+            organization=organization,
+            current_user=current_user,
+        )
+
+    async def _caller_sees_a_no_login_connection(
+        self, db: AsyncSession, data_source: DataSource, current_user: User, connections: list,
+    ) -> bool:
+        """True if one of `connections` takes no login and this caller's catalog includes it.
+
+        Only decides whether a refusal stands: no credential is resolved here. A
+        member the classifier denies gets nothing from the connection, so for
+        them the refusal is the honest answer rather than an empty success.
+        """
+        from app.services.connection_identity import takes_no_login
+
+        open_ids, overlay_ids, _ = await self.classify_connection_access(db, data_source, current_user)
+        visible_ids = {*open_ids, *overlay_ids}
+        return any(str(c.id) in visible_ids and takes_no_login(c) for c in connections)
 
     async def get_metadata_resources(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User = None):
         result = await db.execute(select(DataSource).filter(DataSource.id == data_source_id, DataSource.organization_id == organization.id))
@@ -4969,22 +6636,44 @@ class DataSourceService:
         return [DataSourceMembershipSchema.from_orm(m) for m in data_source_memberships]
 
     async def _get_prompt_schema(self, db: AsyncSession, data_source: DataSource, organization: Organization, current_user: User | None) -> str:
-        """Resolve a prompt-ready schema string for this data source.
-        - For system_only: use canonical via DataSource.prompt_schema
-        - For user_required with user: use per-user overlay tables and TableFormatter
+        """Resolve a prompt-ready schema string for this data source, scoped to
+        what `current_user` may actually see on each of its connections.
+
+        This gated on `data_source.auth_policy` — a field that moved to
+        `Connection`, so `getattr(..., "system_only")` always returned the
+        default and the per-user branch was unreachable. Dead code that reads
+        as live: the delegated path looked handled and never ran, so agent
+        summaries, conversation starters, descriptions and the onboarding
+        instruction draft were all written from the canonical catalog, ignoring
+        per-user access entirely.
+
+        `get_data_source_schema` already merges overlay tables (with their
+        per-user column masking) for delegated connections and canonical tables
+        for open ones, so route through it rather than re-deriving the rule a
+        third time.
         """
-        # User-required path uses per-user overlays — cache-first read, no
-        # live walk on every prompt build.
-        if getattr(data_source, "auth_policy", "system_only") == "user_required" and current_user is not None:
-            tables = await self.read_user_data_source_schema(db=db, data_source=data_source, user=current_user)
-            try:
-                from app.ai.prompt_formatters import TableFormatter
-                return TableFormatter(tables).table_str
-            except Exception:
-                # Fallback to no-stats canonical prompt schema
-                return await data_source.prompt_schema(db=db, with_stats=False)
-        # System path: canonical tables
-        return await data_source.prompt_schema(db=db, with_stats=False)
+        from app.ai.prompt_formatters import TableFormatter
+
+        delegated = [
+            c for c in (getattr(data_source, "connections", None) or [])
+            if (getattr(c, "auth_policy", None) or "system_only") == "user_required"
+        ]
+        if not delegated or current_user is None:
+            return await data_source.prompt_schema(db=db, with_stats=False)
+
+        try:
+            tables = await self.get_data_source_schema(
+                db=db, data_source_id=str(data_source.id), include_inactive=False,
+                organization=organization, current_user=current_user,
+            )
+            return TableFormatter(tables).table_str
+        except Exception:
+            logger.warning(
+                "Scoped prompt schema failed for data source %s / user %s; "
+                "falling back to the canonical catalog",
+                data_source.id, getattr(current_user, "id", None), exc_info=True,
+            )
+            return await data_source.prompt_schema(db=db, with_stats=False)
 
     # ==================== Domain-Connection Architecture Methods ====================
 
@@ -5013,6 +6702,7 @@ class DataSourceService:
         credentials = data_source_dict.pop("credentials", {})
         auth_policy = data_source_dict.get("auth_policy", "system_only")
         allowed_user_auth_modes = data_source_dict.pop("allowed_user_auth_modes", None)
+        member_bindings = data_source_dict.pop("member_bindings", None)
         
         # Extract domain-specific fields
         name = data_source_dict.get("name")
@@ -5034,6 +6724,7 @@ class DataSourceService:
             credentials=credentials,
             auth_policy=auth_policy,
             allowed_user_auth_modes=allowed_user_auth_modes,
+            member_bindings=member_bindings,
         )
         
         # Create the DataSource (Domain) - connection fields are now on Connection model
@@ -5223,17 +6914,78 @@ class DataSourceService:
             )
         )
         
-        # Remove domain tables that reference this connection's tables
         from app.models.connection_table import ConnectionTable
+        from app.models.connection_tool import ConnectionTool
+        from app.models.data_source_connection_tool import DataSourceConnectionTool
+        from app.models.instruction_reference import InstructionReference
+        from app.models.table_feedback_event import TableFeedbackEvent
+        from app.models.table_stats import TableStats
+        from app.models.table_usage_event import TableUsageEvent
+
+        # The agent's tables that came from this connection. A subquery, not a
+        # bound id list: a connection can carry tens of thousands of tables,
+        # past PostgreSQL's 32767-parameter ceiling.
+        removed_table_ids = select(DataSourceTable.id).where(
+            DataSourceTable.datasource_id == data_source_id,
+            DataSourceTable.connection_table_id.in_(
+                select(ConnectionTable.id).where(ConnectionTable.connection_id == connection_id)
+            ),
+        )
+
+        # Clear what hangs off those tables before deleting them. The bulk
+        # DELETE below bypasses the ORM delete-orphan cascade declared on
+        # DataSourceTable, and these FKs have no ON DELETE rule, so Postgres
+        # rejected the unlink (table_stats_datasource_table_id_fkey) as soon as
+        # any table had been queried or rated. SQLite never enforced it.
+        for model in (TableStats, TableUsageEvent, TableFeedbackEvent):
+            await db.execute(
+                delete(model).where(model.datasource_table_id.in_(removed_table_ids))
+            )
+        # Polymorphic reference (no FK): the table ids are gone for good — a
+        # relink creates new rows — so an instruction would point at nothing.
+        await db.execute(
+            delete(InstructionReference).where(
+                InstructionReference.object_type == "datasource_table",
+                InstructionReference.object_id.in_(removed_table_ids),
+            )
+        )
+        # Per-user overlays of this connection within this agent. Legacy rows
+        # carry no connection_id; catch those by the table they point at.
+        overlay_filter = and_(
+            UserOverlayTable.data_source_id == data_source_id,
+            or_(
+                UserOverlayTable.connection_id == connection_id,
+                UserOverlayTable.data_source_table_id.in_(removed_table_ids),
+            ),
+        )
+        await db.execute(
+            delete(UserOverlayColumn).where(UserOverlayColumn.user_data_source_table_id.in_(
+                select(UserOverlayTable.id).where(overlay_filter)
+            ))
+        )
+        await db.execute(delete(UserOverlayTable).where(overlay_filter))
+
         await db.execute(
             delete(DataSourceTable).where(
                 DataSourceTable.datasource_id == data_source_id,
                 DataSourceTable.connection_table_id.in_(
                     select(ConnectionTable.id).where(ConnectionTable.connection_id == connection_id)
-                )
+                ),
             )
         )
-        
+
+        # This agent's tool policies for the connection's tools. They only
+        # cascade on agent/tool delete, so they outlived the unlink, leaked into
+        # the agent's YAML export, and silently came back on a relink.
+        await db.execute(
+            delete(DataSourceConnectionTool).where(
+                DataSourceConnectionTool.data_source_id == data_source_id,
+                DataSourceConnectionTool.connection_tool_id.in_(
+                    select(ConnectionTool.id).where(ConnectionTool.connection_id == connection_id)
+                ),
+            )
+        )
+
         await db.commit()
         return {"message": "Connection removed from agent"}
 
@@ -5243,6 +6995,7 @@ class DataSourceService:
         data_source: DataSource,
         connection,
         max_auto_select: int | None = None,
+        *, commit: bool = True, after_commit: list | None = None,
     ):
         """
         Create DataSourceTable (DomainTable) entries from ConnectionTable entries.
@@ -5251,14 +7004,18 @@ class DataSourceService:
         Args:
             max_auto_select: Maximum tables to auto-select.
                 - None: No auto-selection, all tables start inactive (for new domains from existing connections)
-                - int: Auto-select up to this many tables (for onboarding, use ONBOARDING_MAX_TABLES=20)
+                - int: Explicit auto-selection cap; zero leaves newly discovered tables inactive.
         """
         from app.models.connection_table import ConnectionTable
+
+        from app.services.powerbi_catalog_service import prepare_powerbi_catalog
+        await prepare_powerbi_catalog(db, connection)
 
         # Get connection tables - ensure connection_id is string
         connection_id_str = str(connection.id)
         conn_tables = await db.execute(
             select(ConnectionTable).filter(ConnectionTable.connection_id == connection_id_str)
+            .execution_options(populate_existing=True)
         )
         conn_tables = conn_tables.scalars().all()
 
@@ -5272,6 +7029,7 @@ class DataSourceService:
         # This allows the same table name from different connections to coexist
         existing = await db.execute(
             select(DataSourceTable).filter(DataSourceTable.datasource_id == data_source.id)
+            .execution_options(populate_existing=True)
         )
         existing_rows = existing.scalars().all()
         existing_by_conn_table_id = {t.connection_table_id: t for t in existing_rows if t.connection_table_id}
@@ -5296,6 +7054,31 @@ class DataSourceService:
             if not t.connection_table_id:
                 unlinked_by_name.setdefault(t.name, []).append(t)
 
+        from app.utils.powerbi_catalog import powerbi_identity, reconcile_powerbi_names
+        conn_ids = {t.id for t in conn_tables}
+        def belongs_here(row):
+            if row.connection_table_id:
+                return row.connection_table_id in conn_ids
+            provenance = (row.metadata_json or {}).get("discovered_connection_id")
+            return provenance is None or str(provenance) == connection_id_str
+
+        # An SP can discover a different model with the same label as an
+        # existing user-contributed row. Never adopt that row or its selection.
+        scoped_existing = {r.name: r for r in existing_rows if belongs_here(r)}
+        from copy import deepcopy
+        domain_payloads = reconcile_powerbi_names(
+            {t.name: {"id": t.id, "metadata_json": t.metadata_json, "fks": deepcopy(t.fks or [])}
+             for t in conn_tables},
+            scoped_existing,
+        )
+        domain_names = {payload["id"]: name for name, payload in domain_payloads.items()}
+        domain_fks = {payload["id"]: payload["fks"] for payload in domain_payloads.values()}
+        unlinked_by_identity = {
+            powerbi_identity(r.metadata_json): r for r in existing_rows
+            if r.connection_table_id is None and belongs_here(r)
+            and powerbi_identity(r.metadata_json) is not None
+        }
+
         total_tables = len(conn_tables)
 
         # Determine initial activation:
@@ -5310,12 +7093,14 @@ class DataSourceService:
             needs_smart_selection = total_tables > max_auto_select
 
         for conn_table in conn_tables:
+            domain_name = domain_names[conn_table.id]
             if conn_table.id in existing_by_conn_table_id:
                 # Update existing - refresh schema data (preserves is_active)
                 domain_table = existing_by_conn_table_id[conn_table.id]
+                domain_table.name = domain_name
                 domain_table.columns = conn_table.columns
                 domain_table.pks = conn_table.pks
-                domain_table.fks = conn_table.fks
+                domain_table.fks = domain_fks[conn_table.id]
                 domain_table.no_rows = conn_table.no_rows
                 domain_table.metadata_json = conn_table.metadata_json
             else:
@@ -5324,13 +7109,21 @@ class DataSourceService:
                 # rather than inserting a duplicate. Preserves its is_active (it may
                 # be the row users currently see/select) and its per-user overlay
                 # links (UserDataSourceTable.data_source_table_id points at it).
-                pool = unlinked_by_name.get(conn_table.name)
-                if pool:
-                    domain_table = pool.pop(0)
+                identity = powerbi_identity(conn_table.metadata_json)
+                pool = unlinked_by_name.get(domain_name) or []
+                candidate = unlinked_by_identity.pop(identity, None) if identity else None
+                if candidate is None:
+                    candidate = next((r for r in pool if belongs_here(r)
+                                      and powerbi_identity(r.metadata_json) == identity), None)
+                if candidate is not None:
+                    domain_table = candidate
+                    domain_table.name = domain_name
+                    if candidate in pool:
+                        pool.remove(candidate)
                     domain_table.connection_table_id = conn_table.id
                     domain_table.columns = conn_table.columns
                     domain_table.pks = conn_table.pks
-                    domain_table.fks = conn_table.fks
+                    domain_table.fks = domain_fks[conn_table.id]
                     domain_table.no_rows = conn_table.no_rows
                     domain_table.metadata_json = conn_table.metadata_json
                     domain_table.centrality_score = conn_table.centrality_score
@@ -5343,10 +7136,10 @@ class DataSourceService:
                 else:
                     # Create new domain table linked to connection table
                     domain_table = DataSourceTable(
-                        name=conn_table.name,
+                        name=domain_name,
                         datasource_id=data_source.id,
                         connection_table_id=conn_table.id,
-                        # A BOW custom query always starts inactive on a new
+                        # A BOW custom table always starts inactive on a new
                         # agent: it is an admin's curated relation for a specific
                         # purpose, not part of the source catalog the auto-select
                         # rule is reasoning about, and enabling it silently would
@@ -5359,7 +7152,7 @@ class DataSourceService:
                         # Copy legacy fields for backward compatibility
                         columns=conn_table.columns,
                         pks=conn_table.pks,
-                        fks=conn_table.fks,
+                        fks=domain_fks[conn_table.id],
                         no_rows=conn_table.no_rows,
                         metadata_json=conn_table.metadata_json,
                         centrality_score=conn_table.centrality_score,
@@ -5421,7 +7214,9 @@ class DataSourceService:
             )).scalars().all()
             for orphan in orphan_rows:
                 target = linked_by_name.get(orphan.name)
-                if target is None or str(target.id) == str(orphan.id):
+                if (target is None or str(target.id) == str(orphan.id)
+                    or not belongs_here(orphan)
+                    or powerbi_identity(orphan.metadata_json) != powerbi_identity(target.metadata_json)):
                     continue
                 oid, tid = str(orphan.id), str(target.id)
                 # Re-point everything that referenced the orphan onto the canonical
@@ -5459,45 +7254,55 @@ class DataSourceService:
                     .values(is_active=False)
                 )
 
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
 
         # If too many tables for auto-select, use smart selection algorithm
         if needs_smart_selection and max_auto_select:
-            await self._select_active_tables_sql(db, str(data_source.id), max_auto_select)
+            await self._select_active_tables_sql(db, str(data_source.id), max_auto_select, commit=commit)
 
         # Detect a structural change vs. the pre-refresh snapshot and fire the
         # agent-reliability loop (debounced to one schedule per sync). Skipped on
         # the initial population (empty pre-snapshot) so onboarding doesn't storm
         # the loop. Best-effort: never let trigger wiring break a schema sync.
-        try:
-            post_rows = (await db.execute(
-                select(DataSourceTable).where(
-                    DataSourceTable.datasource_id == data_source.id,
-                    DataSourceTable.is_active == True,  # noqa: E712
-                )
-            )).scalars().all()
-            post_schema_sig = {t.name: self._column_signature(t.columns) for t in post_rows}
-            if pre_schema_sig:
-                changed = sorted({
-                    name for name in (set(pre_schema_sig) | set(post_schema_sig))
-                    if pre_schema_sig.get(name) != post_schema_sig.get(name)
-                })
-                if changed:
-                    from app.services.agent_reliability_service import AgentReliabilityService
-                    from app.models.agent_automation_run import TRIGGER_TABLE_CHANGE
-                    hint = "Table/column structure changed: " + ", ".join(changed[:8])
-                    AgentReliabilityService().schedule(
-                        organization_id=str(data_source.organization_id),
-                        data_source_id=str(data_source.id),
-                        trigger=TRIGGER_TABLE_CHANGE,
-                        changed_hint=hint,
+        async def notify_schema_change():
+            try:
+                post_rows = (await db.execute(
+                    select(DataSourceTable).where(
+                        DataSourceTable.datasource_id == data_source.id,
+                        DataSourceTable.is_active == True,  # noqa: E712
                     )
-                    from app.services.review_producers import emit_schema_changed
-                    await emit_schema_changed(
-                        db, str(data_source.organization_id), str(data_source.id), summary=hint,
-                    )
-        except Exception:
-            logger.debug("sync_domain_tables: reliability trigger skipped", exc_info=True)
+                )).scalars().all()
+                post_schema_sig = {t.name: self._column_signature(t.columns) for t in post_rows}
+                if pre_schema_sig:
+                    changed = sorted({
+                        name for name in (set(pre_schema_sig) | set(post_schema_sig))
+                        if pre_schema_sig.get(name) != post_schema_sig.get(name)
+                    })
+                    if changed:
+                        from app.services.agent_reliability_service import AgentReliabilityService
+                        from app.models.agent_automation_run import TRIGGER_TABLE_CHANGE
+                        hint = "Table/column structure changed: " + ", ".join(changed[:8])
+                        AgentReliabilityService().schedule(
+                            organization_id=str(data_source.organization_id),
+                            data_source_id=str(data_source.id),
+                            trigger=TRIGGER_TABLE_CHANGE,
+                            changed_hint=hint,
+                        )
+                        from app.services.review_producers import emit_schema_changed
+                        await emit_schema_changed(
+                            db, str(data_source.organization_id), str(data_source.id), summary=hint,
+                        )
+            except Exception:
+                logger.debug("sync_domain_tables: reliability trigger skipped", exc_info=True)
+
+
+        if commit:
+            await notify_schema_change()
+        elif after_commit is not None:
+            after_commit.append(notify_schema_change)
 
     @staticmethod
     def _column_signature(columns) -> tuple:

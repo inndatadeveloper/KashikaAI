@@ -2,6 +2,7 @@
 Tests for SCIM 2.0 provisioning endpoints.
 """
 import pytest
+import uuid
 import jwt
 import hashlib
 import secrets
@@ -362,6 +363,47 @@ class TestScimUserCrud:
         assert response.status_code == 200
         assert response.json()["active"] is False
 
+    def test_update_to_taken_email_is_409_uniqueness(self, scim_setup, test_client):
+        """PUT or PATCH that gives a user another account's email is a SCIM
+        409 uniqueness error — never a 500 carrying the constraint error."""
+        h = _scim_headers(scim_setup["scim_token"])
+
+        def _create(email):
+            r = test_client.post("/scim/v2/Users", json={
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": email, "active": True,
+            }, headers=h)
+            assert r.status_code == 201, r.text
+            return r.json()["id"]
+
+        _create("taken.owner@example.com")
+        mover = _create("mover@example.com")
+
+        put = test_client.put(f"/scim/v2/Users/{mover}", json={
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": "taken.owner@example.com", "active": True,
+        }, headers=h)
+        # Case differs from the stored address: still the same mailbox.
+        patch = test_client.patch(f"/scim/v2/Users/{mover}", json={
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "userName", "value": "Taken.Owner@example.com"}],
+        }, headers=h)
+        for r in (put, patch):
+            assert r.status_code == 409, r.text
+            body = r.json()
+            assert body["scimType"] == "uniqueness"
+            assert body["status"] == "409"
+
+        # The user is unchanged and still editable afterwards.
+        got = test_client.get(f"/scim/v2/Users/{mover}", headers=h)
+        assert got.json()["userName"] == "mover@example.com"
+        ok = test_client.patch(f"/scim/v2/Users/{mover}", json={
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+            "Operations": [{"op": "replace", "path": "userName", "value": "moved@example.com"}],
+        }, headers=h)
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["userName"] == "moved@example.com"
+
     def test_delete_user(self, scim_setup, test_client):
         """Test SCIM DELETE deactivates user."""
         # Create user
@@ -532,3 +574,82 @@ class TestScimAuth:
             headers={"Authorization": "Bearer bow_regular_api_key"},
         )
         assert response.status_code == 401
+
+
+# ============================================================================
+# Regression: invite + SSO provisioning must not create duplicate memberships
+# ============================================================================
+
+
+@pytest.mark.e2e
+def test_scim_provisioning_claims_open_invite_instead_of_duplicating(
+    scim_setup, test_client,
+):
+    """An admin email invite followed by SCIM provisioning of the same address
+    yields exactly ONE membership, not an open invite row plus a SCIM row.
+
+    Two live rows for the same (user, org) is the state that broke
+    ``principal_belongs_to_org`` (MultipleResultsFound -> every org-scoped route
+    500s, surfacing as "no available models"). SCIM now claims the open invite
+    (``permission_resolver.claim_pending_invite``) instead of adding a row.
+    """
+    import asyncio
+    from sqlalchemy import select, func
+    from app.dependencies import async_session_maker
+    from app.models.membership import Membership
+    from app.models.user import User
+
+    org_id = scim_setup["org_id"]
+    admin_token = scim_setup["user_token"]
+    invited_email = f"invited_{uuid.uuid4().hex[:8]}@example.com"
+
+    # 1. Admin invites the address by email -> one pending membership (user_id NULL).
+    invite = test_client.post(
+        f"/api/organizations/{org_id}/members",
+        json={"organization_id": org_id, "email": invited_email, "role": "member"},
+        headers={"Authorization": f"Bearer {admin_token}", "X-Organization-Id": org_id},
+    )
+    assert invite.status_code == 200, invite.json()
+    assert invite.json()["user_id"] is None
+
+    # 2. SCIM provisions the SAME address.
+    scim_resp = test_client.post(
+        "/scim/v2/Users",
+        json={
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "userName": invited_email,
+            "active": True,
+        },
+        headers=_scim_headers(scim_setup["scim_token"]),
+    )
+    assert scim_resp.status_code in (200, 201), scim_resp.json()
+
+    async def _check():
+        async with async_session_maker() as db:
+            user = (await db.execute(
+                select(User).where(func.lower(User.email) == invited_email.lower())
+            )).scalars().first()
+            assert user is not None
+            # Exactly one live membership, and it is the claimed invite:
+            # user_id set, invite email cleared.
+            rows = (await db.execute(
+                select(Membership).where(
+                    Membership.organization_id == org_id,
+                    Membership.user_id == user.id,
+                    Membership.deleted_at.is_(None),
+                )
+            )).scalars().all()
+            assert len(rows) == 1, f"expected one membership, got {len(rows)}"
+            assert rows[0].email is None
+            # No leftover open invite for the address in this org.
+            open_invites = (await db.execute(
+                select(func.count(Membership.id)).where(
+                    Membership.organization_id == org_id,
+                    func.lower(Membership.email) == invited_email.lower(),
+                    Membership.user_id.is_(None),
+                    Membership.deleted_at.is_(None),
+                )
+            )).scalar()
+            assert open_invites == 0
+
+    asyncio.run(_check())

@@ -56,9 +56,9 @@
           />
           <div class="absolute inset-x-0 bottom-0 flex flex-col items-center justify-center text-center px-6 pb-2">
             <div class="w-12 h-12 flex items-center justify-center rounded-xl bg-white/70 backdrop-blur-sm ring-1 ring-gray-200/70 shadow-sm">
-              <UIcon name="i-heroicons-squares-plus" class="w-5 h-5 text-gray-400 dark:text-gray-400" />
+              <UIcon name="i-heroicons-squares-plus" class="w-5 h-5 text-ink-muted" />
             </div>
-            <h3 class="mt-3 text-[15px] font-medium text-gray-900 dark:text-white">
+            <h3 class="mt-3 text-base font-medium text-gray-900 dark:text-white">
               {{ $t('settings.integrations.emptyTitle') }}
             </h3>
             <p class="mt-1.5 max-w-xs text-sm leading-relaxed text-gray-500 dark:text-gray-400">
@@ -73,8 +73,8 @@
         <div class="flex items-center gap-3">
           <McpIcon class="w-7 h-7 text-gray-700 dark:text-gray-300" />
           <div class="min-w-0">
-            <h3 class="text-[15px] font-medium text-gray-900 dark:text-white leading-tight">{{ selectedItem.name }}</h3>
-            <span class="inline-flex items-center gap-1.5 text-xs" :class="selectedItem.connected ? 'text-green-600' : 'text-gray-400 dark:text-gray-400'">
+            <h3 class="text-base font-medium text-gray-900 dark:text-white leading-tight">{{ selectedItem.name }}</h3>
+            <span class="inline-flex items-center gap-1.5 text-xs" :class="selectedItem.connected ? 'text-green-600' : 'text-ink-muted'">
               <span class="w-1.5 h-1.5 rounded-full" :class="selectedItem.connected ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'" />
               {{ selectedItem.connected ? $t('settings.integrations.connected') : $t('settings.integrations.notConnected') }}
             </span>
@@ -115,7 +115,7 @@ import WhatsAppIntegrationModal from '~/components/WhatsAppIntegrationModal.vue'
 import GoogleChatIntegrationModal from '~/components/GoogleChatIntegrationModal.vue'
 import EmailIntegrationModal from '~/components/EmailIntegrationModal.vue'
 import ExcelAddinModal from '~/components/ExcelAddinModal.vue'
-import OAuthClientsModal from '~/components/OAuthClientsModal.vue'
+import ConnectedApplicationsPanel from '~/components/embed/ConnectedApplicationsPanel.vue'
 import McpIcon from '~/components/icons/McpIcon.vue'
 
 definePageMeta({ auth: true, permissions: ['manage_settings'], layout: 'settings' })
@@ -138,6 +138,8 @@ const excelAddinEnabled = ref(false)
 const whatsappIntegrated = ref(false)
 const whatsappConfig = ref<{ phone_number_id?: string; display_phone_number?: string; verified_name?: string; waba_id?: string } | null>(null)
 const whatsappIntegrationData = ref<any>(null)
+// All connected WhatsApp numbers (an org may connect several, one per agent).
+const whatsappInstances = ref<any[]>([])
 
 const googleChatIntegrated = ref(false)
 const googleChatConfig = ref<{ pubsub_subscription?: string; client_email?: string; project_id?: string } | null>(null)
@@ -164,8 +166,7 @@ async function fetchSignupDomains() {
 const mcpEnabled = ref(false)
 const mcpUpdating = ref(false)
 
-// OAuth clients
-const oauthClientCount = ref(0)
+const applicationCount = ref(0)
 
 const { settings, fetchSettings } = useOrgSettings()
 
@@ -176,7 +177,7 @@ const WhatsApp = markRaw(WhatsAppIntegrationModal)
 const GoogleChat = markRaw(GoogleChatIntegrationModal)
 const Email = markRaw(EmailIntegrationModal)
 const Excel = markRaw(ExcelAddinModal)
-const OAuth = markRaw(OAuthClientsModal)
+const Applications = markRaw(ConnectedApplicationsPanel)
 
 // Build the integrations list that drives both panes. Each entry carries the
 // component to render inline in the right pane (the former modal contents).
@@ -212,7 +213,7 @@ const integrations = computed(() => {
       connected: whatsappIntegrated.value,
       kind: 'component',
       component: WhatsApp,
-      props: { integrated: whatsappIntegrated.value, integrationData: whatsappIntegrationData.value },
+      props: { instances: whatsappInstances.value },
       onUpdated: fetchIntegrations,
     },
     {
@@ -268,15 +269,9 @@ const integrations = computed(() => {
   })
 
   items.push({
-    key: 'oauth',
-    name: t('settings.integrations.oauthName'),
-    iconType: 'uicon',
-    icon: 'i-heroicons-key',
-    connected: oauthClientCount.value > 0,
-    kind: 'component',
-    component: OAuth,
-    props: {},
-    onUpdated: fetchOAuthClientCount,
+    key: 'connected_apps', name: t('connectedApps.title'), iconType: 'uicon',
+    icon: 'i-heroicons-squares-plus', connected: applicationCount.value > 0,
+    kind: 'component', component: Applications, props: {}, onUpdated: fetchApplicationCount,
   })
 
   return items
@@ -298,10 +293,11 @@ async function fetchIntegrations() {
   teamsConfig.value = teams?.platform_config || null
   teamsIntegrationData.value = teams || null
 
-  const whatsapp = integrations.find((i: any) => i.platform_type === 'whatsapp' && i.is_active)
-  whatsappIntegrated.value = !!whatsapp
-  whatsappConfig.value = whatsapp?.platform_config || null
-  whatsappIntegrationData.value = whatsapp || null
+  const whatsappAll = integrations.filter((i: any) => i.platform_type === 'whatsapp' && i.is_active)
+  whatsappInstances.value = whatsappAll
+  whatsappIntegrated.value = whatsappAll.length > 0
+  whatsappConfig.value = whatsappAll[0]?.platform_config || null
+  whatsappIntegrationData.value = whatsappAll[0] || null
 
   const googleChat = integrations.find((i: any) => i.platform_type === 'google_chat' && i.is_active)
   googleChatIntegrated.value = !!googleChat
@@ -351,20 +347,16 @@ async function toggleMcp(value: boolean) {
   }
 }
 
-async function fetchOAuthClientCount() {
-  try {
-    const res = await useMyFetch('/api/oauth/clients')
-    const clients = (res.data.value as any[]) || []
-    oauthClientCount.value = clients.length
-  } catch (e) {
-    oauthClientCount.value = 0
-  }
+async function fetchApplicationCount() {
+  const res = await useMyFetch('/api/connected_applications')
+  applicationCount.value = ((res.data.value as any[]) || []).length
 }
 
 onMounted(() => {
+  fetchApplicationCount()
+  if (['host_apps', 'oauth', 'connected_apps'].includes(String(useRoute().query.open))) selectedKey.value = 'connected_apps'
   fetchIntegrations()
   loadMcpState()
-  fetchOAuthClientCount()
   fetchSignupDomains()
 })
 </script>

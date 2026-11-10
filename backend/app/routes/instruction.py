@@ -13,6 +13,11 @@ from app.models.organization import Organization
 from app.core.auth import current_user
 from app.core.permissions_decorator import requires_permission, check_resource_permissions, require_org_permission
 from app.services.instruction_service import InstructionService
+from app.services.instruction_authority import (
+    require_delete_authority,
+    require_instruction_authority,
+    require_scope_authority,
+)
 from app.services.skill_catalog_service import SkillCatalogService
 from app.services.instruction_activity_service import (
     ACTIVITY_SOURCES,
@@ -49,6 +54,8 @@ from app.schemas.instruction_analysis_schema import (
     InstructionAnalysisResponse,
 )
 
+from app.services.connected_application_service import instruction_targets, validate_instruction_channels
+
 router = APIRouter(tags=["instructions"])
 
 #: Page ceilings for GET /instructions. The full row carries the instruction
@@ -66,43 +73,22 @@ instruction_label_service = InstructionLabelService()
 instruction_directory_service = InstructionDirectoryService()
 
 
-async def _require_instruction_authority(
-    db: AsyncSession, current_user: User, organization: Organization, existing,
-    *, allow_owner: bool = False,
-) -> None:
-    """Authority to mutate or review ``existing``.
+# Authority rules live in one place so the REST routes and the MCP tools can't
+# drift apart — see app/services/instruction_authority.py.
+_require_instruction_authority = require_instruction_authority
 
-    - Attached to agents → ``manage_instructions`` on EVERY one of them.
-      Managing one agent an instruction is shared with is not authority over
-      the others.
-    - Attached to NO agent → org-level ``manage_instructions``. A scope-less
-      instruction reaches every agent in the org, so a per-agent grant confers
-      no authority over it; this mirrors the /instructions/global create gate.
 
-    The empty-scope branch matters: without it, these routes skipped the check
-    entirely for global instructions, letting any per-agent manager edit,
-    accept or reject org-wide rules.
-
-    ``allow_owner`` keeps the pre-existing carve-out on the edit path: the author
-    of a scope-less instruction may still edit it (the service then restricts
-    them to content fields — governance on a scope-less rule stays org-level).
-    Review actions do NOT pass it: authoring a rule is not authority to approve
-    changes to it.
-    """
-    ds_ids = [str(ds.id) for ds in (getattr(existing, "data_sources", None) or [])]
-    if ds_ids:
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", ds_ids, "manage_instructions",
-        )
-        return
-    if allow_owner:
-        owner_id = getattr(existing, "user_id", None)
-        if owner_id is not None and str(owner_id) == str(current_user.id):
-            return
-    await require_org_permission(
-        db, str(current_user.id), str(organization.id), "manage_instructions",
-    )
+# APPLICATION TARGETS
+# Connected applications an instruction can be scoped to (the channel picker).
+# Names and agent access only; managing apps stays behind manage_settings.
+@router.get("/instructions/application-targets")
+@requires_permission('manage_instructions', resource_scoped=True)
+async def list_instruction_application_targets(
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    return await instruction_targets(db, organization.id)
 
 
 # CREATE INSTRUCTIONS
@@ -115,6 +101,9 @@ async def create_private_instruction(
     organization: Organization = Depends(get_current_organization)
 ):
     """Create a new private instruction (auto-published) - Private Published: published, null, published"""
+    if instruction.applicable_channels:
+        instruction.applicable_channels = await validate_instruction_channels(
+            db, organization.id, instruction.applicable_channels)
     if instruction.data_source_ids:
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
@@ -131,6 +120,9 @@ async def create_global_instruction(
     organization: Organization = Depends(get_current_organization)
 ):
     """Create a new global instruction (admin only) - Global Draft/Published: null, approved, draft/published"""
+    if instruction.applicable_channels:
+        instruction.applicable_channels = await validate_instruction_channels(
+            db, organization.id, instruction.applicable_channels)
     if instruction.data_source_ids:
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
@@ -352,11 +344,16 @@ async def get_instruction_counts(
 async def search_knowledge(
     q: str = Query("", description="Search query (matches agent names and instruction text/title)"),
     limit: int = Query(20, ge=1, le=50),
+    data_source_id: Optional[str] = Query(None, description="Scope the search to one agent: only instructions attached to it; agents are not returned"),
+    show_all: bool = Query(False, description="Admin-only: match every agent in the org (not just the caller's memberships), mirroring the /agents tree's 'Show all agents' toggle so agents visible there are also searchable"),
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
 ):
-    return await instruction_service.search_knowledge(db, organization, current_user, q, limit=limit)
+    return await instruction_service.search_knowledge(
+        db, organization, current_user, q, limit=limit, data_source_id=data_source_id,
+        show_all=show_all,
+    )
 
 
 # BULK UPDATE
@@ -618,12 +615,17 @@ async def delete_instruction_label(
 # reading the tree is open to any org member (parity with the instruction list,
 # which is permission-filtered rather than decorated).
 async def _assert_manage_scope(db, current_user, organization, data_source_id):
-    """Require manage_instructions on the scope agent (skip for the Global group,
-    which the route-level @requires_permission already gates org-wide)."""
+    """Require manage_instructions on the scope agent, or org-level
+    manage_instructions for the Global group. The routes are resource_scoped,
+    so the decorator alone admits anyone managing a single agent."""
     if data_source_id:
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", [data_source_id], "manage_instructions",
+        )
+    else:
+        await require_org_permission(
+            db, str(current_user.id), str(organization.id), "manage_instructions",
         )
 
 
@@ -931,16 +933,10 @@ async def update_instruction(
     # their own rule to global (applies to every agent in the org) by removing
     # the one agent from it, which is precisely what the /instructions/global
     # gate exists to prevent.
-    if instruction.data_source_ids is not None:
-        if instruction.data_source_ids:
-            await check_resource_permissions(
-                db, str(current_user.id), str(organization.id),
-                "data_source", instruction.data_source_ids, "manage_instructions",
-            )
-        else:
-            await require_org_permission(
-                db, str(current_user.id), str(organization.id), "manage_instructions",
-            )
+    await require_scope_authority(db, current_user, organization, instruction.data_source_ids)
+    if instruction.applicable_channels:
+        instruction.applicable_channels = await validate_instruction_channels(
+            db, organization.id, instruction.applicable_channels)
     updated_instruction = await instruction_service.update_instruction(
         db, instruction_id, instruction, organization, current_user
     )
@@ -990,32 +986,10 @@ async def delete_instruction(
         except Exception:
             pass
         return {"message": "Instruction deleted successfully"}
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
-    else:
-        # Global instruction (no attached agents) applies to every agent, so
-        # deleting it stays an org-level capability — mirrors the create_global
-        # gate. Without this, the resource_scoped decorator would let any
-        # per-agent manager delete a global (they can't create or edit one).
-        #
-        # Exception: the owner may always delete their OWN global. Deleting your
-        # own instruction is strictly de-escalating (it removes a rule), and it
-        # prevents "zombie" globals — an owner who created a global (e.g. while
-        # they were an admin, or via the AI/MCP path) but later lost org-level
-        # rights could otherwise never clean it up. This mirrors the update
-        # path, where the owner can already edit their own global. AI-orphan
-        # globals (no owner) stay admin-only — no owner to retract them.
-        # Ported from PR #732.
-        is_owner = getattr(existing, "user_id", None) is not None and \
-            str(getattr(existing, "user_id")) == str(current_user.id)
-        if not is_owner:
-            await require_org_permission(
-                db, str(current_user.id), str(organization.id), "manage_instructions",
-            )
+    # Attached agents → manage_instructions on each; a global → org-level,
+    # except the author may always delete their own global (de-escalating, and
+    # it prevents "zombie" globals an ex-admin could never clean up; PR #732).
+    await require_delete_authority(db, current_user, organization, existing)
     success = await instruction_service.delete_instruction(db, instruction_id, organization, current_user)
     if not success:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
@@ -1301,7 +1275,7 @@ async def accept_instruction_hunk(
         organization=organization, current_user=current_user,
     )
     if status == "stale":
-        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "This change moved since you viewed it — refresh and try again.")
+        raise AppError.conflict(ErrorCode.REVIEW_STALE_MAIN, "This change moved since you viewed it — refresh and try again.")
     if status == "invalid_selection":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "This change couldn't be applied as displayed. Refresh to reload the review; if this keeps happening, please report it.")
     if resolved is None:
@@ -1390,7 +1364,7 @@ async def reject_instruction_hunk(
         organization=organization, current_user=current_user,
     )
     if status == "stale":
-        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "This change moved since you viewed it — refresh and try again.")
+        raise AppError.conflict(ErrorCode.REVIEW_STALE_MAIN, "This change moved since you viewed it — refresh and try again.")
     if status == "invalid_selection":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "This change couldn't be applied as displayed. Refresh to reload the review; if this keeps happening, please report it.")
     if resolved is None:
@@ -1451,7 +1425,7 @@ async def accept_all_instruction_hunks(
         selected_hunks=[(h.build_id, h.hunk_key) for h in body.hunks],
     )
     if status == "stale":
-        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes moved since you viewed them — refresh and try again.")
+        raise AppError.conflict(ErrorCode.REVIEW_STALE_MAIN, "These changes moved since you viewed them — refresh and try again.")
     if status == "invalid_selection":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes couldn't be applied as displayed. Refresh to reload the review; if this keeps happening, please report it.")
     if resolved is None:
@@ -1494,7 +1468,7 @@ async def reject_all_instruction_hunks(
         selected_hunks=[(h.build_id, h.hunk_key) for h in body.hunks],
     )
     if status == "stale":
-        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes moved since you viewed them — refresh and try again.")
+        raise AppError.conflict(ErrorCode.REVIEW_STALE_MAIN, "These changes moved since you viewed them — refresh and try again.")
     if status == "invalid_selection":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes couldn't be applied as displayed. Refresh to reload the review; if this keeps happening, please report it.")
     if resolved is None:

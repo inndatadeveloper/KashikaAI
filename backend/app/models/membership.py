@@ -1,4 +1,4 @@
-from sqlalchemy import Column, ForeignKey, Table, String, DateTime, JSON
+from sqlalchemy import Column, ForeignKey, Table, String, DateTime, JSON, Boolean, false, Index, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.models.base import BaseSchema
@@ -6,6 +6,20 @@ import uuid
 
 class Membership(BaseSchema):
     __tablename__ = 'memberships'
+    __table_args__ = (
+        # One live membership per (user, organization). Mirrors migration
+        # memberdup01 exactly; the partial predicate leaves open invites
+        # (user_id NULL) and any soft-deleted rows unconstrained. Declared here
+        # so ORM-metadata schema builds and `alembic revision --autogenerate`
+        # keep the index instead of proposing to drop it.
+        Index(
+            'uq_memberships_one_live_per_user_org',
+            'user_id', 'organization_id',
+            unique=True,
+            sqlite_where=text('user_id IS NOT NULL AND deleted_at IS NULL'),
+            postgresql_where=text('user_id IS NOT NULL AND deleted_at IS NULL'),
+        ),
+    )
 
     user_id = Column(String(36), ForeignKey('users.id'), nullable=True)
     organization_id = Column(String(36), ForeignKey('organizations.id'), primary_key=True)
@@ -15,14 +29,6 @@ class Membership(BaseSchema):
     # no expiry enforced (legacy rows / non-invite memberships).
     invite_expires_at = Column(DateTime, nullable=True)
     note = Column(String, nullable=True)
-    # Per-user, per-org agent memory. Small, curated, agent-written durable
-    # facts about this user (preferences, writing style, analyses they liked).
-    # Full-document rewrite via the update_user_memory tool; the user can
-    # view/edit it in their profile. Capped at MEMBERSHIP_MEMORY_MAX_LENGTH
-    # chars so it can be always-injected without bloating context. Distinct
-    # from ``note`` (user-authored profile) and from Notes (per-report
-    # scratchpad).
-    memory = Column(String, nullable=True)
     # Per-user default LLM model for this org. Soft reference (no FK): a stale
     # value falls back to the org default at resolve time.
     default_llm_model_id = Column(String(36), nullable=True)
@@ -43,6 +49,21 @@ class Membership(BaseSchema):
     # <user_profile> context block alongside ``note``/``memory``. JSON object of
     # attribute name -> value ({} / NULL when nothing is synced).
     profile_attributes = Column(JSON, nullable=True)
+    # Per-user, per-org attributes an org admin sets by hand (invite, member
+    # edit, CSV import) — e.g. the member's account id in another system.
+    # Separate from ``profile_attributes`` because the IdP sync replaces that
+    # dict wholesale on every login and would erase admin-entered values.
+    # Members cannot edit (or list) these; ``membership.attr:<key>`` sources
+    # resolve them first (see services/member_attributes.py). Not rendered
+    # into the agent prompt. JSON object of str -> str.
+    custom_attributes = Column(JSON, nullable=True)
+    # Per-user opt-out of agent check-ins (the agent's own follow-ups) in this
+    # org. Only meaningful while the org's enable_agent_checkins setting is on;
+    # respected at plan time (no planner call) and at fire time.
+    checkins_opt_out = Column(Boolean, nullable=False, default=False, server_default=false())
+    # Nightly user dream watermark: human-initiated activity up to here has
+    # been reflected on.
+    user_dreamed_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="memberships")
     organization = relationship("Organization", back_populates="memberships")

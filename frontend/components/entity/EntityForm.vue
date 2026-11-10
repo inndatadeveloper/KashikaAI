@@ -1,24 +1,30 @@
 <template>
-  <div class="max-w-2xl mx-auto space-y-4">
+  <!-- Stacked by default (the report's Save Query); `compact` lays title,
+       a one-line description, agents and status on a single row, for a
+       form that sits above a code editor. -->
+  <div :class="compact
+    ? ['grid grid-cols-1 gap-x-3 gap-y-2', showStatus ? 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_220px_140px]' : 'lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_220px]']
+    : 'max-w-2xl mx-auto space-y-4'">
     <!-- Title -->
     <div>
       <label class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">{{ $t('entityForm.title') }}</label>
-      <input
+      <input v-text-dir
         v-model="localForm.title"
         type="text"
         placeholder="Revenue by month"
-        class="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 w-full text-sm focus:outline-none focus:border-blue-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500"
+        class="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 w-full text-sm focus:outline-none focus:border-blue-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-ink-subtle dark:placeholder:text-gray-500"
       />
     </div>
 
     <!-- Description -->
     <div>
       <label class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">{{ $t('entityForm.description') }}</label>
-      <textarea
+      <textarea v-text-dir.align
         v-model="localForm.description"
-        rows="4"
+        :rows="compact ? 1 : 4"
         placeholder="Description"
-        class="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 w-full text-sm focus:outline-none focus:border-blue-500 min-h-[100px] bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500"
+        :class="compact ? 'resize-none' : 'min-h-[100px]'"
+        class="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 w-full text-sm focus:outline-none focus:border-blue-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-ink-subtle dark:placeholder:text-gray-500"
       />
     </div>
 
@@ -38,8 +44,8 @@
           <div class="flex items-center flex-wrap gap-1">
             <span v-if="selectedDataSourceIds.length === 0" class="text-gray-500 dark:text-gray-400">{{ $t('entityForm.selectAgents') }}</span>
             <div v-else class="flex items-center flex-wrap gap-1">
-              <span v-for="ds in selectedDataSourceObjects" :key="ds.id" class="flex items-center bg-blue-100 dark:bg-blue-900/50 text-blue-800 text-[10px] px-1.5 py-0.5 rounded">
-                <DataSourceIcon :type="ds.type" :icon="ds.icon" class="h-3 me-1" />
+              <span v-for="ds in selectedDataSourceObjects" :key="ds.id" class="flex items-center bg-blue-100 dark:bg-blue-900/50 text-blue-800 text-2xs px-1.5 py-0.5 rounded">
+                <DataSourceIcon :type="ds.type" :icon-token="ds.icon_token" :icon="ds.icon" class="h-3 me-1" />
                 {{ ds.name }}
               </span>
             </div>
@@ -48,7 +54,7 @@
         <template #option="{ option }">
           <div class="flex items-center justify-between w-full py-1 pe-2">
             <div class="flex items-center">
-              <DataSourceIcon :type="option.type" :icon="option.icon" class="h-3 me-2" />
+              <DataSourceIcon :type="option.type" :icon-token="option.icon_token" :icon="option.icon" class="h-3 me-2" />
               <span class="text-xs">{{ option.name }}</span>
             </div>
             <UCheckbox
@@ -75,7 +81,7 @@
       >
         <template #label>
           <div class="inline-flex items-center text-xs">
-            <span :class="getStatusClass(localForm.status)" class="inline-flex px-2 py-0.5 text-[11px] font-medium rounded-full">
+            <span :class="getStatusClass(localForm.status)" class="inline-flex px-2 py-0.5 text-2xs font-medium rounded-full">
               {{ getCurrentStatusDisplayText() }}
             </span>
           </div>
@@ -102,6 +108,7 @@ interface DataSource {
   name: string
   type: string
   icon?: string | null
+  icon_token?: string | null
 }
 
 interface EntityFormData {
@@ -117,8 +124,10 @@ interface EntityFormData {
 const props = withDefaults(defineProps<{
   modelValue: EntityFormData
   showStatus?: boolean
+  compact?: boolean
 }>(), {
-  showStatus: true
+  showStatus: true,
+  compact: false,
 })
 
 const emit = defineEmits<{

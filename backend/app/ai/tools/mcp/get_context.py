@@ -1,7 +1,9 @@
 """MCP Tool: get_context - Returns available schemas and metadata resources."""
 
+import json
+import logging
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,13 +14,95 @@ from app.ai.context.builders.resource_context_builder import ResourceContextBuil
 from app.models.user import User
 from app.models.organization import Organization
 from app.models.report import Report
+from app.ai.tools.mcp.instruction_scope import instruction_builder
+from app.ai.utils.token_counter import count_tokens
 from app.schemas.mcp import (
+    ContextInstructionInfo,
     GetContextInput,
     GetContextOutput,
     DataSourceInfo,
+    EntityInfo,
     TableInfo,
     ResourceInfo,
 )
+
+
+logger = logging.getLogger(__name__)
+
+# 'always' instructions come with their full text up to this many chars
+# (JSON-encoded, as they travel); the rest are listed as required entries for
+# read_instruction. Everything else in scope is listed without text, capped at
+# INSTRUCTION_CATALOG_LIMIT entries (the response says when it is capped).
+INLINE_INSTRUCTIONS_BUDGET = 100_000
+INSTRUCTION_CATALOG_LIMIT = 100
+
+INSTRUCTIONS_HINT = (
+    "These are the organization's rules for this report. Entries with required: true apply "
+    "to every request: follow the ones whose text is shown, and read the others with "
+    "read_instruction before answering. For the rest, read the ones relevant to the request "
+    "with read_instruction (instruction_ids reads several at once; pass report_id). Pass the "
+    "ids you read as instruction_ids to create_data / inspect_data / create_artifact / "
+    "edit_artifact so the code they write follows them too."
+)
+
+
+async def list_report_instructions(
+    db, organization, user, report, data_sources,
+) -> Tuple[List[ContextInstructionInfo], int, bool]:
+    """Every instruction in the report's scope: (entries, total in scope, capped)."""
+    builder = instruction_builder(db, organization, user, report, data_sources)
+    # on_demand=True: smart instructions are listed, never inlined — the
+    # client decides what applies. A high catalog limit so the total is real.
+    section = await builder.build(query=None, on_demand=True, catalog_limit=10_000)
+
+    always = sorted(section.items, key=lambda it: (-(it.usage_count or 0), (it.title or "").lower()))
+    entries: List[ContextInstructionInfo] = []
+    used = 0
+    for it in always:
+        cost = len(json.dumps(it.text or ""))
+        if used + cost <= INLINE_INSTRUCTIONS_BUDGET:
+            used += cost
+            entries.append(ContextInstructionInfo(
+                id=it.id, title=it.title, load_mode=it.load_mode or "always", required=True,
+                text=it.text or "", tables=it.table_refs or [],
+            ))
+            continue
+        ref = builder._catalog_entry(
+            inst_id=it.id, title=it.title, description=None, structured_data=None,
+            text=it.text or "", table_refs=it.table_refs or [], usage_count=it.usage_count,
+        )
+        entries.append(ContextInstructionInfo(
+            id=it.id, title=ref.title, load_mode=it.load_mode or "always", required=True,
+            description=ref.description, tables=it.table_refs or [], tokens=count_tokens(it.text or ""),
+        ))
+
+    optional = [
+        ContextInstructionInfo(
+            id=ref.id, title=ref.title, load_mode="intelligent", required=False,
+            description=ref.description, tables=ref.table_refs or [], references=ref.other_refs or [],
+            tokens=ref.tokens,
+        )
+        for ref in section.available_instructions
+    ] + [
+        ContextInstructionInfo(
+            id=sk.id, title=sk.title, kind="skill", load_mode="intelligent", required=False,
+            description=sk.description, tables=sk.table_refs or [], references=sk.other_refs or [],
+            tokens=sk.tokens,
+        )
+        for sk in (section.skills or [])
+    ]
+    total = len(entries) + len(optional)
+    capped = len(optional) > INSTRUCTION_CATALOG_LIMIT
+    return entries + optional[:INSTRUCTION_CATALOG_LIMIT], total, capped
+
+
+def _pattern_matches(pattern: str, text: str) -> bool:
+    """Regex match, falling back to a literal substring for an invalid regex —
+    the behavior the table/resource filters already have."""
+    try:
+        return bool(re.search(pattern, text, re.IGNORECASE))
+    except re.error:
+        return pattern.lower() in text.lower()
 
 
 class GetContextTool(MCPTool):
@@ -29,8 +113,12 @@ class GetContextTool(MCPTool):
     """
     
     name = "get_context"
+    read_only_hint = True
     description = (
-        "Get available data sources, tables, and metadata resources. Useful for searching or explaining metadata. "
+        "Get available data sources, tables, metadata resources, the organization's saved "
+        "queries (agreed metric/model definitions) and the instructions that apply in this "
+        "report ('always' rules with their text; the rest listed for read_instruction). "
+        "Useful for searching or explaining metadata. "
         "Optionally filter by regex patterns. "
         "Agents may also expose external tools (MCP servers / custom APIs), listed here by name only — "
         "call list_agent_tools to get their full input schemas before invoking them with execute_mcp."
@@ -55,7 +143,7 @@ class GetContextTool(MCPTool):
         platform = await self._get_or_create_mcp_platform(db, organization)
 
         # Load report as ORM model (preserves Connection.get_credentials())
-        report = await self._load_report(db, input_data.report_id)
+        report = await self._load_report(db, input_data.report_id, user, organization)
         from app.services.data_source_service import DataSourceService
         ds_service = DataSourceService()
         # First, restrict to data sources THIS user is allowed to see — the
@@ -183,6 +271,50 @@ class GetContextTool(MCPTool):
                         description=resource.get("description"),
                     ))
         
+        # Published saved queries on these agents, by name only: an external
+        # client that is never shown them writes its own definition of a term
+        # the org has already agreed on. Full code and rows come from
+        # describe_entity.
+        from app.ai.context.builders.entity_context_builder import EntityContextBuilder
+        from app.ai.tools.mcp.entities import entity_agent_names
+        entities_output: List[EntityInfo] = []
+        try:
+            ds_ids = [str(d.id) for d in data_sources]
+            if ds_ids:
+                ent_builder = EntityContextBuilder(db, organization, report=report, user=user)
+                found = await ent_builder.load_entities(
+                    keywords=[], top_k=20, require_source_assoc=True, data_source_ids=ds_ids,
+                )
+                for e in found:
+                    if input_data.patterns:
+                        searchable = f"{e.title} {e.description or ''}"
+                        if not any(
+                            _pattern_matches(pattern, searchable) for pattern in input_data.patterns
+                        ):
+                            continue
+                    entities_output.append(EntityInfo(
+                        id=str(e.id),
+                        slug=getattr(e, "slug", None),
+                        type=e.type,
+                        title=e.title,
+                        description=e.description or None,
+                        agents=entity_agent_names(e),
+                        parameters=[
+                            str(p.get("name")) for p in (getattr(e, "parameters", None) or [])
+                            if isinstance(p, dict) and p.get("name")
+                        ],
+                    ))
+        except Exception:
+            logger.exception("get_context: listing saved queries failed")
+            entities_output = []
+
+        entities_hint = (
+            "Saved queries above are the organization's agreed definitions. Before writing a "
+            "query for a business term one of them covers, call describe_entity for its code "
+            "and reuse it instead of writing your own definition."
+            if entities_output else None
+        )
+
         # Tools are listed by name only here. Point the client at list_agent_tools
         # for their full input schemas before calling execute_mcp.
         has_tools = any(ds.tools for ds in data_sources_output)
@@ -193,22 +325,40 @@ class GetContextTool(MCPTool):
             if has_tools else None
         )
 
+        # Instructions in scope. Not narrowed by `patterns`: those filter
+        # tables and resources, and a rule can apply without naming either.
+        instructions_output: List[ContextInstructionInfo] = []
+        instructions_total, instructions_truncated = 0, False
+        try:
+            instructions_output, instructions_total, instructions_truncated = await list_report_instructions(
+                db, organization, user, report, data_sources,
+            )
+        except Exception:
+            logger.exception("get_context: listing instructions failed")
+
         output = GetContextOutput(
             report_id=str(report.id),
             data_sources=data_sources_output,
             resources=resources_output,
+            entities=entities_output,
+            instructions=instructions_output,
+            instructions_total=instructions_total,
+            instructions_truncated=instructions_truncated,
+            instructions_hint=INSTRUCTIONS_HINT if instructions_output else None,
             tools_hint=tools_hint,
+            entities_hint=entities_hint,
         )
         
         # Finish tracking
         total_tables = sum(len(ds.tables) for ds in data_sources_output)
         await self._finish_tracking(
             db, tracking, success=True,
-            summary=f"Retrieved context: {len(data_sources_output)} data sources, {total_tables} tables, {len(resources_output)} resources",
+            summary=f"Retrieved context: {len(data_sources_output)} data sources, {total_tables} tables, {len(resources_output)} resources, {len(entities_output)} saved queries",
             result_json={
                 "data_source_count": len(data_sources_output),
                 "table_count": total_tables,
                 "resource_count": len(resources_output),
+                "entity_count": len(entities_output),
             },
         )
         

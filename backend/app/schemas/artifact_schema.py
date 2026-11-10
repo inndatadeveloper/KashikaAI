@@ -63,8 +63,13 @@ class ArtifactUpdate(BaseModel):
 
 
 class ArtifactSchema(ArtifactBase):
-    """Full artifact schema for API responses."""
+    """Full artifact schema for API responses.
+
+    `id` is a VERSION id; `artifact_id` is the parent identity shared by all
+    versions of the same dashboard/deck/doc — the UI groups by it.
+    """
     id: str
+    artifact_id: str
     report_id: str
     user_id: str
     organization_id: str
@@ -80,6 +85,12 @@ class ArtifactSchema(ArtifactBase):
     # a viz whose id the code never binds silently disappears from the page —
     # this is how clients tell the two states apart.
     used_visualization_ids: List[str] = Field(default_factory=list)
+    # Page mode only: the artifact code precompiled exactly as babel-standalone
+    # would compile it in the iframe, when already available (read routes
+    # fill it from cache; see app.services.artifact_precompile). The host uses
+    # it only when compiled_js_key matches the code it is about to render.
+    compiled_js: Optional[str] = None
+    compiled_js_key: Optional[str] = None
 
     @model_validator(mode="after")
     def _compute_used_visualization_ids(self):
@@ -101,12 +112,18 @@ class ArtifactSchema(ArtifactBase):
 
 
 class ArtifactListSchema(BaseModel):
-    """Schema for listing artifacts (lighter weight)."""
+    """Schema for listing artifacts (lighter weight).
+
+    `id` is a VERSION id; `artifact_id` groups versions of the same artifact.
+    """
     id: str
+    artifact_id: str
     report_id: str
     title: Optional[str]
     mode: str
     version: int
+    # A name someone gave this version (collab01), e.g. "Q3 launch".
+    name: Optional[str] = None
     status: str = "completed"
     created_at: datetime
     updated_at: datetime

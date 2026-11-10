@@ -267,6 +267,21 @@ class CompletionFeedbackService:
         except Exception:
             return
 
+    @staticmethod
+    async def _can_read_completion(
+        db: AsyncSession, completion: Completion, user: Optional[User], organization: Organization
+    ) -> bool:
+        """Report-level read check (owner, full admin, or the report's
+        conversation visibility/project) — the same rule the report routes use.
+        An org-only check let any member read feedback on private reports."""
+        if user is None or not completion.report_id:
+            return False
+        from app.services.file_access_service import user_can_view_report
+        report = await db.get(Report, completion.report_id)
+        if report is None:
+            return False
+        return await user_can_view_report(db, user, organization, report)
+
     async def create_or_update_feedback(
         self,
         db: AsyncSession,
@@ -284,7 +299,7 @@ class CompletionFeedbackService:
         )
         completion_result = await db.execute(completion_stmt)
         completion = completion_result.scalar_one_or_none()
-        if not completion:
+        if not completion or (user is not None and not await self._can_read_completion(db, completion, user, organization)):
             raise HTTPException(status_code=404, detail="Completion not found")
         
         user_id = user.id if user else None
@@ -317,6 +332,8 @@ class CompletionFeedbackService:
             existing_feedback.message = feedback_data.message
             await db.commit()
             await db.refresh(existing_feedback)
+            from app.services.diagnosis.rollup import refresh_for_completion
+            await refresh_for_completion(db, str(completion_id))
             # Silent session event: the user changed their mind on a past answer.
             await self._emit_feedback_event(
                 db, completion, existing_feedback, user,
@@ -385,6 +402,8 @@ class CompletionFeedbackService:
             
             db.add(feedback)
             await db.commit()
+            from app.services.diagnosis.rollup import refresh_for_completion
+            await refresh_for_completion(db, str(completion_id))
             await db.refresh(feedback)
 
             # Silent session event: user gave feedback on the assistant's answer.
@@ -456,7 +475,7 @@ class CompletionFeedbackService:
         completion_result = await db.execute(completion_stmt)
         completion = completion_result.scalar_one_or_none()
         
-        if not completion:
+        if not completion or not await self._can_read_completion(db, completion, user, organization):
             raise HTTPException(status_code=404, detail="Completion not found")
         
         # Get aggregated feedback stats
@@ -521,6 +540,8 @@ class CompletionFeedbackService:
 
         await db.delete(feedback)
         await db.commit()
+        from app.services.diagnosis.rollup import refresh_for_completion
+        await refresh_for_completion(db, str(completion_id))
 
         # Silent session event: user retracted their feedback. The completion
         # carries the report the event lands on.
@@ -561,11 +582,13 @@ class CompletionFeedbackService:
         self, 
         db: AsyncSession, 
         completion_id: str, 
-        organization: Organization
+        organization: Organization,
+        user: Optional[User] = None,
     ) -> List[CompletionFeedbackSchema]:
-        """Get all feedbacks for a completion."""
+        """Get all feedbacks for a completion the user can read."""
         
-        # Verify completion exists and belongs to organization
+        # Verify completion exists, belongs to organization, and that the
+        # caller can read its report (feedback text is report content).
         completion_stmt = select(Completion).where(
             Completion.id == completion_id,
             Completion.report.has(organization_id=organization.id)
@@ -573,7 +596,7 @@ class CompletionFeedbackService:
         completion_result = await db.execute(completion_stmt)
         completion = completion_result.scalar_one_or_none()
         
-        if not completion:
+        if not completion or not await self._can_read_completion(db, completion, user, organization):
             raise HTTPException(status_code=404, detail="Completion not found")
         
         feedbacks_stmt = select(CompletionFeedback).where(
@@ -621,7 +644,7 @@ class CompletionFeedbackService:
             )
             completion_result = await db.execute(completion_stmt)
             completion = completion_result.scalar_one_or_none()
-            if not completion:
+            if not completion or not await self._can_read_completion(db, completion, user, organization):
                 return []
             
             # Get the user's most recent feedback for this completion

@@ -12,10 +12,10 @@
       :loading="loading"
       class="!h-auto"
       :ui="{
-        input: { size: 'sm:text-[13px]' },
+        input: { size: 'sm:text-sm' },
         group: {
-          container: 'text-[13px] text-gray-700 dark:text-gray-200',
-          label: 'px-2.5 my-1.5 text-[11px] font-semibold text-gray-700 dark:text-white',
+          container: 'text-sm text-gray-700 dark:text-gray-200',
+          label: 'px-2.5 my-1.5 text-2xs font-semibold text-gray-700 dark:text-white',
           command: { icon: { base: 'flex-shrink-0 w-4 h-4' } }
         }
       }"
@@ -24,12 +24,12 @@
     >
       <!-- Agents use the real data-source logo for their type -->
       <template #agents-icon="{ command }">
-        <DataSourceIcon :type="command.dsType" :icon="command.dsIcon" class="h-4 w-4 flex-shrink-0" />
+        <DataSourceIcon :icon-token="command.dsIconToken" class="h-4 w-4 flex-shrink-0" />
       </template>
     </UCommandPalette>
 
     <!-- Footer keyboard hints -->
-    <div class="flex items-center gap-4 px-4 py-2 border-t border-gray-100 dark:border-gray-800 text-[11px] text-gray-400 bg-gray-50/60 dark:bg-gray-900 rounded-b-lg">
+    <div class="flex items-center gap-4 px-4 py-2 border-t border-gray-100 dark:border-gray-800 text-2xs text-ink-muted bg-gray-50/60 dark:bg-gray-900 rounded-b-lg">
       <span><kbd class="font-sans">↑↓</kbd> navigate</span>
       <span><kbd class="font-sans">↵</kbd> open</span>
       <span><kbd class="font-sans">esc</kbd> close</span>
@@ -204,8 +204,7 @@ const agentsGroup = computed(() => {
     commands: filtered.map((a: any) => ({
       id: `agent-${a.id}`,
       label: a.name,
-      dsType: a.type,
-      dsIcon: a.icon,
+      dsIconToken: a.icon_token,
       suffix: a.status === 'active' ? 'active' : 'inactive',
       to: `/agents/${a.id}`,
     })),

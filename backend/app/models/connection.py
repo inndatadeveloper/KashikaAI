@@ -1,9 +1,15 @@
-from sqlalchemy import Column, String, Boolean, JSON, DateTime, Text, Integer, ForeignKey, UniqueConstraint
+from app.data_sources.client_parameters import merge_client_credentials, filter_client_parameters
+from sqlalchemy import Column, String, Boolean, JSON, DateTime, Text, Integer, ForeignKey, UniqueConstraint, true
 from sqlalchemy.orm import relationship
 from app.models.base import BaseSchema
 from cryptography.fernet import Fernet
 from app.settings.config import settings
 import json
+
+# Per-connection runtime query limits stored in `config` but read by the
+# code-execution wrapper (stashed onto the client), never passed to a client
+# constructor.
+RUNTIME_CONFIG_KEYS = frozenset({"query_timeout_seconds", "max_concurrent_queries"})
 
 
 class Connection(BaseSchema):
@@ -27,10 +33,41 @@ class Connection(BaseSchema):
     # Connection test cache - stores last test result to avoid repeated slow tests
     last_connection_status = Column(String, nullable=True)  # "success", "not_connected", "offline"
     last_connection_checked_at = Column(DateTime, nullable=True)
-    
+    # Health-probe failures in a row. A shared connection is deactivated only
+    # when this reaches the threshold (see ConnectionService.test_connection),
+    # so one slow probe does not hide its tables from every agent.
+    consecutive_test_failures = Column(Integer, nullable=False, default=0, server_default="0")
+    # When the last "connection is down" alert email went out for this shared
+    # connection. The in-app inbox row always fires on the down transition
+    # (deduped by group_key); the email is additionally throttled to at most
+    # one per cooldown window (BOW_CONN_DOWN_ALERT_COOLDOWN_MINUTES, default 60)
+    # so a flapping connection cannot spam admins. NULL = never alerted.
+    last_down_alert_at = Column(DateTime, nullable=True, default=None)
+    # Per-connection on/off switch for the down/restored alert EMAIL, gated UNDER
+    # the org-wide toggle (OrganizationSettings.config["connection_alerts_email"]):
+    # the effective send = org toggle AND this switch. When the org toggle is off,
+    # nothing sends and this switch is disabled in the UI (you can't opt a single
+    # connection back in). Default True = send when the org toggle is on.
+    # The in-app inbox notification is unaffected — it is always delivered.
+    alert_emails_enabled = Column(Boolean, nullable=False, default=True, server_default=true())
+    # The health state last ANNOUNCED for this shared connection, so alerts
+    # follow what admins were told rather than the probe that flipped
+    # ``is_active``: NULL = nothing outstanding, "down" = a down alert went out
+    # (inbox only), "down_emailed" = a down alert went out with an email. A
+    # manual "Test connection" can flip ``is_active`` but never announces, so
+    # the next automated probe still owes (and sends) the alert. A recovery
+    # emails only when the outage's down alert was emailed.
+    health_alert_state = Column(String(16), nullable=True, default=None)
+
     # Authentication policy
     auth_policy = Column(String, nullable=False, default="system_only")  # system_only, user_required
     allowed_user_auth_modes = Column(JSON, nullable=True, default=None)
+    # "member_mapped" per-user auth: {credential_field: member_attribute_key}.
+    # Each bound field takes the member's admin-set attribute at query time
+    # instead of the value saved on the connection (e.g. Qlik user_id ->
+    # qlik_user_id). Fields a type allows are flagged ui:memberBindable in its
+    # credentials schema. See services/member_identity.py.
+    member_bindings = Column(JSON, nullable=True, default=None)
 
     # Scheduled schema auto-reload (enterprise feature `scheduled_reindex`).
     # A background sweeper periodically re-indexes the shared catalog so tables
@@ -179,23 +216,27 @@ class Connection(BaseSchema):
 
             # Parse config if it's a string
             config = json.loads(self.config) if isinstance(self.config, str) else self.config
-            client_params = config.copy()
-            
-            # Only decrypt and merge credentials if they exist
-            if self.credentials:
-                decrypted_credentials = self.decrypt_credentials()
-                client_params.update(decrypted_credentials)
-            
-            # Remove non-client params
-            if "auth_type" in client_params:
-                del client_params["auth_type"]
+            credentials = self.decrypt_credentials() if self.credentials else {}
+            client_params = merge_client_credentials(config, credentials)
+            if self.type in ("remote_ssh", "remote_smb") and (config or {}).get("auth_type"):
+                client_params["auth_type"] = config["auth_type"]
+            client_params = filter_client_parameters(
+                ClientClass, client_params, only={"auth_type"}
+            )
             if "demo_id" in client_params:
                 del client_params["demo_id"]
+            # Runtime query limits read by the code-execution wrapper, not
+            # constructor arguments — splatting them would break every client
+            # whose __init__ does not take them.
+            for runtime_key in RUNTIME_CONFIG_KEYS:
+                client_params.pop(runtime_key, None)
             
             import logging
             logger = logging.getLogger(__name__)
             logger.info(f"Client params for {self.type}")
-            
+
+            from app.core.egress import check_connection_params
+            check_connection_params(self.type, client_params)
             return ClientClass(**client_params)
         except (ImportError, AttributeError) as e:
             raise ValueError(f"Unable to load data source client for {self.type}: {str(e)}")

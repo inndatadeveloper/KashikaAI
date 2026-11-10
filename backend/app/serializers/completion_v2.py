@@ -1,5 +1,7 @@
 from typing import Optional, Any, Dict, List
 
+from app.services.memory_privacy import MEMORY_TOOL_NAMES
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import inspect as sa_inspect, select
 
@@ -18,6 +20,7 @@ from app.schemas.completion_v2_schema import (
     ToolExecutionUISchema,
     ToolExecutionDataSourceSchema,
 )
+from app.schemas.agent_icon import resolve_agent_icon_token
 from app.schemas.widget_schema import WidgetSchema
 from app.schemas.step_schema import StepSchema
 from app.schemas.visualization_schema import VisualizationSchema
@@ -85,7 +88,15 @@ def _extract_data_source_ids(tool_execution: ToolExecution) -> List[str]:
 async def _resolve_data_sources(
     db: AsyncSession, ds_ids: List[str]
 ) -> List[ToolExecutionDataSourceSchema]:
-    """Look up DataSource name + first Connection type for a list of DS IDs."""
+    """Look up display info for a list of DS IDs: name, first connection type,
+    and the agent's resolved ``icon_token``.
+
+    Every connection is selected, ordered the same way ``DataSource.connections``
+    is, because the icon of a multi-connection agent depends on all of them (a
+    notion connection gives the agent notion's logo even when it isn't first).
+    The previous version selected one unordered join row, which made both the
+    type and the icon depend on whichever row the database happened to return.
+    """
     if not ds_ids:
         return []
 
@@ -97,22 +108,67 @@ async def _resolve_data_sources(
         select(
             DataSource.id,
             DataSource.name,
+            DataSource.icon,
             Connection.type,
+            Connection.config,
         )
         .join(domain_connection, domain_connection.c.data_source_id == DataSource.id)
         .join(Connection, Connection.id == domain_connection.c.connection_id)
         .where(DataSource.id.in_(ds_ids))
+        .order_by(Connection.created_at, Connection.id)
     )
-    # Take first connection type per DS
-    seen: Dict[str, ToolExecutionDataSourceSchema] = {}
-    for row in rows:
-        ds_id = str(row[0])
-        if ds_id not in seen:
-            seen[ds_id] = ToolExecutionDataSourceSchema(
-                id=ds_id, name=row[1], type=row[2]
-            )
+
+    names: Dict[str, Optional[str]] = {}
+    icons: Dict[str, Optional[str]] = {}
+    conns: Dict[str, List[Dict[str, Any]]] = {}
+    for ds_id_raw, name, icon, conn_type, conn_config in rows:
+        ds_id = str(ds_id_raw)
+        names.setdefault(ds_id, name)
+        icons.setdefault(ds_id, icon)
+        conns.setdefault(ds_id, []).append({"type": conn_type, "config": conn_config})
+
     # Return in original order
-    return [seen[did] for did in ds_ids if did in seen]
+    return [
+        ToolExecutionDataSourceSchema(
+            id=did,
+            name=names[did],
+            type=(conns[did][0]["type"] if conns.get(did) else None),
+            icon_token=resolve_agent_icon_token(icons[did], conns.get(did)),
+        )
+        for did in ds_ids
+        if did in names
+    ]
+
+
+async def resolve_data_sources_for_tool_executions(
+    db: AsyncSession, tool_executions: List[Any]
+) -> Dict[str, List[ToolExecutionDataSourceSchema]]:
+    """Map tool-execution id -> the agents it references, in ONE query for the
+    whole page.
+
+    The per-block async serializer resolves one tool execution at a time, which a
+    list endpoint can't afford; without this the list paths shipped no agents at
+    all and the client was left to guess an icon from whatever else it had. Use
+    this wherever blocks are serialized in bulk.
+    """
+    by_te: Dict[str, List[str]] = {}
+    all_ids: List[str] = []
+    for te in tool_executions or []:
+        if te is None:
+            continue
+        ds_ids = _extract_data_source_ids(te)
+        if ds_ids:
+            by_te[str(te.id)] = ds_ids
+            all_ids.extend(ds_ids)
+    if not all_ids:
+        return {}
+
+    resolved = await _resolve_data_sources(db, list(dict.fromkeys(all_ids)))
+    index = {ds.id: ds for ds in resolved}
+    return {
+        te_id: [index[did] for did in ds_ids if did in index]
+        for te_id, ds_ids in by_te.items()
+    }
 
 
 # How many result rows to embed inline in the completions list as a preview.
@@ -236,9 +292,54 @@ def _tool_execution_schema_data(tool_execution: ToolExecution) -> Dict[str, Any]
         for field in ToolExecutionSchema.model_fields
         if field != "result_json"
     }
-    data["result_json"] = redact_deep_display(
-        project_tool_result_for_ui(getattr(tool_execution, "result_json", None))
+    from app.core.code_visibility import (
+        code_visible_now,
+        redact_tool_arguments,
+        redact_tool_result,
+        redact_tool_timings,
     )
+
+    _code_ok = code_visible_now()
+    _tool = getattr(tool_execution, "tool_name", None)
+
+    # Per-query timing telemetry embeds the executed statement verbatim, so it
+    # is a code surface in its own right — found by diffing an admin's payload
+    # against a restricted viewer's against a live stack, not by reading code.
+    data["sub_timings_json"] = redact_tool_timings(
+        data.get("sub_timings_json"), _code_ok, _tool
+    )
+
+    # The tool CALL carries code too (e.g. write_csv's `arguments_json.code`),
+    # which the UI reads as a fallback — redacting only the result would leave
+    # the same source one key away.
+    data["arguments_json"] = redact_tool_arguments(
+        data.get("arguments_json"), _code_ok, _tool
+    )
+    # Order matters: project (bound rows) → PII-redact → code-redact. The code
+    # gate runs last so it also covers anything the projection copied forward.
+    data["result_json"] = redact_tool_result(
+        redact_deep_display(
+            project_tool_result_for_ui(getattr(tool_execution, "result_json", None))
+        ),
+        _code_ok,
+        _tool,
+    )
+    if _tool in MEMORY_TOOL_NAMES:
+        data = redact_memory_tool_payload(data)
+    return data
+
+
+# User memory is private to its owner. Report/timeline/trace payloads carry
+# only the tool's status line and success flag — never entry text, handles,
+# tags or search results; details live in the owner's profile and the
+# owner-only memory section of the trace.
+
+
+def redact_memory_tool_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    args = data.get("arguments_json") if isinstance(data.get("arguments_json"), dict) else {}
+    result = data.get("result_json") if isinstance(data.get("result_json"), dict) else {}
+    data["arguments_json"] = {"title": args.get("title")} if args.get("title") else {}
+    data["result_json"] = {"success": result.get("success")} if "success" in result else {}
     return data
 
 
@@ -259,6 +360,10 @@ def serialize_block_v2_sync(
     """
     # Map to schemas
     pd_schema = PlanDecisionSchema.from_orm(plan_decision) if plan_decision else None
+    if pd_schema is not None and pd_schema.action_name in MEMORY_TOOL_NAMES and pd_schema.action_args_json:
+        # The decision echoes the tool call's arguments — same privacy rule.
+        _title = pd_schema.action_args_json.get("title") if isinstance(pd_schema.action_args_json, dict) else None
+        pd_schema.action_args_json = {"title": _title} if _title else {}
     te_schema: Optional[ToolExecutionUISchema] = None
     
     if tool_execution:
@@ -413,7 +518,26 @@ async def serialize_block_v2(db: AsyncSession, block: CompletionBlock) -> Comple
         if ds_ids:
             resolved_data_sources = await _resolve_data_sources(db, ds_ids)
 
-    return serialize_block_v2_sync(
+    # A tool paused for review is not linked to its block yet; the watch
+    # stream (reload, second tab) must still show the review card.
+    review = None
+    try:
+        if tool_execution is None and getattr(block, "status", None) == "in_progress" and getattr(block, "plan_decision_id", None):
+            tool_execution = (await running_tools_by_block(db, [block])).get(str(block.id))
+            unlinked = True
+        else:
+            unlinked = False
+        if tool_execution is not None and tool_execution.status in RUNNING_TOOL_STATUSES:
+            from app.services.tool_confirmation_service import review_states_for_running_tools
+            review = (await review_states_for_running_tools(
+                db, [(str(tool_execution.id), str(block.completion_id), tool_execution.tool_name)]
+            )).get(str(tool_execution.id))
+        if unlinked and review is None:
+            tool_execution = None
+    except Exception:
+        review = None
+
+    schema = serialize_block_v2_sync(
         block=block,
         plan_decision=plan_decision,
         tool_execution=tool_execution,
@@ -423,3 +547,74 @@ async def serialize_block_v2(db: AsyncSession, block: CompletionBlock) -> Comple
         created_visualizations=created_visualizations or None,
         data_sources=resolved_data_sources,
     )
+    apply_review_state(schema.tool_execution, review)
+    return schema
+
+
+RUNNING_TOOL_STATUSES = ("in_progress", "running")
+
+
+async def running_tools_by_block(db, blocks) -> Dict[str, Any]:
+    """Tool executions still running for in-progress blocks, by block id.
+
+    A decision block is only linked to its tool execution when the tool
+    finishes, so a running tool — e.g. one paused for its owner's review — was
+    invisible to every reader: a reload lost the approval card and a shared
+    conversation showed a bare "Designing…" line. The execution row exists from
+    the start (keyed by plan decision), so read paths look it up from there.
+    Read-only: the block itself is not modified.
+    """
+    from sqlalchemy import select
+    from app.models.tool_execution import ToolExecution
+
+    pending = {
+        str(b.plan_decision_id): str(b.id)
+        for b in blocks
+        if not getattr(b, "tool_execution_id", None)
+        and getattr(b, "plan_decision_id", None)
+        and getattr(b, "status", None) == "in_progress"
+    }
+    if not pending:
+        return {}
+    rows = (await db.execute(
+        select(ToolExecution)
+        .where(
+            ToolExecution.plan_decision_id.in_(list(pending.keys())),
+            ToolExecution.status.in_(RUNNING_TOOL_STATUSES),
+        )
+        .order_by(ToolExecution.created_at)
+    )).scalars().all()
+    out: Dict[str, Any] = {}
+    for te in rows:
+        out[pending[str(te.plan_decision_id)]] = te
+    return out
+
+
+def block_tool_execution(b, te_map, running_by_block):
+    if getattr(b, "tool_execution_id", None):
+        return te_map.get(b.tool_execution_id)
+    return (running_by_block or {}).get(str(b.id))
+
+
+def running_tool_keys(blocks, te_map, running_by_block=None) -> list:
+    """(tool_execution_id, system_completion_id, tool_name) for running tools."""
+    keys = []
+    for b in blocks:
+        te = block_tool_execution(b, te_map, running_by_block)
+        if te is not None and te.status in RUNNING_TOOL_STATUSES:
+            keys.append((str(te.id), str(b.completion_id), te.tool_name))
+    return keys
+
+
+def apply_review_state(te_schema, review: Optional[Dict[str, Any]]) -> None:
+    """Attach a running tool's review state; a pending one carries the
+    confirmation payload so the owner's approval card renders after reload."""
+    if te_schema is None or not review:
+        return
+    from app.services.tool_confirmation_service import confirmation_payload
+
+    te_schema.review_state = review["state"]
+    if review["state"] == "pending":
+        te_schema.confirmation = confirmation_payload(review["row"])
+        te_schema.progress_stage = "awaiting_confirmation"
+

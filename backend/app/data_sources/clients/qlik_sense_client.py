@@ -25,6 +25,7 @@ Out of scope for v1: on-prem Enterprise on Windows, OAuth2 Authorization Code
 """
 
 from __future__ import annotations
+from app.data_sources.clients.progress import discovery_progress, discovery_items, IndexingCancelled
 
 import asyncio
 import json
@@ -36,11 +37,13 @@ from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 import requests
+from app.core.egress import pinned_request, pinned_session
 
 from app.ai.prompt_formatters import ForeignKey, ServiceFormatter, Table, TableColumn
 from app.data_sources.clients._qix_common import (
     _TAG_DTYPE_ORDER as _TAG_DTYPE_ORDER_SHARED,
     QixSession,
+    apply_field_selections,
     build_hypercube_def,
     build_ssl_context,
     build_tables_from_qix,
@@ -88,6 +91,9 @@ class QlikSenseClient(DataSourceClient):
             self._space_filter = tokens or None
 
         self._http: Optional[requests.Session] = None
+        # `Space/App` keys of the apps the last get_schemas could not read.
+        self._unread_app_keys: List[str] = []
+
         # OAuth M2M token cache
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -115,7 +121,7 @@ class QlikSenseClient(DataSourceClient):
             raise RuntimeError("base_url is required")
         # Validate we have *some* credential path (raises on misconfiguration).
         _ = self._auth_mode
-        self._http = requests.Session()
+        self._http = pinned_session()
 
     def _fetch_oauth_token(self) -> None:
         """Exchange client_id/client_secret for a bearer token via /oauth/token."""
@@ -126,9 +132,10 @@ class QlikSenseClient(DataSourceClient):
             "client_secret": self.client_secret,
             "scope": self.scope,
         }
-        # Use a bare requests.post here (not self._http) so token exchange doesn't
+        # Use a one-shot request here (not self._http) so token exchange doesn't
         # try to call _bearer_token() recursively.
-        resp = requests.post(
+        resp = pinned_request(
+            "POST",
             url,
             data=body,
             headers={"Accept": "application/json"},
@@ -342,6 +349,8 @@ class QlikSenseClient(DataSourceClient):
         if rest_error is not None or qix_error is not None:
             err = rest_error or qix_error
             logger.warning("Qlik app crawl failed for %s (%s): %s", app_name, app_id, err)
+            if app_key:
+                self._unread_app_keys.append(app_key)
             stub_name = app_key if app_key else (app_id or "unknown-app")
             return [Table(
                 name=stub_name,
@@ -363,25 +372,40 @@ class QlikSenseClient(DataSourceClient):
 
         return []
 
-    def get_schemas(self) -> List[Table]:
+    @discovery_progress
+    def get_schemas(self, progress_callback=None) -> List[Table]:
         """
         Full-tenant crawl: list_apps() then parallel per-app REST metadata,
         with QIX fallback for apps that don't expose REST metadata.
         """
+        self._unread_app_keys = []
         apps = self.list_apps()
         if not apps:
             return []
 
         tables: List[Table] = []
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
-            futures = {pool.submit(self._crawl_app, app): app for app in apps}
-            for fut in as_completed(futures):
-                try:
-                    tables.extend(fut.result() or [])
-                except Exception as e:
-                    app = futures[fut]
-                    logger.warning("Unhandled crawl exception for %s: %s", app.get("id"), e)
+            try:
+                futures = {pool.submit(self._crawl_app, app): app for app in apps}
+                for fut in discovery_items(as_completed(futures), 'applications', label=lambda fut: futures[fut].get('name') or futures[fut].get('id'), total=len(futures)):
+                    try:
+                        tables.extend(fut.result() or [])
+                    except IndexingCancelled:
+                        raise
+                    except Exception as e:
+                        app = futures[fut]
+                        logger.warning("Unhandled crawl exception for %s: %s", app.get("id"), e)
+                        name = app.get("name") or app.get("id") or ""
+                        space = app.get("space_name") or ""
+                        self._unread_app_keys.append(f"{space}/{name}" if space else name)
+            except IndexingCancelled:
+                for pending in futures:
+                    pending.cancel()
+                raise
         return tables
+
+    def unindexed_table_prefixes(self) -> List[str]:
+        return [k for k in self._unread_app_keys if k]
 
     def get_schema(self, table_name: str) -> Table:
         """Find a single Table by its 'Space/App/Table' name or metadata keys."""
@@ -470,7 +494,8 @@ class QlikSenseClient(DataSourceClient):
             measures: list of ``{"expr": "...", "alias": "..."}`` dicts;
                 ``expr`` uses Qlik expression syntax (Sum, Count, Avg, ...).
             filters: ``{field: [allowed_values]}`` applied as Qlik selections
-                before the cube is built.
+                before the cube is built. Values must be non-empty lists of
+                strings or finite numbers.
             max_rows: maximum rows to return (paginated in 10k-cell chunks).
         """
         target = app or table_name
@@ -503,15 +528,7 @@ class QlikSenseClient(DataSourceClient):
             if doc_handle is None:
                 raise RuntimeError("Qlik OpenDoc did not return a document handle")
 
-            # Apply selections as SelectInField(field, [values], toggle=False)
-            for field, values in selections:
-                await qix.rpc(doc_handle, "SelectInField", [
-                    field,
-                    {"qMatchMode": 0, "qSoftLock": False, "qValues": [
-                        {"qText": str(v)} for v in (values or [])
-                    ]},
-                    False,
-                ])
+            await apply_field_selections(qix, doc_handle, selections)
 
             session = await qix.rpc(doc_handle, "CreateSessionObject", [{
                 "qInfo": {"qType": "bow-hypercube"},
@@ -589,6 +606,11 @@ the `app` argument.
 ### How to Execute Queries
 
 Signature: `execute_query(app, dimensions, measures, filters=None, max_rows=10000)`
+
+Filter values must retain their Qlik types: send numeric years/IDs as numbers,
+and textual IDs (including leading zeros) as strings. Dual/date fields may
+require verified numeric Qlik values rather than formatted date text; never
+guess date serials or silently drop a filter when selection fails.
 
 ```python
 # Total sales by region

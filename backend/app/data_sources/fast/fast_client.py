@@ -1,6 +1,6 @@
-"""FastQueryClient — serves materialized custom queries to the agent.
+"""FastQueryClient — serves materialized custom tables to the agent.
 
-Built per request from the custom queries a given agent has **activated**. Each
+Built per request from the custom tables a given agent has **activated**. Each
 call to `connect()` creates a throwaway in-memory DuckDB, attaches the relevant
 encrypted artifacts read-only, registers one view per relation, and then locks
 the session down before any agent-generated SQL runs.
@@ -16,6 +16,7 @@ never put in its catalog.
 """
 
 import logging
+import re
 import time
 from contextlib import contextmanager
 from typing import Generator, List, Optional
@@ -29,9 +30,31 @@ from app.data_sources.fast.rls import Filter
 
 logger = logging.getLogger(__name__)
 
+# DuckDB introspection that reports server-side state — attached artifact file
+# paths (duckdb_databases / PRAGMA database_list), directory settings, the
+# extension install path — or that evaluates a table name from a string
+# (query / query_table, a way around this list). None of it is needed to
+# query the registered relations, so it is refused before execution.
+_BLOCKED_INTROSPECTION = re.compile(
+    # Catalog functions, callable with or without parentheses.
+    r"\b(?:duckdb_databases|duckdb_settings|duckdb_extensions|duckdb_secrets|"
+    r"duckdb_temporary_files|duckdb_memory|duckdb_logs?|(?:pragma_)?database_list)\b"
+    # Scalar/table functions, only when called (a column named `query` is fine).
+    r"|\b(?:current_setting|which_secret|getenv|query_table|query)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def assert_no_blocked_introspection(sql: str) -> None:
+    if sql and _BLOCKED_INTROSPECTION.search(sql):
+        raise ValueError(
+            "System introspection functions are not available on accelerated data; "
+            "query the registered tables instead."
+        )
+
 
 class FastRelation:
-    """One activated custom query, resolved to a readable artifact."""
+    """One activated custom table, resolved to a readable artifact."""
 
     def __init__(
         self,
@@ -93,6 +116,9 @@ class FastQueryClient(DataSourceClient):
                 alias = f"bow_a{i}"
                 safe_name = rel.name.replace('"', '""')
                 try:
+                    # Extracts are write-once (a refresh writes a new file).
+                    from app.services import storage
+                    storage.ensure_local(rel.artifact_path, fresh=False)
                     con.execute(
                         f"ATTACH '{rel.artifact_path}' AS {alias} "
                         f"(ENCRYPTION_KEY '{rel.artifact_key}', READ_ONLY)"
@@ -234,6 +260,7 @@ class FastQueryClient(DataSourceClient):
             )
 
     def execute_query(self, sql: str) -> pd.DataFrame:
+        assert_no_blocked_introspection(sql)
         t0 = time.perf_counter()
         with self.connect() as con:
             df = con.execute(sql).df()

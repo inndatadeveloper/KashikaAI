@@ -1,20 +1,25 @@
 <template>
   <div class="grid-container h-full">
+    <!-- Data, columns and pagination go in through gridOptions and are updated
+         through this grid's own API (see the watchers below), never as reactive
+         props: ag-grid-vue3 v31 batches prop changes in one module-level buffer
+         shared by every grid, so when two grids change in the same tick (e.g.
+         a filter applied to a result shown in both the chat and the side
+         panel) all changes land on the first grid and the second never
+         updates. -->
+    <!-- :key — ag-grid reads localeText only at creation, so a language
+         switch builds fresh options and mounts a new grid. -->
     <ag-grid-vue
-      :columnDefs="columnDefs"
-      :rowData="rowData"
+      ref="gridRef"
+      :key="gridKey"
       :class="[agThemeClass, 'ag-grid']"
-      :gridOptions="gridOptions"
-      :pagination="paginationEnabled"
-      :paginationPageSize="PAGE_SIZE"
-      :loadingOverlayComponent="CustomLoadingRenderer"
-      :loadingOverlayComponentParams="{ columns: columnCount }">
+      :gridOptions="gridOptions">
     </ag-grid-vue>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue';
+import { ref, shallowRef, computed, watch, toRaw } from 'vue';
 import { AgGridVue } from 'ag-grid-vue3';
 import CustomHeader from './CustomHeader.vue'; // Import the CustomHeader component
 import CustomLoadingRenderer from './CustomLoadingRenderer.vue'; // Import the CustomLoadingRenderer component
@@ -31,6 +36,27 @@ const agThemeClass = computed(() =>
 );
 
 const isLoading = ref(true);
+const { t, locale } = useI18n();
+
+// A cell whose whole value is an http(s) URL (SharePoint/Outlook web links,
+// monday `item_url`, …) renders as a short "Open ↗" link in a new tab instead
+// of a long raw URL. Built as a DOM node — never innerHTML — so cell text can't
+// inject markup; anything that isn't a single absolute URL stays plain text.
+const URL_RE = /^https?:\/\/\S+$/i;
+const linkCellRenderer = (params: any) => {
+  const value = params.value;
+  if (typeof value !== 'string' || !URL_RE.test(value.trim())) {
+    return value ?? '';
+  }
+  const a = document.createElement('a');
+  a.href = value.trim();
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  a.title = value.trim();
+  a.className = 'ag-link-cell';
+  a.textContent = `${t('common.openLink')} ↗`;
+  return a;
+};
 
 const props = defineProps({
   columnDefs: {
@@ -46,11 +72,21 @@ const props = defineProps({
 
 const PAGE_SIZE = 50;
 
-const gridOptions = ref({
+const gridRef = ref<any>(null);
+const gridApi = () => gridRef.value?.api;
+
+// The paging footer ("Page Size", "1 to 50 of 236", "Page 1 of 5") in the
+// viewer's language instead of ag-grid's built-in English.
+const PAGER_KEYS = ['page', 'to', 'of', 'more', 'pageSizeSelectorLabel', 'firstPage', 'previousPage', 'nextPage', 'lastPage'];
+const pagerText = () => Object.fromEntries(PAGER_KEYS.map((key) => [key, t(`dataGrid.${key}`)]));
+
+// Read once at mount by ag-grid-vue; later changes go through gridApi().
+const baseOptions = () => ({
   autoHeaderHeight: false,
   suppressServerSideFullWidthLoadingRow: true,
   defaultColDef: {
     loadingCellRenderer: () => '',
+    cellRenderer: linkCellRenderer,
     resizable: true,
     sortable: true,
     // Fill the available width so columns aren't stuck at the ~200px default
@@ -60,8 +96,10 @@ const gridOptions = ref({
     minWidth: 110,
   },
   loadingOverlayComponent: CustomLoadingRenderer,
-  enableCellTextSelection: true
-});
+  loadingOverlayComponentParams: { columns: props.columnDefs.length },
+  enableCellTextSelection: true,
+  paginationPageSize: PAGE_SIZE,
+} as Record<string, any>);
 
 // Only paginate when there are actually more rows than a page. A small preview
 // (the common case for a data tool result) otherwise gets ag-grid's paging
@@ -86,6 +124,22 @@ const columnDefs = ref(props.columnDefs.map(col => ({
 
 const rowData = ref(props.rowData);
 
+const buildOptions = () => ({
+  ...baseOptions(),
+  localeText: pagerText(),
+  columnDefs: toRaw(columnDefs.value),
+  rowData: toRaw(rowData.value),
+  pagination: paginationEnabled.value,
+});
+const gridOptions = shallowRef(buildOptions());
+const gridKey = ref(0);
+// A language switch (profile menu, or the org locale arriving after mount):
+// rebuild with the current data and the new pager text, and remount.
+watch(locale, () => {
+  gridOptions.value = buildOptions();
+  gridKey.value++;
+});
+
 watch(() => props.columnDefs, (newVal) => {
   columnDefs.value = newVal.map(col => ({
     ...col,
@@ -101,14 +155,21 @@ watch(() => props.rowData, (newVal) => {
   rowData.value = newVal;
 });
 
-// Dynamically set the number of columns for the skeleton loader
-const columnCount = ref(0);
-onMounted(() => {
-  columnCount.value = columnDefs.value.length;
-});
+watch(columnDefs, (defs) => gridApi()?.setGridOption('columnDefs', toRaw(defs)));
+watch(rowData, (rows) => gridApi()?.setGridOption('rowData', toRaw(rows)));
+watch(paginationEnabled, (on) => gridApi()?.setGridOption('pagination', on));
 </script>
 
 <style>
+.ag-link-cell {
+  color: rgb(37 99 235);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.dark .ag-link-cell {
+  color: rgb(96 165 250);
+}
+
 .grid-container {
   width: 100%;
   display: flex;
@@ -119,5 +180,63 @@ onMounted(() => {
 .ag-grid {
   flex: 1;
   width: 100%;
+}
+
+/* ag-theme-balham declares the whole `--ag-*` palette ON the element carrying
+   the theme class — which is this grid, not the wrapper. A themed wrapper
+   (.ag-grid-themed in RenderTable / TableAgGrid) sets its token values as
+   inline custom properties one level up, and those were being shadowed for
+   everything inside the grid: the app/report tokens never reached a single
+   cell. In light mode that went unnoticed (balham is white too); in dark mode
+   the grid rendered balham-dark's own greys (#2d3436 rows on a #1c1c1c header)
+   inside a #111827 panel — three different surfaces in one card.
+
+   Re-inherit the tokens the wrappers actually set, so the surface, text and
+   borders follow the app theme. Everything else (menus, filter popups, icons,
+   the active accent) intentionally keeps its per-variant balham value, which
+   is already light/dark correct. */
+.ag-grid-themed .ag-grid {
+  --ag-background-color: inherit;
+  --ag-foreground-color: inherit;
+  --ag-header-background-color: inherit;
+  --ag-header-foreground-color: inherit;
+  --ag-border-color: inherit;
+  --ag-odd-row-background-color: inherit;
+  --ag-row-hover-color: inherit;
+  --ag-selected-row-background-color: inherit;
+  --ag-font-family: inherit;
+  --ag-font-size: inherit;
+  /* Not set by the wrappers — derive them so row/column rules stop using
+     balham's own greys once --ag-border-color follows the theme. */
+  --ag-row-border-color: var(--ag-border-color);
+  --ag-header-column-separator-color: var(--ag-border-color);
+  /* The wrappers declare these as var(--ag-header-background-color), but that
+     resolves on the WRAPPER — i.e. to the flat card background, not to the
+     tinted header below. Re-declare them here so they resolve against this
+     element's header color and hovering a header cell doesn't flash it flat. */
+  --ag-header-cell-hover-background-color: var(--ag-header-background-color);
+  --ag-header-cell-moving-background-color: var(--ag-header-background-color);
+}
+
+/* Both wrappers set --ag-header-background-color to the same token as the body
+   (cardBackground), so once the tokens actually reached the grid the header row
+   collapsed onto the rows and the only separation left was the border under
+   .ag-header. Tint it toward the text color instead of picking a literal: that
+   darkens the header in light mode and lifts it in dark mode while staying in
+   the card's own hue family, so it also holds for the named report themes
+   (retro, hacker, …) without giving each one a header token of its own.
+
+   Gated on @supports because a custom property accepts any token stream at
+   parse time — without the gate, a browser that can't do color-mix would take
+   this declaration and then drop the property at computed-value time, leaving
+   the header with no background at all rather than the plain inherit above. */
+@supports (color: color-mix(in srgb, red 6%, blue)) {
+  .ag-grid-themed .ag-grid {
+    --ag-header-background-color: color-mix(
+      in srgb,
+      var(--ag-foreground-color) 6%,
+      var(--ag-background-color)
+    );
+  }
 }
 </style>

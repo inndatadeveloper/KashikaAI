@@ -161,10 +161,12 @@ Use your own API keys, endpoints, and model deployments. Multiple providers and 
 | Vertica | Database / warehouse |
 | AWS Redshift | Database / warehouse |
 | Trino | Database / warehouse |
+| Starburst (Galaxy and Enterprise) | Database / warehouse |
 | Apache Pinot | Database / warehouse |
 | Apache Druid | Database / warehouse |
 | Oracle Database | Database / warehouse |
 | MongoDB | Database / warehouse |
+| Neo4j | Database / warehouse |
 | Sybase SQL Anywhere | Database / warehouse |
 | Teradata Vantage | Database / warehouse |
 | SQLite | Database / warehouse |
@@ -175,9 +177,11 @@ Use your own API keys, endpoints, and model deployments. Multiple providers and 
 | ServiceNow | Business app |
 | Monday data | Business app |
 | AWS Cost Explorer | Business app |
+| Azure Cost Management | Business app |
 | PostHog | Business app |
 | Priority ERP | Business app |
 | Outlook Mail | Business app |
+| Gmail | Business app |
 | Elasticsearch | Search and observability |
 | OpenSearch | Search and observability |
 | Splunk | Search and observability |
@@ -186,7 +190,13 @@ Use your own API keys, endpoints, and model deployments. Multiple providers and 
 | Prometheus | Monitoring and observability |
 | AWS CloudWatch | Monitoring and observability |
 | VMware Aria Operations | Monitoring and observability |
+| CrowdStrike Falcon | Security |
 | Jaeger | Tracing and observability |
+| Kubernetes | Infrastructure |
+| Microsoft Configuration Manager (SCCM) | Infrastructure |
+| NetApp ONTAP | Infrastructure |
+| Brocade Fabric OS | Infrastructure |
+| Microsoft Intune | Infrastructure |
 | Tableau | BI tool |
 | Power BI | BI tool |
 | Power BI Report Server | BI tool |
@@ -210,6 +220,9 @@ Use your own API keys, endpoints, and model deployments. Multiple providers and 
 | SharePoint | Files |
 | SharePoint Server (on-prem) | Files |
 | SharePoint Lists | Business app |
+| Google Drive | Files |
+| OpenText Documentum | Files |
+| KMS Lighthouse | Files |
 
 ### Connect Tools Through MCP
 
@@ -223,8 +236,8 @@ Bag of Words can connect to any MCP server or custom API. Ready-to-connect MCP i
 | Linear | Issues, projects, and cycles |
 | Sentry | Errors, issues, releases, and diagnostics |
 | GitHub | Repositories, issues, and pull requests |
+| HubSpot | CRM contacts, companies, deals, and tickets |
 | Google Drive | File search and content access |
-| Gmail | Messages, threads, labels, and drafts |
 | X | Posts, users, search, and trends |
 | X (Write) | Create and delete posts through a custom API |
 | Custom MCP server | Any compatible remote or self-hosted MCP server |

@@ -18,6 +18,7 @@ from app.schemas.entity_schema import (
     EntityFromStepCreate,
     EntityRunPayload,
     EntityPreviewPayload,
+    EntityCodePreviewPayload,
 )
 from app.services.entity_service import EntityService
 
@@ -52,22 +53,36 @@ async def _require_ds_access(db, user, organization, ds_ids: List[str]) -> None:
             or str(ds.organization_id) != str(organization.id)
             or not await user_can_access_data_source(db, str(user.id), str(organization.id), ds)
         ):
-            label = getattr(ds, "name", None) or str(rid)
+            # Echo only the id the caller sent: naming the agent would leak
+            # private agent names to anyone who can guess an id.
             raise HTTPException(
                 status_code=403,
-                detail=f'No access to agent "{label}".',
+                detail=f'No access to agent "{rid}".',
             )
 
 
-async def _require_entity_run_access(db, entity_id: str, organization, user) -> None:
+# EntityRunPayload fields a run persists onto the entity (besides the data).
+_RUN_EDIT_FIELDS = ("type", "title", "slug", "description", "code", "view", "status")
+
+
+async def _require_entity_run_access(db, entity_id: str, organization, user, payload=None) -> None:
     """Body check for run/preview: the entity's owner needs ACCESS to every
     attached data source; anyone else needs per-DS `create_entities` on all of
-    them (org admins pass via implication)."""
+    them (org admins pass via implication).
+
+    Once an entity is globally approved its owner loses plain edit rights (see
+    ``EntityService._determine_update_type``), so a run that also rewrites its
+    definition (code, title, status, ...) takes the non-owner bar there too —
+    otherwise /run would be a side door around PUT's approval lock."""
     existing = await service.get_entity(db, entity_id, organization, user)
     if not existing:
         raise AppError.not_found(ErrorCode.ENTITY_NOT_FOUND, "Entity not found")
     ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if str(existing.owner_id) == str(user.id):
+    edits_definition = payload is not None and any(
+        getattr(payload, f, None) is not None for f in _RUN_EDIT_FIELDS
+    )
+    owner_may_edit = not (edits_definition and existing.global_status == "approved")
+    if str(existing.owner_id) == str(user.id) and owner_may_edit:
         if ds_ids:
             await _require_ds_access(db, user, organization, ds_ids)
         return
@@ -89,6 +104,23 @@ async def _require_entity_run_access(db, entity_id: str, organization, user) -> 
     )
 
 
+async def _require_step_report_view(db, step_id: str, user, organization) -> None:
+    from sqlalchemy import select
+    from sqlalchemy.orm import lazyload
+    from app.models.step import Step
+    from app.models.query import Query
+    from app.models.report import Report
+    from app.services.file_access_service import user_can_view_report
+    report = (await db.execute(
+        select(Report).options(lazyload("*"))
+        .join(Query, Query.report_id == Report.id)
+        .join(Step, Step.query_id == Query.id)
+        .where(Step.id == str(step_id), Report.organization_id == str(organization.id))
+    )).scalar_one_or_none()
+    if report is not None and not await user_can_view_report(db, user, organization, report):
+        raise HTTPException(status_code=404, detail="Step not found")
+
+
 async def _require_entity_view_access(db, entity_id: str, organization, user) -> None:
     """Body check for viewer-mode (parameter VALUES) runs: the entity must be
     visible to the caller and they need ACCESS to every attached data source
@@ -102,22 +134,108 @@ async def _require_entity_view_access(db, entity_id: str, organization, user) ->
         await _require_ds_access(db, user, organization, ds_ids)
 
 
+async def _resolve_create_tier(db, user, organization, ds_ids: List[str]) -> bool:
+    """The two tiers of the report's "Save Query", for a query written by hand.
+
+    Returns ``can_publish``:
+    - PUBLISH directly: per-DS `create_entities` on every listed agent (agent
+      owners via `manage`, org `manage_entities`, full admins). With no agent
+      the query is org-wide, which stays an org-admin capability.
+    - SUGGEST (draft pending admin approval): any member who can ACCESS every
+      listed agent. Raises 403 when they cannot, or when there is no agent.
+    """
+    if ds_ids:
+        if await _holds_create_entities(db, user, organization, ds_ids):
+            return True
+        await _require_ds_access(db, user, organization, ds_ids)
+        return False
+    from app.core.permission_resolver import resolve_permissions
+    resolved = await resolve_permissions(db, str(user.id), str(organization.id))
+    if resolved.has_org_permission("manage_entities"):
+        return True
+    raise HTTPException(
+        status_code=403,
+        detail="A query without an agent is org-wide and needs 'manage_entities'. "
+               "Attach it to an agent you can access to suggest it for review.",
+    )
+
+
+def _validate_declared_params(payload) -> None:
+    """A declaration list a form sends to save or preview is validated
+    strictly (400 with the reason), not silently pruned at run time."""
+    raw = getattr(payload, "parameters", None)
+    if raw is None:
+        return
+    from app.ai.code_execution.query_params import ParamError
+    try:
+        payload.parameters = service.validate_param_specs(raw)
+    except ParamError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("", response_model=EntitySchema)
-@requires_permission('create_entities', resource_scoped=True)
+@requires_permission('create_reports')
 async def create_private_entity(
     payload: EntityCreate,
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(current_user),
     organization: Organization = Depends(get_current_organization),
 ):
-    """Create a new private entity (auto-published) - Private Published: published, null, published"""
-    if payload.data_source_ids:
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", payload.data_source_ids, "create_entities",
-        )
-    entity = await service.create_entity(db, payload, current_user, organization)
+    """Create an entity by hand (the agent panel's "New query").
+
+    Same two tiers as ``/from_step``: holders of per-agent `create_entities`
+    publish (or keep a draft) directly; any other member with access to the
+    agents saves a SUGGESTION — `(published, suggested, draft)` — that an
+    admin reviews, regardless of the `status` they sent.
+    """
+    ds_ids = [str(i) for i in (payload.data_source_ids or []) if i]
+    can_publish = await _resolve_create_tier(db, current_user, organization, ds_ids)
+    _validate_declared_params(payload)
+    entity = await service.create_entity(
+        db, payload, current_user, organization, creator_can_publish=can_publish,
+    )
     return EntitySchema.model_validate(entity)
+
+
+@router.post("/preview")
+@requires_permission('create_reports')
+async def preview_code(
+    payload: EntityCodePreviewPayload,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Run code against the chosen agents WITHOUT an entity row — the "try
+    before save" step of the "New query" form. Same tiers as creating one:
+    anyone who may at least suggest a query on these agents (access to every
+    one of them) may preview it; execution always uses the CALLER's
+    credentials, and nothing is persisted. Declared before the
+    `/{entity_id}/...` routes on purpose."""
+    ds_ids = [str(i) for i in (payload.data_source_ids or []) if i]
+    await _resolve_create_tier(db, current_user, organization, ds_ids)
+    # Executes caller-supplied code against the source — same trust boundary as
+    # a builder-mode query run, so it takes the same permission.
+    from app.core.permission_resolver import resolve_permissions
+    from app.core.code_visibility import can_run_custom_code
+    _resolved = await resolve_permissions(db, str(current_user.id), str(organization.id))
+    if not can_run_custom_code(_resolved):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to edit and run custom code",
+        )
+    if not (payload.code or "").strip():
+        raise HTTPException(status_code=400, detail="Code is required")
+    _validate_declared_params(payload)
+    from app.ai.code_execution.query_params import ParamError
+    try:
+        return await service.preview_code(
+            db, payload.code, ds_ids, organization, current_user=current_user,
+            parameters=payload.parameters, params=payload.params,
+        )
+    except ParamError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post("/global", response_model=EntitySchema)
@@ -261,10 +379,14 @@ async def update_entity(
                     db, str(current_user.id), str(organization.id),
                     "data_source", payload.data_source_ids, "create_entities",
                 )
-        elif not is_owner_unapproved:
+        elif existing_ds_ids or not is_owner_unapproved:
+            # An empty scope IS org-wide scope. The owner allowance covers
+            # editing a draft, not promoting it to every agent: clearing the
+            # scope needs the same `manage_entities` as /entities/global.
             await require_org_permission(
                 db, str(current_user.id), str(organization.id), "manage_entities",
             )
+    _validate_declared_params(payload)
     entity = await service.update_entity(
         db, entity_id, payload, organization, current_user,
         resource_authorized=resource_authorized,
@@ -343,6 +465,12 @@ async def create_entity_from_step(
     if not can_publish and target_ds_ids:
         await _require_ds_access(db, current_user, organization, target_ds_ids)
 
+    # The step's code, SQL and saved rows belong to its report: cloning them
+    # needs read access to that report (owner, full admin, or its visibility /
+    # project admits the caller). Agent access alone is not enough — the rows
+    # may come from the owner's personal credentials or identity-bound params.
+    await _require_step_report_view(db, step_id, current_user, organization)
+
     try:
         entity = await service.create_entity_from_step(
             db,
@@ -385,7 +513,7 @@ async def run_entity(
     if payload.params:
         await _require_entity_view_access(db, entity_id, organization, current_user)
     else:
-        await _require_entity_run_access(db, entity_id, organization, current_user)
+        await _require_entity_run_access(db, entity_id, organization, current_user, payload)
     from app.ai.code_execution.query_params import ParamError
     try:
         entity = await service.run_entity_with_update(db, entity_id, payload, organization, current_user=current_user)
@@ -409,9 +537,26 @@ async def preview_entity(
 ):
     """Preview (execute without persisting) — same access tier as run."""
     await _require_entity_run_access(db, entity_id, organization, current_user)
+    # Caller-supplied code that differs from the stored code is custom code —
+    # same trust boundary as /preview-code and builder-mode query runs, so it
+    # takes the same permission. Previewing the stored code stays at the run tier.
+    existing = await service.get_entity(db, entity_id, organization, current_user)
+    if (payload.code or "").strip() and (payload.code or "").strip() != (existing.code or "").strip():
+        from app.core.permission_resolver import resolve_permissions
+        from app.core.code_visibility import can_run_custom_code
+        _resolved = await resolve_permissions(db, str(current_user.id), str(organization.id))
+        if not can_run_custom_code(_resolved):
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to edit and run custom code",
+            )
+    _validate_declared_params(payload)
+    from app.ai.code_execution.query_params import ParamError
     try:
         result = await service.preview_entity(db, entity_id, payload, organization, current_user=current_user)
         return result
+    except ParamError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 

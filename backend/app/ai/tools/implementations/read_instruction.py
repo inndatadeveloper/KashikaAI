@@ -23,6 +23,7 @@ Design constraints (chat-only progressive disclosure):
 from typing import AsyncIterator, Dict, Any, Type, List, Optional, Tuple
 from pydantic import BaseModel
 import logging
+import re
 
 from sqlalchemy import select, and_, func
 
@@ -40,9 +41,9 @@ from app.ai.tools.schemas.events import (
 )
 from app.models.instruction import Instruction
 from app.ai.context.builders.instruction_context_builder import InstructionContextBuilder
+from app.ai.tools.implementations._instruction_window import read_window
 
 logger = logging.getLogger(__name__)
-
 
 class ReadInstructionTool(Tool):
     """Read the full text of one instruction or skill by its short id prefix."""
@@ -67,10 +68,18 @@ class ReadInstructionTool(Tool):
                 "proposed each, when, and what it changes. It is INFORMATIONAL: `text` is "
                 "the live instruction and the only thing an anchor can match. If a pending "
                 "change already does what you were about to propose, say so rather than "
-                "stacking a second suggestion on top of it."
+                "stacking a second suggestion on top of it.\n\n"
+                "LONG INSTRUCTIONS (catalogues, event lists, glossaries): a plain read of a "
+                "body too long to return whole comes back with `truncated: true`, the opening "
+                "lines, and a line-numbered `outline`. Never treat that as the full text. Use "
+                "`grep_pattern` (regex per line, e.g. 'connect|pair|weight', with "
+                "`before`/`after` context) to pull the entries you need, or `offset`/`limit` "
+                "to read a line range; continue from `next_offset` (plus `col_offset` = "
+                "`next_col_offset` when one line is too long for a single read). Both return verbatim "
+                "lines, safe to anchor edit_instruction on."
             ),
             category="research",
-            version="2.0.0",
+            version="2.1.0",
             input_schema=ReadInstructionInput.model_json_schema(),
             output_schema=ReadInstructionOutput.model_json_schema(),
             max_retries=1,
@@ -86,6 +95,14 @@ class ReadInstructionTool(Tool):
                         "Read an instruction/skill by its short id prefix from "
                         "<available_skills> or <available_instructions>"
                     ),
+                },
+                {
+                    "input": {"id": "be8090f2", "grep_pattern": "connect|pair", "after": 3},
+                    "description": "Pull matching entries (plus 3 lines of context) out of a long instruction",
+                },
+                {
+                    "input": {"id": "be8090f2", "offset": 401, "limit": 400},
+                    "description": "Read lines 401-800 of a long instruction",
                 },
             ],
         )
@@ -112,6 +129,15 @@ class ReadInstructionTool(Tool):
 
         prefix = (data.id or "").strip().lower()
         yield ToolStartEvent(type="tool.start", payload={"id": prefix})
+
+        if data.grep_pattern:
+            try:
+                re.compile(data.grep_pattern)
+            except re.error as e:
+                yield self._end_error(
+                    f"Invalid grep_pattern regex: {e}. Fix the pattern and retry."
+                )
+                return
 
         db = runtime_ctx.get("db")
         organization = runtime_ctx.get("organization")
@@ -234,7 +260,33 @@ class ReadInstructionTool(Tool):
 
             item = items[0]
             await self._record_on_demand_usage(runtime_ctx, item, full_id)
+            # Hand smart instructions the agent chose to read to the tool-less
+            # consumers (coder, chart step), which can't call this tool.
+            context_hub = runtime_ctx.get("context_hub")
+            if (
+                context_hub is not None
+                and (kind or "instruction") != "skill"
+                and getattr(item, "load_mode", None) == "intelligent"
+                and getattr(item, "id", None)
+                and hasattr(context_hub, "record_instruction_read")
+            ):
+                context_hub.record_instruction_read(item)
             pending = await self._pending_changes(db, organization, user, full_id)
+
+            full_text = item.text or ""
+            display_title = item.title or title or full_id[:8]
+            window = read_window(
+                full_text,
+                display_title,
+                offset=data.offset,
+                col_offset=data.col_offset,
+                limit=data.limit,
+                grep_pattern=data.grep_pattern,
+                ignore_case=data.ignore_case,
+                before=data.before,
+                after=data.after,
+                max_matches=data.max_matches,
+            )
 
             output = ReadInstructionOutput(
                 success=True,
@@ -242,7 +294,7 @@ class ReadInstructionTool(Tool):
                 short_id=full_id[:8],
                 title=item.title or title,
                 description=description,
-                text=item.text or "",
+                text=window["text"],
                 category=item.category,
                 kind=kind or "instruction",
                 load_mode=item.load_mode,
@@ -251,9 +303,10 @@ class ReadInstructionTool(Tool):
                     + (" (unpublished draft — awaiting review)" if row_status == "draft" else "")
                 ),
                 pending_changes=pending or None,
+                **window["fields"],
             )
 
-            summary = f"Read instruction '{item.title or title or full_id[:8]}'"
+            summary = window["summary"]
             if pending:
                 summary += (
                     f" — {len(pending)} suggested edit(s) awaiting review "
@@ -277,7 +330,10 @@ class ReadInstructionTool(Tool):
                     "output": output_dict,
                     "observation": {
                         "summary": summary,
-                        "text": item.text or "",
+                        "text": window["text"],
+                        # Window metadata (line range, outline, grep matches)
+                        # rides with the text so the model can page on.
+                        **window["fields"],
                         # Nested, never inlined with the body: pending text is
                         # NOT part of the instruction and an anchor matched
                         # against it will fail. Keeping it under its own key is
@@ -334,6 +390,7 @@ class ReadInstructionTool(Tool):
         out = []
         for s in review.get("suggestions", []):
             hunks = s.get("hunks") or []
+            fields = s.get("field_changes") or []
             out.append({
                 "build_id": s.get("build_id"),
                 "build_number": s.get("build_number"),
@@ -341,7 +398,7 @@ class ReadInstructionTool(Tool):
                 "source": s.get("source"),
                 "proposed_at": s.get("created_at"),
                 "evidence": s.get("evidence"),
-                "change_count": len(hunks),
+                "change_count": len(hunks) + len(fields),
                 "changes": [
                     {
                         "replaces": (h.get("before") or "")[:120],
@@ -349,6 +406,11 @@ class ReadInstructionTool(Tool):
                     }
                     for h in hunks[:5]
                 ],
+                # Non-text proposals, e.g. turning the instruction off.
+                **({"field_changes": [
+                    {"field": f.get("field"), "from": f.get("from"), "to": f.get("to")}
+                    for f in fields
+                ]} if fields else {}),
             })
         return out
 

@@ -21,10 +21,29 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # SOURCE OF TRUTH: Data sources to test
 # =============================================================================
+# kms_lighthouse is deliberately absent: it has no catalog (get_schemas() returns []),
+# so _run_connection_test's table-count assertion can never pass. Verify it with
+# tools/kms_lighthouse/mock_kms_server.py and its unit/e2e tests.
 DATA_SOURCES = [
+    "netapp_ontap",  # customer-run ONTAP validation; see tools/netapp/README.md
+    "brocade",  # Real switch or tools/brocade/simulated_api.py; credentials via integrations.json.
+    # Infra appliance connectors: a real appliance, or the loopback simulator in
+    # tools/<vendor>/simulated_api.py (set <VENDOR>_TEST_URL + credentials; the
+    # simulator needs <VENDOR>_TEST_ALLOW_HTTP=true).
+    "f5_bigip",
+    "checkpoint",
+    "dell_ome",
+    "hpe_oneview",
     "sharepoint_onprem",  # Real SharePoint Server; configure in integrations.json.
     "postgresql",
     "mysql",
+    # Remote mode: a Starburst Galaxy (or Enterprise) cluster configured in
+    # integrations.json with a service account; Galaxy's free tier works.
+    #   {"starburst": {"enabled": true, "host": "<account>-<cluster>.trino.galaxy.starburst.io",
+    #                  "port": 443, "protocol": "https", "catalog": "tpch", "schema": "sf1",
+    #                  "additional_catalogs": "tpcds", "role": "public",
+    #                  "user": "<service-account>@<account>.galaxy.starburst.io", "password": "..."}}
+    "starburst",
     # Temporarily skipped: the CI Snowflake trial account is suspended for lack
     # of a payment method, so every connection fails in the driver
     # (ProgrammingError 000666 / SQLSTATE 57014) before any client code runs.
@@ -41,6 +60,10 @@ DATA_SOURCES = [
     "qvd",
     "teradata",
     "opensearch",
+    # Container mode: {"neo4j": {"enabled": true, "container": true}} in
+    # integrations.json (neo4j:5.26, a small movies graph). The deeper live
+    # checks are in tests/integrations/test_neo4j_live.py.
+    "neo4j",
     # Remote mode: Zabbix is a multi-container stack (server + web + db), so it
     # doesn't fit the single-`container_cls` testcontainer pattern. Point
     # integrations.json at a live instance — `tools/zabbix/docker-compose.yaml`
@@ -54,6 +77,13 @@ DATA_SOURCES = [
     #                    "account_name": "customer1", "username": "admin",
     #                    "password": "Secret123!"}}
     "appdynamics",
+    # Remote mode: CrowdStrike ships no emulator/container for the Falcon API,
+    # so integrations.json points at either a real tenant (API client with read
+    # scopes) or the SDK-shaped simulator:
+    # `tools/crowdstrike/docker-compose.yaml` (mock_falcon.py) —
+    #   {"crowdstrike": {"enabled": true, "base_url": "http://localhost:8095",
+    #                    "client_id": "bow_api", "client_secret": "FalconSecret123!"}}
+    "crowdstrike",
     # Remote mode: no Aria Operations appliance can run in CI (OVA, needs ESXi
     # + a Broadcom entitlement), so integrations.json points at either a live
     # appliance or the spec-shaped simulator:
@@ -62,6 +92,31 @@ DATA_SOURCES = [
     #                        "auth_source": "LOCAL", "username": "admin",
     #                        "password": "Aria!2024"}}
     "aria_operations",
+    # Remote mode: no vCenter appliance can run in CI (OVA on ESXi + a Broadcom
+    # entitlement). Point VCENTER_TEST_HOST / _USERNAME / _PASSWORD (and
+    # optionally VCENTER_TEST_PORT, VCENTER_TEST_CA_PEM, VCENTER_TEST_VERIFY_SSL)
+    # at a real vCenter or ESXi, or at the vim25 mock
+    # `tools/vcenter/docker-compose.yaml` (mock_vcenter.py, pyVmomi's own wire
+    # serializer) — or use integrations.json:
+    #   {"vcenter": {"enabled": true, "host": "localhost", "port": 8989,
+    #                "username": "bow-ro@vsphere.local", "password": "VMware1!RO",
+    #                "ca_certificate": "<tools/vcenter/.certs/ca.pem contents>"}}
+    "vcenter",
+    # Remote mode: no DX NetOps Spectrum OneClick can run in CI (Broadcom
+    # entitlement, licensed Docker tarballs), so integrations.json points at
+    # either a customer OneClick or the doc-shaped simulator:
+    # `tools/spectrum/docker-compose.yaml` (mock_oneclick.py) —
+    #   {"spectrum": {"enabled": true, "url": "http://localhost:8880",
+    #                 "username": "bow_api", "password": "Spectrum!2024"}}
+    "spectrum",
+    # Remote mode: Intune is SaaS-only (no container). integrations.json points
+    # at a real tenant's Entra app — or at the doc-shaped Graph stand-in
+    # `tools/intune/docker-compose.yaml` (mock_graph.py), in which case the run
+    # also needs BOW_GRAPH_BASE_URL=http://localhost:8095/v1.0 and
+    # BOW_GRAPH_TOKEN_BASE_URL=http://localhost:8095 in the environment:
+    #   {"intune": {"enabled": true, "tenant_id": "<tenant guid>",
+    #               "client_id": "intune-reader", "client_secret": "Reader123!"}}
+    "intune",
     # Remote mode: `tools/elastic/docker-compose.yaml` + `seed_elastic.py` stand
     # up a local Elasticsearch 8 with an API key. Not a bundled testcontainer to
     # avoid pulling in elasticsearch-py's strict server-version handshake.
@@ -88,15 +143,37 @@ DATA_SOURCES = [
     #               "username": "BWUSER", "password": "...", "catalog": "0D_NW_C01"}}
     "businessobjects",
     "sap_bw",
+    # Remote mode: no redistributable Documentum Content Server exists (licensed
+    # OpenText binaries), so integrations.json points at either a live
+    # `/dctm-rest` + OTDS pair or the spec-shaped simulator:
+    # `tools/documentum/docker-compose.yaml` (mock_documentum_server.py) —
+    #   {"documentum": {"enabled": true, "rest_url": "http://localhost:8081/dctm-rest",
+    #                   "repository": "bow_demo", "allow_http": true,
+    #                   "username": "dmadmin", "password": "dmadmin123"}}
+    "documentum",
     # Remote mode: monday.com has no self-hostable server, so this runs only
     # against a live account configured in integrations.json (skips otherwise):
     #   {"monday": {"enabled": true, "api_token": "..."}}
     "monday",
+    # Remote mode: Configuration Manager needs Windows Server + SQL + AD, so no
+    # container exists. Point integrations.json at a real lab (e.g. Microsoft's
+    # "Configuration Manager current branch" Azure quickstart template) or the
+    # protocol simulator `tools/mecm/mock_adminservice.py` (HTTPS + real NTLM):
+    #   {"mecm": {"enabled": true, "server_url": "localhost:8443",
+    #             "username": "CONTOSO\\svc_bow", "password": "Passw0rd!",
+    #             "ca_certificate": "-----BEGIN CERTIFICATE-----\n..."}}
+    "mecm",
     # Container mode (testcontainers k3s): the k3s admin kubeconfig is used ONLY
     # to seed tools/kubernetes/{rbac.yaml,manifests}; the client under test then
     # authenticates with the service-account access file exactly the way a
     # customer connection does. `{"kubernetes": {"enabled": true, "container": true}}`.
     "kubernetes",
+    # Remote mode: Azure Cost Management has no emulator, so this runs only
+    # against a live tenant configured in integrations.json (skips otherwise):
+    #   {"azure_cost": {"enabled": true, "scope": "/subscriptions/<id>",
+    #                   "tenant_id": "...", "client_id": "...", "client_secret": "..."}}
+    # For a deeper probe of the live API shape see verify_azure_cost.py.
+    "azure_cost",
 ]
 
 
@@ -266,6 +343,29 @@ except ImportError:
     pass
 
 try:
+    from testcontainers.neo4j import Neo4jContainer
+
+    def _seed_neo4j(container) -> None:
+        with container.get_driver() as driver, driver.session() as s:
+            s.run(
+                "CREATE (k:Person {name: 'Keanu Reeves'})-[:ACTED_IN {roles: ['Neo']}]->"
+                "(m:Movie {title: 'The Matrix', released: 1999})"
+            ).consume()
+
+    CONTAINER_REGISTRY["neo4j"] = {
+        "container_cls": Neo4jContainer,
+        "image": "neo4j:5.26-community",
+        "get_kwargs": lambda c: {
+            "uri": f"bolt://{c.get_container_host_ip()}:{c.get_exposed_port(7687)}",
+            "username": c.username,
+            "password": c.password,
+        },
+        "seed_fn": _seed_neo4j,
+    }
+except ImportError:
+    pass
+
+try:
     from testcontainers.mysql import MySqlContainer
     CONTAINER_REGISTRY["mysql"] = {
         "container_cls": MySqlContainer,
@@ -308,9 +408,87 @@ def ds_kwargs(name: str) -> Dict[str, Any]:
     Extract and normalize kwargs for a data source from credentials.
     Skips the test if the data source is missing or disabled.
     """
+    if name == "aria_operations" and os.environ.get("ARIA_TEST_URL"):
+        return {
+            "url": os.environ["ARIA_TEST_URL"],
+            "username": os.environ["ARIA_TEST_USERNAME"],
+            "password": os.environ["ARIA_TEST_PASSWORD"],
+            "auth_source": os.environ.get("ARIA_TEST_AUTH_SOURCE", "LOCAL"),
+        }
+    if name == "spectrum" and os.environ.get("SPECTRUM_TEST_URL"):
+        return {
+            "url": os.environ["SPECTRUM_TEST_URL"],
+            "username": os.environ.get("SPECTRUM_TEST_USERNAME"),
+            "password": os.environ.get("SPECTRUM_TEST_PASSWORD"),
+            "token": os.environ.get("SPECTRUM_TEST_TOKEN"),
+            "verify_ssl": os.environ.get("SPECTRUM_TEST_VERIFY_SSL", "true") != "false",
+        }
+    if name == "vcenter" and os.environ.get("VCENTER_TEST_HOST"):
+        return {
+            "host": os.environ["VCENTER_TEST_HOST"],
+            "port": int(os.environ.get("VCENTER_TEST_PORT", "443")),
+            "username": os.environ["VCENTER_TEST_USERNAME"],
+            "password": os.environ["VCENTER_TEST_PASSWORD"],
+            "ca_certificate": os.environ.get("VCENTER_TEST_CA_PEM"),
+            "verify_ssl": os.environ.get("VCENTER_TEST_VERIFY_SSL", "true") != "false",
+        }
+    if name == "netapp_ontap" and os.environ.get("NETAPP_URL"):
+        return {
+            "url": os.environ["NETAPP_URL"],
+            "username": os.environ["NETAPP_USERNAME"],
+            "password": os.environ["NETAPP_PASSWORD"],
+            "ca_certificate": os.environ.get("NETAPP_CA_PEM"),
+            "allow_http": os.environ.get("NETAPP_SIMULATOR") == "true",
+        }
+    if name == "f5_bigip" and os.environ.get("F5_TEST_URL"):
+        return {
+            "url": os.environ["F5_TEST_URL"],
+            "username": os.environ["F5_TEST_USERNAME"],
+            "password": os.environ["F5_TEST_PASSWORD"],
+            "ca_certificate": os.environ.get("F5_TEST_CA_PEM"),
+            "allow_http": os.environ.get("F5_TEST_ALLOW_HTTP") == "true",
+        }
+    if name == "checkpoint" and os.environ.get("CHECKPOINT_TEST_URL"):
+        creds = (
+            {"api_key": os.environ["CHECKPOINT_TEST_API_KEY"]}
+            if os.environ.get("CHECKPOINT_TEST_API_KEY")
+            else {"username": os.environ["CHECKPOINT_TEST_USERNAME"], "password": os.environ["CHECKPOINT_TEST_PASSWORD"]}
+        )
+        return {
+            "url": os.environ["CHECKPOINT_TEST_URL"],
+            **creds,
+            "domain": os.environ.get("CHECKPOINT_TEST_DOMAIN"),
+            "ca_certificate": os.environ.get("CHECKPOINT_TEST_CA_PEM"),
+            "allow_http": os.environ.get("CHECKPOINT_TEST_ALLOW_HTTP") == "true",
+        }
+    if name == "dell_ome" and os.environ.get("OME_TEST_URL"):
+        return {
+            "url": os.environ["OME_TEST_URL"],
+            "username": os.environ["OME_TEST_USERNAME"],
+            "password": os.environ["OME_TEST_PASSWORD"],
+            "ca_certificate": os.environ.get("OME_TEST_CA_PEM"),
+            "allow_http": os.environ.get("OME_TEST_ALLOW_HTTP") == "true",
+        }
+    if name == "hpe_oneview" and os.environ.get("ONEVIEW_TEST_URL"):
+        return {
+            "url": os.environ["ONEVIEW_TEST_URL"],
+            "username": os.environ["ONEVIEW_TEST_USERNAME"],
+            "password": os.environ["ONEVIEW_TEST_PASSWORD"],
+            "ca_certificate": os.environ.get("ONEVIEW_TEST_CA_PEM"),
+            "allow_http": os.environ.get("ONEVIEW_TEST_ALLOW_HTTP") == "true",
+        }
+    if name == "brocade" and os.environ.get("BROCADE_TEST_URL"):
+        return {
+            "url": os.environ["BROCADE_TEST_URL"],
+            "username": os.environ["BROCADE_USER"],
+            "password": os.environ["BROCADE_PASSWORD"],
+            "vf_ids": os.environ.get("BROCADE_TEST_VF_IDS", ""),
+            "allow_http": os.environ.get("BROCADE_TEST_ALLOW_HTTP") == "true",
+        }
     if name == "sharepoint_onprem" and os.environ.get("SHAREPOINT_TEST_SITE_URL"):
         return {
             "site_url": os.environ["SHAREPOINT_TEST_SITE_URL"],
+            "api_mode": os.environ.get("SHAREPOINT_TEST_API_MODE", "modern"),
             "username": os.environ.get("SHAREPOINT_TEST_USERNAME"),
             "password": os.environ.get("SHAREPOINT_TEST_PASSWORD"),
             "allow_http": os.environ.get("SHAREPOINT_TEST_ALLOW_HTTP") == "true",
@@ -410,6 +588,11 @@ def get_client(ds_name: str, **kwargs):
     Dynamically import and instantiate a data source client.
     Mirrors the logic in DataSourceService._resolve_client_by_type().
     """
+    if ds_name in {"netapp_ontap", "f5_bigip", "checkpoint", "dell_ome", "hpe_oneview"}:
+        # Explicit registry client_path is the contract (CheckPointClient, HpeOneViewClient …
+        # do not follow the TitleCase-from-snake_case convention below).
+        from app.schemas.data_source_registry import resolve_client_class
+        return resolve_client_class(ds_name)(**kwargs)
     module_name = f"app.data_sources.clients.{ds_name.lower()}_client"
     # Convert snake_case to TitleCase for class name (e.g., aws_redshift -> AwsRedshift)
     title = "".join(word[:1].upper() + word[1:] for word in ds_name.split("_"))

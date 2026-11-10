@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import pandas as pd
@@ -16,9 +17,11 @@ class SapHanaClient(DataSourceClient):
     """SAP HANA / HANA Cloud / SAP Datasphere (Open SQL schema) client.
 
     Speaks plain SQL to the HANA SQL port via the official `hdbcli` DBAPI
-    driver. For SAP Datasphere, connect with a space database user
-    (SPACE#NAME) against the tenant's HANA Cloud endpoint (port 443, TLS) —
-    views marked "Expose for Consumption" appear in the space schema.
+    driver. hdbcli is not bundled (SAP Developer License — proprietary, not
+    redistributable); deployments that want this connector `pip install hdbcli`.
+    For SAP Datasphere, connect with a space database user (SPACE#NAME)
+    against the tenant's HANA Cloud endpoint (port 443, TLS) — views marked
+    "Expose for Consumption" appear in the space schema.
     """
 
     def __init__(self, host, port: int = 443, user: str = None, password: str = None,
@@ -61,18 +64,29 @@ class SapHanaClient(DataSourceClient):
     @contextmanager
     def connect(self) -> Generator["object", None, None]:
         """Yield an hdbcli DBAPI connection to SAP HANA."""
-        from hdbcli import dbapi
+        try:
+            from hdbcli import dbapi
+        except ImportError:
+            raise RuntimeError(
+                "SAP HANA driver (hdbcli) is not installed. It is not bundled with "
+                "Bag of Words because of its SAP license; install it on the server "
+                "with `pip install hdbcli` to use this connector."
+            )
 
         conn = None
         try:
             conn = dbapi.connect(**self._connect_kwargs)
             yield conn
+        except IndexingCancelled:
+            raise
         except Exception as e:
             raise RuntimeError(f"{e}")
         finally:
             if conn is not None:
                 try:
                     conn.close()
+                except IndexingCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -112,6 +126,8 @@ class SapHanaClient(DataSourceClient):
         """Get tables and views (Datasphere exposes views) with graceful fallback."""
         try:
             return self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             return self._get_tables_basic()
 
@@ -136,6 +152,8 @@ class SapHanaClient(DataSourceClient):
                 return pks
             finally:
                 cursor.close()
+        except IndexingCancelled:
+            raise
         except Exception:
             return {}
 
@@ -190,7 +208,7 @@ class SapHanaClient(DataSourceClient):
                 cursor.close()
 
         tables: dict = {}
-        for schema_name, table_name, column_name, dtype, col_comment, obj_comment, obj_type, _pos in rows:
+        for schema_name, table_name, column_name, dtype, col_comment, obj_comment, obj_type, _pos in discovery_items(rows, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
             key = (schema_name, table_name)
             if key not in tables:
                 tables[key] = Table(
@@ -210,13 +228,18 @@ class SapHanaClient(DataSourceClient):
 
     def _get_tables_enriched(self) -> List[Table]:
         """Tables + views with comments and primary keys."""
+        discovery_phase('reading_columns')
         return self._fetch_tables(self._ENRICHED_SQL, with_pks=True)
 
     def _get_tables_basic(self) -> List[Table]:
         """Tables + views without comments (minimal privileges — always works)."""
+        discovery_phase('metadata_fallback')
         try:
             return self._fetch_tables(self._BASIC_SQL, with_pks=False)
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("sap_hana catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -225,7 +248,8 @@ class SapHanaClient(DataSourceClient):
         raise NotImplementedError(
             "get_schema() is obsolete. Use get_tables() instead.")
 
-    def get_schemas(self):
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
         """Get schemas for all tables in the specified database."""
         return self.get_tables()
 

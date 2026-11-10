@@ -192,11 +192,56 @@ class TestTestConnection:
 
     def test_probe_budget_respected(self):
         c = _mk_client()
-        many = {"ws1": [{"id": f"d{i}", "name": f"M{i}"} for i in range(20)]}
-        _wire_probe(c, WS, many, [_resp(404)] * 20)
+        many = {"ws1": [{"id": f"d{i}", "name": f"M{i}"} for i in range(c.MAX_PROBE_DATASETS + 10)]}
+        _wire_probe(c, WS, many, [_resp(404)] * (c.MAX_PROBE_DATASETS + 10))
         out = c.test_connection()
+        # No catalog attached, so nothing beyond the workspace walk is probed.
         assert c._request.call_count == c.MAX_PROBE_DATASETS
         assert out["success"] is False
+
+    def test_probe_budget_walks_past_a_run_of_unqueryable_models(self):
+        """A Viewer-only workspace answers 404 for every model in it. The
+        budget must be wide enough to reach a queryable model further down
+        instead of giving up after a handful."""
+        c = _mk_client()
+        many = {"ws1": [{"id": f"d{i}", "name": f"M{i}"} for i in range(12)]}
+        _wire_probe(c, WS, many, [_resp(404)] * 11 + [_resp(200, {"results": []})])
+        out = c.test_connection()
+        assert out["success"] is True
+        assert "M11" in out["message"]
+
+    def test_all_404_names_the_skipped_models(self):
+        """The old fallback printed 'no dataset could be probed' — no model
+        names, no hint. A user who can list a workspace but has no Build on
+        its models needs to know which models answered 404 and what to ask for."""
+        c = _mk_client()
+        _wire_probe(c, WS, DS, [_resp(404), _resp(404)])
+        out = c.test_connection()
+        assert out["success"] is False
+        assert out["connectivity"] is True
+        assert "no dataset could be probed" not in out["message"]
+        assert "Model1" in out["message"]
+        assert "Model2" in out["message"]
+        assert "Build" in out["message"]
+
+    def test_all_404_still_checks_the_known_catalog(self):
+        """Viewer somewhere + Build on the connection's own model is the normal
+        delegated shape. The workspace walk sees only the Viewer models (404);
+        the catalog probe must be consulted before failing the user."""
+        c = _mk_client()
+        c.attach_table_metadata([{
+            "name": "Shared/Orders",
+            "metadata_json": {"powerbi": {
+                "datasetId": "ds-shared", "workspaceId": "ws-x",
+                "workspaceName": "Elsewhere", "datasetName": "Shared", "tableName": "Orders",
+            }},
+        }])
+        _wire_probe(c, WS, DS, [_resp(404), _resp(404), _resp(200, {"results": []})])
+        out = c.test_connection()
+        assert out["success"] is True
+        assert "Shared" in out["message"]
+        # The third call is the tenant-level catalog probe, not a workspace one.
+        assert "/datasets/ds-shared/executeQueries" in c._request.call_args_list[2].args[1]
 
 
 # ---------- _request retry ---------- #
@@ -301,8 +346,10 @@ class TestExecuteQueryResolution:
         args = c._execute_dax_internal.call_args[0]
         assert args[0] == "override-ws"
 
-    def test_falls_back_to_live_discovery_when_not_in_map(self):
-        c = self._client_with_map()
+    def test_falls_back_to_live_discovery_when_no_map_was_attached(self):
+        """A bare client (no platform-attached activation map) still resolves
+        by live discovery — e.g. direct/scripted use outside an agent."""
+        c = _mk_client()
         from app.ai.prompt_formatters import Table
         live = Table(name="NewModel/Things", columns=[], pks=[], fks=[], is_active=True,
                      metadata_json={"powerbi": {"datasetId": "live-ds", "workspaceId": "live-ws"}})
@@ -311,6 +358,19 @@ class TestExecuteQueryResolution:
         c.execute_query("EVALUATE Things", "NewModel/Things")
         args = c._execute_dax_internal.call_args[0]
         assert (args[0], args[1]) == ("live-ws", "live-ds")
+
+    def test_no_live_discovery_for_name_outside_attached_map(self):
+        """Once the platform attached the activated-table map, a name outside
+        it is a table the agent manager did not activate: no live crawl may
+        resolve it, and the error steers back to the activated tables."""
+        c = self._client_with_map()
+        c.get_schemas = MagicMock(side_effect=AssertionError("live discovery must not run"))
+        c._execute_dax_internal = MagicMock(return_value="df")
+        with pytest.raises(ValueError) as ei:
+            c.execute_query("EVALUATE Things", "NewModel/Things")
+        assert "NewModel/Things" in str(ei.value)
+        assert "SalesModel/Customers" in str(ei.value)
+        c._execute_dax_internal.assert_not_called()
 
     def test_unresolvable_table_error_names_table_and_known_tables(self):
         c = self._client_with_map()
@@ -471,6 +531,30 @@ class TestInternalColumnFiltering:
         guide = c.system_prompt()
         assert "RowNumber-<GUID>" in guide
         assert "cannot be determined" in guide
+
+    def test_dax_guide_teaches_bounded_queries(self):
+        """Every DAX query is a live evaluation serialized over REST, so the
+        guide must lead with aggregation / TOPN and never show an unbounded
+        `EVALUATE <table>` as an example - models copy the first pattern they
+        see, and a full scan of a fact table is the slow query in the field."""
+        c = _mk_client()
+        guide = c.system_prompt()
+        assert "### Query Cost and Performance" in guide
+        assert "TOPN(100, Customers)" in guide
+        assert "SELECTCOLUMNS" in guide
+        # No example line is a bare, unbounded table scan.
+        bare = [
+            ln for ln in guide.splitlines()
+            if ln.strip().startswith("EVALUATE ")
+            and "(" not in ln
+            and "<" not in ln  # the `EVALUATE <table_expression>` pattern placeholder
+        ]
+        assert bare == [], bare
+        # Measures-first guidance sits with the performance rules, and the
+        # INFO.VIEW.* family is framed as a last resort, not an exploration step.
+        perf = guide.split("### Query Cost and Performance", 1)[1].split("### Key DAX Syntax Rules", 1)[0]
+        assert "[Measure Name]" in perf
+        assert "never as a default exploration step" in guide
 
 
 # ---------- Incremental discovery (prior_tables) ---------- #
@@ -652,3 +736,146 @@ class TestGeneratedDateTableRelationships:
         assert not PowerBIClient._is_system_table("LocalDates")
         assert not PowerBIClient._is_system_table("dim_date")
         assert not PowerBIClient._is_system_table("")
+
+
+class TestActivationEnforcement:
+    """Activation is per `Dataset/Table`, but DAX addresses a whole dataset.
+    With the NOT-activated rows attached, execute_query refuses both a
+    non-activated target and a DAX body that reaches a non-activated sibling
+    table of an activated target's dataset."""
+
+    def _client(self):
+        c = _mk_client()
+        c.attach_table_metadata([
+            {"name": "SalesModel/Customers", "metadata_json": PBI_META},
+        ])
+        c.attach_blocked_table_metadata([
+            {"name": "SalesModel/Orders", "metadata_json": {
+                "powerbi": {**PBI_META["powerbi"], "tableName": "Orders"}}},
+            {"name": "SalesModel/Date Table", "metadata_json": {
+                "powerbi": {**PBI_META["powerbi"], "tableName": "Date Table"}}},
+            {"name": "HRModel/Employees", "metadata_json": {
+                "powerbi": {"datasetId": "ds-guid-2", "workspaceId": "ws-guid-1",
+                             "datasetName": "HRModel", "tableName": "Employees"}}},
+        ])
+        c.get_schemas = MagicMock(side_effect=AssertionError("live discovery must not run"))
+        c._execute_dax_internal = MagicMock(return_value="df")
+        return c
+
+    def test_non_activated_target_is_refused_without_live_crawl(self):
+        c = self._client()
+        with pytest.raises(ValueError) as ei:
+            c.execute_query("EVALUATE Orders", "SalesModel/Orders")
+        msg = str(ei.value)
+        assert "SalesModel/Orders" in msg and "not activated" in msg
+        assert "SalesModel/Customers" in msg
+        c._execute_dax_internal.assert_not_called()
+
+    def test_non_activated_internal_name_is_refused(self):
+        c = self._client()
+        with pytest.raises(ValueError, match="not activated"):
+            c.execute_query("EVALUATE Orders", "Orders")
+        c._execute_dax_internal.assert_not_called()
+
+    def test_activated_target_runs(self):
+        c = self._client()
+        c.execute_query("EVALUATE Customers", "SalesModel/Customers")
+        c._execute_dax_internal.assert_called_once()
+
+    @pytest.mark.parametrize("dax", [
+        "EVALUATE Orders",
+        "EVALUATE SUMMARIZE(Orders, Orders[Region])",
+        "EVALUATE\nSUMMARIZECOLUMNS(Customers[Name], \"n\", COUNTROWS(Orders))",
+        "EVALUATE FILTER(Customers, RELATED(Orders[Amount]) > 1)",
+        "EVALUATE 'Date Table'",
+        "EVALUATE ADDCOLUMNS(Customers, \"d\", CALCULATE(MAX('Date Table'[Date])))",
+        "evaluate orders",
+        # query clauses after the table reference
+        "EVALUATE Orders ORDER BY [Id]",
+        "EVALUATE Orders ORDER BY Orders[Id] DESC START AT 10",
+        "EVALUATE\n  Orders\nORDER BY\n  [Id]",
+        "EVALUATE TOPN(5, Orders) ORDER BY [Amount]",
+        # DEFINE block
+        "DEFINE VAR __n = COUNTROWS(Orders)\nEVALUATE ROW(\"n\", __n)",
+        "DEFINE MEASURE Orders[Total] = SUM(Orders[Amount])\nEVALUATE ROW(\"t\", [Total])",
+        # reference outside a comment still counts
+        "EVALUATE Orders // count them",
+        "/* header */ EVALUATE 'Date Table'",
+        # spacing / escaped quote
+        "EVALUATE  'Date Table'  ORDER BY 'Date Table'[Date]",
+    ])
+    def test_dax_body_reaching_non_activated_sibling_is_refused(self, dax):
+        c = self._client()
+        with pytest.raises(ValueError) as ei:
+            c.execute_query(dax, "SalesModel/Customers")
+        assert "not activated" in str(ei.value)
+        assert "SalesModel/Customers" in str(ei.value)
+        c._execute_dax_internal.assert_not_called()
+
+    def test_dax_body_reaching_non_activated_sibling_is_refused_with_explicit_ids(self):
+        c = self._client()
+        with pytest.raises(ValueError, match="not activated"):
+            c.execute_query("EVALUATE Orders", dataset_id="ds-guid-1", workspace_id="ws-guid-1")
+        c._execute_dax_internal.assert_not_called()
+
+    @pytest.mark.parametrize("dax", [
+        "EVALUATE Customers",
+        "EVALUATE FILTER(Customers, Customers[Orders] > 1)",          # a column named Orders
+        "EVALUATE FILTER(Customers, Customers[Name] = \"Orders\")",    # a string literal
+        "EVALUATE ROW(\"x\", [Orders])",                              # a measure named Orders
+        "EVALUATE SUMMARIZE(Customers, Customers[Region], \"n\", COUNTROWS(Customers))",
+        "EVALUATE Customers ORDER BY [Orders]",                       # sorting by a measure named Orders
+        "EVALUATE Customers ORDER BY Customers[Orders] DESC",
+        "EVALUATE Customers // Orders would be nice",                 # line comment
+        "EVALUATE Customers -- see Orders",                           # SQL-style line comment
+        "/* Orders 'Date Table' */ EVALUATE Customers",               # block comment
+        "EVALUATE FILTER(Customers, Customers[Note] = \"see 'Date Table'\")",  # quoted name inside a string
+        "EVALUATE ROW(\"n\", DATE(2024, 1, 1))",                       # function named like nothing blocked
+    ])
+    def test_dax_body_using_only_activated_tables_runs(self, dax):
+        c = self._client()
+        c.execute_query(dax, "SalesModel/Customers")
+        c._execute_dax_internal.assert_called_once()
+
+    def test_other_dataset_blocked_names_do_not_affect_this_dataset(self):
+        c = self._client()
+        # "Employees" is blocked in HRModel only; a Customers column of that
+        # name in SalesModel is fine.
+        c.execute_query("EVALUATE FILTER(Customers, Customers[Employees] > 0)", "SalesModel/Customers")
+        c._execute_dax_internal.assert_called_once()
+
+    def test_without_blocked_map_dax_body_is_not_inspected(self):
+        c = _mk_client()
+        c.attach_table_metadata([{"name": "SalesModel/Customers", "metadata_json": PBI_META}])
+        c._execute_dax_internal = MagicMock(return_value="df")
+        c.execute_query("EVALUATE Orders", "SalesModel/Customers")
+        c._execute_dax_internal.assert_called_once()
+
+
+class TestDaxTableReferences:
+    """The lexer behind the activation guard."""
+
+    def test_bare_and_quoted_references(self):
+        refs = PowerBIClient._dax_table_references(
+            "DEFINE VAR __x = COUNTROWS('Sales Orders')\n"
+            "EVALUATE SUMMARIZE(Customers, Customers[Region]) ORDER BY [Region] START AT \"A\""
+        )
+        assert {"sales orders", "customers"} <= refs
+        # function names, keywords-as-functions and column names are not tables
+        assert "countrows" not in refs and "summarize" not in refs and "region" not in refs
+
+    def test_keywords_are_present_but_harmless(self):
+        # EVALUATE / ORDER / BY are bare words too; they only matter if a
+        # blocked table carries such a name, which the guard tolerates.
+        refs = PowerBIClient._dax_table_references("EVALUATE T ORDER BY [x]")
+        assert "t" in refs
+
+    def test_comments_strings_and_brackets_are_ignored(self):
+        refs = PowerBIClient._dax_table_references(
+            "-- Orders\n// Orders\n/* 'Date Table' */ EVALUATE Customers ORDER BY [Orders] "
+            "START AT \"Orders\""
+        )
+        assert refs == {"evaluate", "customers", "order", "by", "start", "at"}
+
+    def test_escaped_quote_in_table_name(self):
+        assert "o'brien" in PowerBIClient._dax_table_references("EVALUATE 'O''Brien'")

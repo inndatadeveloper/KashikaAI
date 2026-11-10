@@ -16,12 +16,19 @@ from app.schemas.organization_settings_schema import (
     SignupPolicySchema,
 )
 from datetime import datetime
+import logging
 import os
 import hashlib
 from PIL import Image
 from io import BytesIO
 from app.ee.audit.service import audit_service
 from app.core.telemetry import telemetry
+
+logger = logging.getLogger(__name__)
+
+
+# Config keys the generic PUT /organization/settings may not write.
+PROTECTED_CONFIG_KEYS = frozenset({"signup_policy", "entra_profile_sync", "google_profile_sync", "smtp"})
 
 
 class OrganizationSettingsService:
@@ -71,6 +78,22 @@ class OrganizationSettingsService:
                 changed = True
         return changed
 
+    @classmethod
+    def _repair_partial_feature(cls, config: dict, key: str, schema_feature) -> bool:
+        """A feature entry stored without its metadata (e.g. {'value': False},
+        written by a build that did not know the key yet) fails the response
+        model and makes every settings read and write 500. Rebuild it from the
+        schema default, keeping the org's own value/state."""
+        stored = config.get(key)
+        if not (isinstance(stored, dict) and not cls._is_feature_dict(stored)
+                and cls._is_feature_dict(schema_feature)):
+            return False
+        merged = {**schema_feature, **{k: v for k, v in stored.items() if k in ('value', 'state')}}
+        if 'value' in stored and 'state' not in stored:
+            merged.pop('state', None)  # let FeatureConfig derive state from the stored value
+        config[key] = FeatureConfig(**merged).dict()
+        return True
+
     async def _sync_new_features(self, db: AsyncSession, settings: OrganizationSettings):
         """Sync the stored config with the schema: add new features, refresh
         code-owned metadata on existing ones (so renames/description edits and
@@ -89,6 +112,8 @@ class OrganizationSettingsService:
                  current_config[key] = feature_or_value if not isinstance(feature_or_value, FeatureConfig) else feature_or_value.dict()
                  config_modified = True
              elif self._refresh_feature_metadata(current_config[key], feature_or_value):
+                 config_modified = True
+             elif self._repair_partial_feature(current_config, key, feature_or_value):
                  config_modified = True
 
         # Drop stored feature entries (never plain values or nested blocks like
@@ -141,6 +166,17 @@ class OrganizationSettingsService:
              flag_modified(settings, "config") # Mark as modified if initialized
 
         update_data = settings_data.dict(exclude_unset=True)
+
+        # Keys owned by dedicated endpoints with stricter gates / validation
+        # (signup policy needs full_admin_access, profile sync needs
+        # manage_identity_providers, SMTP encrypts its password). The generic
+        # writer only needs manage_settings, so it must never write them.
+        protected = sorted(set((update_data.get('config') or {})) & PROTECTED_CONFIG_KEYS)
+        if protected:
+            raise HTTPException(
+                status_code=403,
+                detail=f"These settings must be changed through their dedicated endpoints: {', '.join(protected)}",
+            )
 
         if 'config' in update_data and update_data['config']:
             # Use dict() to ensure we have a mutable copy
@@ -379,6 +415,33 @@ class OrganizationSettingsService:
                 await db.commit()
                 await db.refresh(settings)
 
+                # Agent check-ins turned off: remove every pending checkin:* job
+                # for the org right away and mark those rows cancelled:disabled,
+                # so no dormant job is left behind.
+                if 'enable_agent_checkins' in update_data['config']:
+                    try:
+                        from app.services.checkin_policy import feature_enabled
+                        if not feature_enabled(settings):
+                            from app.services.checkin_service import checkin_service
+                            await checkin_service.cancel_all_for_org(db, str(organization.id))
+                    except Exception:
+                        logger.warning("Failed to cancel pending check-ins on settings-off", exc_info=True)
+
+                # Overnight learning turned off: cancel queued dream runs for
+                # the org right away (running ones re-check the setting before
+                # every write and stop there).
+                if any(k in update_data['config'] for k in ('enable_agent_dreaming', 'enable_user_memory')):
+                    try:
+                        from app.services.dreams import common as dream_common
+                        from app.services.dreams.runtime import dream_runtime
+                        from app.models.dream_run import KIND_AGENT, KIND_USER
+                        if not dream_common.agent_dreaming_enabled(settings):
+                            await dream_runtime.cancel_queued_for_org(db, str(organization.id), KIND_AGENT)
+                        if not dream_common.user_dreaming_enabled(settings):
+                            await dream_runtime.cancel_queued_for_org(db, str(organization.id), KIND_USER)
+                    except Exception:
+                        logger.warning("Failed to cancel queued dream runs on settings-off", exc_info=True)
+
                 # Drop the cached PII redactor so a toggle/rule change takes
                 # effect immediately instead of waiting out the loader TTL.
                 if pii_changed:
@@ -478,6 +541,8 @@ class OrganizationSettingsService:
             buf = BytesIO()
             image.save(buf, format="PNG")
             f.write(buf.getvalue())
+        from app.services import storage
+        await storage.apersist(file_path, "image/png")
 
         # update settings
         general = dict(settings.config.get("general", {}))
@@ -526,6 +591,8 @@ class OrganizationSettingsService:
                     os.remove(file_path)
                 except Exception:
                     pass
+            from app.services import storage
+            await storage.adiscard(file_path)
         general["icon_key"] = None
         general["icon_url"] = None
         settings.config["general"] = general
@@ -945,10 +1012,26 @@ class OrganizationSettingsService:
         return result
 
     async def get_smtp(self, db: AsyncSession, organization: Organization, current_user: User):
-        """Return the org's SMTP server config (password redacted)."""
+        """Return the org's SMTP server config (password redacted).
+
+        Includes ``active_source`` — the transport system mail is *actually*
+        using — resolved through the same code path that sends it, so the page
+        cannot claim one thing while the mailer does another.
+        """
         from app.schemas.organization_settings_schema import OrgSmtpSchema
+        from app.services.email_client_resolver import (
+            global_smtp_configured,
+            resolve_outbound,
+        )
+
         settings = await self.get_settings(db, organization, current_user)
         raw = (settings.config or {}).get("smtp") or {}
+        try:
+            active_source = (
+                await resolve_outbound(db, str(organization.id), purpose="system")
+            ).source
+        except Exception:  # noqa: BLE001 — a readout must never break the page
+            active_source = "none"
         return OrgSmtpSchema(
             enabled=bool(raw.get("enabled", False)),
             host=raw.get("host"),
@@ -959,6 +1042,8 @@ class OrganizationSettingsService:
             from_address=raw.get("from_address"),
             from_name=raw.get("from_name"),
             validate_certs=bool(raw.get("validate_certs", True)),
+            active_source=active_source,
+            global_configured=global_smtp_configured(),
         )
 
     async def update_smtp(self, db: AsyncSession, organization: Organization, current_user: User, data):
@@ -987,8 +1072,18 @@ class OrganizationSettingsService:
         if data.password:
             smtp["password_enc"] = encrypt_secret(data.password)
 
-        if smtp["enabled"] and not smtp["host"]:
-            raise HTTPException(status_code=400, detail="SMTP host is required when enabled")
+        if smtp["enabled"]:
+            if not smtp["host"]:
+                raise HTTPException(status_code=400, detail="SMTP host is required when enabled")
+            # Every relay rejects a message with no envelope sender, and
+            # build_email refuses to construct one — so an enabled server with
+            # no From address is guaranteed to fail at send time. Catch it here
+            # instead of at 3am in a scheduled report.
+            if not (smtp["from_address"] or smtp["username"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="A From address is required when a custom SMTP server is enabled",
+                )
 
         current_config["smtp"] = smtp
         settings.config = current_config
@@ -1010,38 +1105,129 @@ class OrganizationSettingsService:
 
         return await self.get_smtp(db, organization, current_user)
 
-    async def test_smtp(self, db: AsyncSession, organization: Organization, current_user: User) -> dict:
-        """Probe the org's saved SMTP server (connect + auth, no send)."""
-        from app.services.email_client_resolver import get_org_smtp
-        from app.services.email.sender import SmtpConfig, _tls_context
-        import aiosmtplib
+    # A *delivered* test costs the org a message and lands in someone's inbox, so
+    # successful sends are throttled. A rejected one delivers nothing, and an
+    # admin fixing a password should not be made to wait between attempts — so
+    # only success starts the clock. Keyed per org, in-process: a courtesy
+    # throttle against inbox spam, not a security control.
+    _SMTP_TEST_COOLDOWN_SECONDS = 10
+    _smtp_test_last_send: dict = {}
 
-        smtp = await get_org_smtp(db, organization.id)
-        if not (smtp and smtp.get("host")):
-            return {"success": False, "smtp": "no SMTP host configured"}
-        cfg = SmtpConfig(
-            host=smtp["host"], port=int(smtp.get("port") or 587),
-            username=smtp.get("username"), password=smtp.get("password"),
-            security=smtp.get("security") or "starttls",
-            validate_certs=bool(smtp.get("validate_certs", True)),
-        ).resolved()
-        try:
-            kwargs = dict(
-                hostname=cfg.host, port=cfg.port,
-                use_tls=(cfg.security == "ssl"),
-                start_tls=(cfg.security == "starttls"), timeout=15,
+    async def test_smtp(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        data=None,
+    ) -> dict:
+        """Send a real test email through the org's configured transport.
+
+        This deliberately *sends* rather than probing connect+auth. A probe
+        cannot see the failures that actually bite — a relay that refuses the
+        envelope sender, one that declines to relay to the recipient, a missing
+        From address — so a connect-only check reports "Connection OK" for
+        configurations that never deliver a single message.
+
+        It runs the production path (``resolve_outbound`` → ``build_email`` →
+        ``send_message``), not a parallel implementation, so whatever it proves
+        is true of real mail. It also reports *which* transport carried the
+        message, which is the only way to notice that mail an admin believes is
+        going through their relay is really going out via bow-config.
+        """
+        import time
+
+        from app.services.email.sender import STAGE_CONFIG
+        from app.services.email_client_resolver import resolve_outbound
+        from app.services.notification_service import notification_service
+
+        own_address = (current_user.email or "").strip()
+        recipient = (getattr(data, "to", None) or "").strip() or own_address
+        if not recipient:
+            return {
+                "success": False, "source": "none", "stage": STAGE_CONFIG,
+                "error": "your account has no email address to send the test to",
+            }
+        # Only the caller's own address: this endpoint sends real mail through
+        # the org's relay, and an arbitrary recipient would make it a spam relay
+        # for anyone holding manage_settings.
+        if recipient.lower() != own_address.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="The test email can only be sent to your own address",
             )
-            tls_context = _tls_context(cfg)
-            if tls_context is not None:
-                kwargs["tls_context"] = tls_context
-            client = aiosmtplib.SMTP(**kwargs)
-            await client.connect()
-            if cfg.username and cfg.password:
-                await client.login(cfg.username, cfg.password)
-            await client.quit()
-            return {"success": True, "smtp": "ok"}
-        except Exception as e:
-            return {"success": False, "smtp": f"failed: {e}"}
+
+        org_key = str(organization.id)
+        last = self._smtp_test_last_send.get(org_key)
+        if last is not None:
+            elapsed = time.monotonic() - last
+            if elapsed < self._SMTP_TEST_COOLDOWN_SECONDS:
+                wait = int(self._SMTP_TEST_COOLDOWN_SECONDS - elapsed) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Please wait {wait}s before sending another test email",
+                )
+
+        resolved = await resolve_outbound(db, org_key, purpose="system")
+        if resolved.source == "none":
+            return {
+                "success": False, "source": "none", "stage": STAGE_CONFIG,
+                "error": "no SMTP server is configured for this organization",
+            }
+
+        transport = {
+            "org_smtp": "this organization's own SMTP server",
+            "global": "the globally configured SMTP server",
+        }.get(resolved.source, resolved.source)
+        subject = "Bag of words — SMTP test"
+        body = (
+            f"This is a test message from Bag of words, sent to confirm that "
+            f"{organization.name or 'your organization'}'s system email is working.\n\n"
+            f"Sent via: {transport}\n"
+            f"From: {resolved.from_address}\n\n"
+            f"If you received this, invites, report shares and scheduled report "
+            f"results will be delivered the same way."
+        )
+
+        result = await notification_service.send_custom_email(
+            recipients=[recipient],
+            subject=subject,
+            body=body,
+            subtype="plain",
+            timeout=25,
+            db=db,
+            organization_id=org_key,
+            purpose="system",
+        )
+
+        if result.status == "sent":
+            now = time.monotonic()
+            # Drop expired entries as we go, so a long-lived process serving many
+            # organizations does not accumulate one dict entry per org forever.
+            for key, stamp in list(self._smtp_test_last_send.items()):
+                if now - stamp >= self._SMTP_TEST_COOLDOWN_SECONDS:
+                    self._smtp_test_last_send.pop(key, None)
+            self._smtp_test_last_send[org_key] = now
+
+        try:
+            await audit_service.log(
+                db=db, organization_id=org_key,
+                action="settings.org_smtp_tested", user_id=str(current_user.id),
+                resource_type="organization_settings", resource_id=org_key,
+                details={"source": result.source, "status": result.status},
+            )
+        except Exception:
+            pass
+
+        return {
+            "success": result.status == "sent",
+            "source": result.source,
+            "stage": result.stage,
+            "recipient": recipient,
+            "from_address": resolved.from_address,
+            "error": result.error,
+            # Kept for older clients that read the flat "smtp" string.
+            "smtp": "ok" if result.status == "sent" else (result.error or "failed"),
+        }
 
     async def get_locale(
         self,
@@ -1113,6 +1299,55 @@ class OrganizationSettingsService:
             "enabled_locales": list(i18n.enabled_locales),
             "effective_locale": new_locale or i18n.default_locale,
         }
+
+    async def get_connection_alerts(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Whether this org sends 'connection is down/back' alert emails.
+
+        The in-app inbox notification is always delivered; this governs only
+        the email nudge layered on top. Default off — an admin opts in."""
+        from app.services.connection_alerts import EMAIL_ENABLED_KEY
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get(EMAIL_ENABLED_KEY)
+        return {"email_enabled": False if raw is None else bool(raw)}
+
+    async def update_connection_alerts(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        email_enabled: bool,
+    ) -> dict:
+        """Turn connection-alert emails on/off for the whole org."""
+        from app.services.connection_alerts import EMAIL_ENABLED_KEY
+        value = bool(email_enabled)
+        settings = await self.get_settings(db, organization, current_user)
+        current_config = dict(settings.config or {})
+        if current_config.get(EMAIL_ENABLED_KEY) != value:
+            current_config[EMAIL_ENABLED_KEY] = value
+            settings.config = current_config
+            settings.updated_at = datetime.utcnow()
+            flag_modified(settings, "config")
+            db.add(settings)
+            await db.commit()
+            await db.refresh(settings)
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="settings.connection_alerts_updated",
+                    user_id=str(current_user.id),
+                    resource_type="organization_settings",
+                    resource_id=str(settings.id),
+                    details={"email_enabled": value},
+                )
+            except Exception:
+                pass
+        return {"email_enabled": value}
 
     async def get_timezone(
         self,
@@ -1218,7 +1453,7 @@ class OrganizationSettingsService:
         new_week_start: str | None
         if week_start in (None, "", "auto"):
             new_week_start = None
-        elif week_start.lower() in self._WEEK_START_OPTIONS:
+        elif isinstance(week_start, str) and week_start.lower() in self._WEEK_START_OPTIONS:
             new_week_start = week_start.lower()
         else:
             raise HTTPException(

@@ -1,3 +1,4 @@
+from app.data_sources.clients.progress import discovery_progress, discovery_items, discovery_phase, IndexingCancelled
 from app.data_sources.clients.base import DataSourceClient
 
 import pandas as pd
@@ -6,6 +7,17 @@ from typing import List, Generator
 from app.ai.prompt_formatters import Table, TableColumn
 from app.ai.prompt_formatters import TableFormatter
 from contextlib import contextmanager
+
+
+def _clickhouse_extraction_source(client):
+    """Materialize through clickhouse-connect, not SQLAlchemy.
+
+    EXPLAIN ESTIMATE for the pre-flight check, Arrow streaming into the
+    artifact, and KILL QUERY on early stop. See fast/clickhouse_source.py.
+    """
+    from app.data_sources.fast.clickhouse_source import ClickHouseSource
+
+    return ClickHouseSource(client)
 
 
 class ClickhouseClient(DataSourceClient):
@@ -45,7 +57,26 @@ class ClickhouseClient(DataSourceClient):
         # Only include database if provided; otherwise let server default apply
         if self._primary_database:
             client_kwargs["database"] = self._primary_database
-        self.client = clickhouse_connect.get_client(**client_kwargs)
+        self._client_kwargs = client_kwargs
+        self._client = None
+
+    @property
+    def client(self):
+        """The clickhouse-connect client, built on first use.
+
+        `get_client` is not free: it runs three round-trips (version, settings,
+        a probe) the moment it is called. Agents build a client for every
+        connection on every turn, including turns answered entirely from a
+        custom table's local copy — and on ClickHouse Cloud any query, however
+        small, wakes an idle service and bills compute. Deferring it means a
+        turn that never queries the source never touches it.
+        """
+        if self._client is None:
+            self._client = clickhouse_connect.get_client(**self._client_kwargs)
+        return self._client
+
+    # Resolved lazily by fast/sources.source_for.
+    EXTRACTION_SOURCE = staticmethod(_clickhouse_extraction_source)
 
     @contextmanager
     def connect(self) -> Generator[clickhouse_connect.driver.Client, None, None]:
@@ -71,11 +102,14 @@ class ClickhouseClient(DataSourceClient):
         """Get tables with graceful fallback if enriched query fails."""
         try:
             return self._get_tables_enriched()
+        except IndexingCancelled:
+            raise
         except Exception:
             return self._get_tables_basic()
 
     def _get_tables_enriched(self) -> List[Table]:
         """Get tables with column/table comments. May fail on some ClickHouse versions."""
+        discovery_phase('reading_columns')
         with self.connect() as conn:
             if self._databases:
                 quoted = ", ".join([f"'{d.replace("'", "''")}'" for d in self._databases])
@@ -103,7 +137,7 @@ class ClickhouseClient(DataSourceClient):
             result = conn.query(sql).result_rows
 
             tables = {}
-            for row in result:
+            for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                 database_name, table_name, column_name, data_type, col_comment, tbl_comment = row
                 fqn = f"{database_name}.{table_name}"
 
@@ -126,6 +160,7 @@ class ClickhouseClient(DataSourceClient):
 
     def _get_tables_basic(self) -> List[Table]:
         """Get tables without comments (original query - always works)."""
+        discovery_phase('metadata_fallback')
         try:
             with self.connect() as conn:
                 if self._databases:
@@ -150,7 +185,7 @@ class ClickhouseClient(DataSourceClient):
                 result = conn.query(sql).result_rows
 
                 tables = {}
-                for row in result:
+                for row in discovery_items(result, 'columns', label=lambda row: '.'.join(str(v) for v in row[:3])):
                     database_name, table_name, column_name, data_type = row
                     fqn = f"{database_name}.{table_name}"
 
@@ -161,7 +196,10 @@ class ClickhouseClient(DataSourceClient):
                         TableColumn(name=column_name, dtype=data_type))
 
                 return list(tables.values())
+        except IndexingCancelled:
+            raise
         except Exception as e:
+            self.mark_discovery_incomplete("SQL catalog")
             print(f"Error retrieving tables: {e}")
             return []
 
@@ -170,7 +208,8 @@ class ClickhouseClient(DataSourceClient):
         raise NotImplementedError(
             "get_schema() is obsolete. Use get_tables() instead.")
 
-    def get_schemas(self):
+    @discovery_progress
+    def get_schemas(self, progress_callback=None):
         """Get schemas for all tables in the specified database."""
         return self.get_tables()
 

@@ -4,13 +4,15 @@
       <VChart :key="chartKey" class="chart" :option="chartOptions" autoresize :loading="isLoading" :theme="colorMode.value === 'dark' ? 'dark' : undefined" />
     </div>
     <div v-else-if="isLoading" class="flex-1 flex items-center justify-center text-gray-500 dark:text-gray-400">Loading Chart...</div>
-    <div v-else-if="!(data?.rows?.length > 0)" class="flex-1 flex items-center justify-center text-gray-400">No data to display.</div>
-    <div v-else class="flex-1 flex items-center justify-center text-gray-400">Chart configuration error or unsupported type.</div>
+    <div v-else-if="!(data?.rows?.length > 0)" class="flex-1 flex items-center justify-center text-ink-muted">No data to display.</div>
+    <div v-else class="flex-1 flex items-center justify-center text-ink-muted">Chart configuration error or unsupported type.</div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { toRefs, ref, watch, computed } from 'vue'
+import { autoAxisLabels, resolveAxisLabels } from '~/utils/chartAxisLabels'
+import { toRefs, ref, watch, computed, inject } from 'vue'
+import { CHAT_VIZ_TEXT_PX, applyChatChartText } from '~/utils/chatVizText'
 const colorMode = useColorMode()
 import { useDashboardTheme } from '@/components/dashboard/composables/useDashboardTheme'
 import { use } from 'echarts/core'
@@ -37,12 +39,19 @@ const props = defineProps<{
 
 const { reportThemeName, reportOverrides } = toRefs(props)
 const { tokens } = useDashboardTheme(reportThemeName, reportOverrides, props.view || null)
+// Set only inside a conversation (widget preview); dashboards keep their sizes.
+const chatTextPx = inject(CHAT_VIZ_TEXT_PX, null)
 
 type EChartsOption = Record<string, any>
 
 const isLoading = ref(false)
 const chartOptions = ref<EChartsOption>({})
-const chartKey = ref(0)
+// Remount VChart only when the chart TYPE changes. Any other rebuild hands the
+// new option to the live instance (vue-echarts calls setOption), so the chart
+// updates in place instead of being destroyed and replaying its entry
+// animation — which is what made previews "refresh" several times on first
+// paint as the card's inputs settled.
+const chartKey = ref('')
 
 // Card-level wrapper style - default transparent with no border
 const wrapperStyle = computed(() => {
@@ -153,16 +162,27 @@ function resolveColorInput(input: any): any {
   return input
 }
 
-function getAxisLabelConfig(numCategories: number): { interval: number; rotate: number; hideOverlap: boolean } {
+// Tilted category labels are capped in length. With containLabel the grid
+// reserves room for the longest label, so one 60-character name tilted 45°
+// takes ~250px and squashes the plot into a sliver of a 340px chat card. The
+// full name stays in the tooltip.
+const ROTATED_LABEL_MAX_WIDTH = 110
+
+type AxisLabelConfig = { interval: number; rotate: number; hideOverlap: boolean; width?: number; overflow?: 'truncate' }
+
+function capRotatedLabel<T extends { rotate?: number }>(config: T): T & { width?: number; overflow?: 'truncate' } {
+  if (!config.rotate) return config
+  return { ...config, width: ROTATED_LABEL_MAX_WIDTH, overflow: 'truncate' }
+}
+
+function getAxisLabelConfig(numCategories: number): AxisLabelConfig {
+  return capRotatedLabel(baseAxisLabelConfig(numCategories))
+}
+
+function baseAxisLabelConfig(numCategories: number): AxisLabelConfig {
   // Check view.view (new v2 schema)
   const viewV2 = props.view?.view
-  if (viewV2?.axisX) {
-    return {
-      rotate: viewV2.axisX.rotate ?? 45,
-      interval: viewV2.axisX.interval ?? 0,
-      hideOverlap: true
-    }
-  }
+  if (viewV2?.axisX) return resolveAxisLabels(viewV2.axisX, numCategories)
   
   // Check legacy view settings
   const viewInterval = props.view?.xAxisLabelInterval
@@ -178,16 +198,7 @@ function getAxisLabelConfig(numCategories: number): { interval: number; rotate: 
     }
   }
   
-  // Default heuristics based on category count
-  if (numCategories > 50) return { interval: Math.max(1, Math.floor(numCategories / 20)), rotate: 45, hideOverlap: true }
-  if (numCategories > 25) return { interval: 1, rotate: 45, hideOverlap: true }
-  if (numCategories > 10) return { interval: 1, rotate: 45, hideOverlap: true }
-  if (numCategories > 5) return { interval: 0, rotate: 45, hideOverlap: true }
-  // Keep labels upright for a handful of categories, but still let ECharts drop
-  // any that would overlap — otherwise long category names (or a narrow/mobile
-  // chart) render on top of each other. On a wide desktop chart they all fit, so
-  // nothing is hidden and the appearance is unchanged.
-  return { interval: 0, rotate: 0, hideOverlap: true }
+  return autoAxisLabels(numCategories)
 }
 
 function hexToRGBA(hex: string, alpha: number): string {
@@ -300,7 +311,7 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
   if (!categoryKey) return {}
   
   const categories = Array.from(new Set(rows.map((r: any) => String(r[categoryKey] ?? ''))))
-  const { interval, rotate, hideOverlap } = getAxisLabelConfig(categories.length)
+  const xLabelConfig = getAxisLabelConfig(categories.length)
   const colors = getColors()
   const axisColors = { ...(tokens.value?.axis || {}), ...((props.view?.style as any)?.axis || {}) }
   const xVisible = props.view?.xAxisVisible ?? viewV2?.axisX?.show ?? true
@@ -444,7 +455,7 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
     show: xVisible,
     axisLabel: isHorizontal
       ? { interval: 0, rotate: 0, hideOverlap: false, color: axisColors.yLabelColor }
-      : { interval, rotate, hideOverlap, color: axisColors.xLabelColor },
+      : { ...xLabelConfig, color: axisColors.xLabelColor },
     axisLine: { lineStyle: { color: isHorizontal ? axisColors.yLineColor : axisColors.xLineColor } },
     splitLine: { show: false }
   }
@@ -646,11 +657,11 @@ function buildHeatmapOptions(rows: any[], dm: any): EChartsOption {
       data: xCats,
       show: xVisible,
       name: xAxisConfig?.label || undefined,
-      axisLabel: {
+      axisLabel: capRotatedLabel({
         interval: xAxisConfig?.interval ?? defaultInterval,
         rotate: xAxisConfig?.rotate ?? defaultRotate,
         hideOverlap
-      }
+      })
     },
     yAxis: {
       type: 'category',
@@ -930,11 +941,11 @@ function buildOptions() {
   const rows = normalizeRows(props.data?.rows)
   if (!dm || (!rows.length && normalizeType((props.view?.view?.type || props.view as any)?.type || dm.type) !== 'table')) {
     isLoading.value = false
-    chartKey.value++
     return
   }
   
   const t = normalizeType(props.view?.view?.type || (props.view as any)?.type || dm.type)
+  chartKey.value = t
   const base = getBaseOptions()
   let specific: EChartsOption = {}
   
@@ -950,6 +961,7 @@ function buildOptions() {
     
     chartOptions.value = { ...base, ...specific }
     const merged = chartOptions.value as any
+    if (chatTextPx?.value) applyChatChartText(merged, chatTextPx.value)
     if (typeof merged.tooltip?.formatter === 'function') {
       const original = merged.tooltip.formatter
       merged.tooltip.formatter = (params: any, ...rest: any[]) => {
@@ -960,11 +972,35 @@ function buildOptions() {
     chartOptions.value = { title: { text: 'Error Building Chart' } }
   } finally {
     isLoading.value = false
-    chartKey.value++
   }
 }
 
-watch(() => [props.step?.id, props.data?.rows, props.data_model, props.view, tokens.value], () => {
+// Everything buildOptions reads, serialized. The deep watcher below fires
+// whenever any traversed dependency is touched — including a parent handing
+// down a fresh-but-identical object (a re-wrapped view, a reloaded payload,
+// a re-applied report theme). Comparing content lets those through as no-ops
+// so only a real change rebuilds the chart.
+let lastInputSignature: string | null = null
+function inputSignature(): string | null {
+  try {
+    return JSON.stringify([
+      props.step?.id ?? null,
+      props.data?.rows ?? null,
+      props.data?.columns ?? null,
+      props.data_model ?? null,
+      props.view ?? null,
+      tokens.value ?? null,
+      chatTextPx?.value ?? null,
+    ])
+  } catch {
+    return null // not serializable — always rebuild
+  }
+}
+
+watch(() => [props.step?.id, props.data?.rows, props.data?.columns, props.data_model, props.view, tokens.value, chatTextPx?.value], () => {
+  const signature = inputSignature()
+  if (signature !== null && signature === lastInputSignature) return
+  lastInputSignature = signature
   buildOptions()
 }, { deep: true, immediate: true })
 </script>

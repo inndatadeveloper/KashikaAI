@@ -7,7 +7,10 @@
         role="img"
         aria-hidden="true"
     >{{ parsedIcon.value }}</span>
+    <img v-else-if="effectiveType === 'bow'" src="/assets/logo-128.png" :class="computedClass" class="w-auto object-contain" alt="" />
     <UIcon v-else-if="effectiveType === 'custom_api'" name="heroicons-cog-6-tooth" :class="[computedClass, 'text-gray-500 dark:text-gray-400']" />
+    <UIcon v-else-if="effectiveType === 'remote_ssh'" name="heroicons-command-line" :class="[computedClass, 'text-ink-muted']" />
+    <UIcon v-else-if="effectiveType === 'remote_smb'" name="heroicons-folder-open" :class="[computedClass, 'text-ink-muted']" />
     <img v-else :src="imgSrc" :class="computedClass" class="w-auto" alt="" @error="handleError" />
 </template>
 
@@ -16,7 +19,9 @@ import { computed, ref, watch } from 'vue';
 
 // Props to accept the type of data source and class
 const props = defineProps<{
-    type: string | null | undefined;
+    // Connection-level inputs: use these to draw ONE CONNECTION (a catalog tile,
+    // a connection row, a table's source) where there is no agent to resolve.
+    type?: string | null;
     // Optional catalog key for a known connector (e.g. "notion", "monday"). When
     // set, the provider's brand icon is preferred over the generic type icon.
     connectorKey?: string | null;
@@ -24,14 +29,23 @@ const props = defineProps<{
     // "preset:<key>"). When it resolves to an emoji it wins over everything
     // else; otherwise the default type/connector logic below applies.
     icon?: string | null;
+    // AGENT-LEVEL input, and the one to prefer wherever the payload carries it:
+    // the backend's already-resolved `icon_token`. It supersedes
+    // type/connectorKey/icon, so every surface showing a given agent shows the
+    // same icon instead of each deriving one from a different pair of fields
+    // (see backend/app/schemas/agent_icon.py).
+    iconToken?: string | null;
     class?: string;
 }>();
 
 const FALLBACK_ICON = '/data_sources_icons/document.png'
 
-// Parse the custom icon override. Unrecognised/future tokens resolve to 'none'
-// and fall through to the default type icon, so nothing ever renders broken.
-const parsedIcon = computed(() => parseAgentIcon(props.icon))
+// The resolved agent token when the call site has one, else the raw override.
+// Both use the same vocabulary, so one parser covers them. Unrecognised/future
+// tokens resolve to 'none' and fall through to the default type icon, so nothing
+// ever renders broken.
+const activeToken = computed(() => props.iconToken || props.icon)
+const parsedIcon = computed(() => parseAgentIcon(activeToken.value))
 
 // A "type:<key>" override pins one of the agent's connection type/connector
 // icons. We feed the key into BOTH the connector-brand and the type-asset
@@ -59,6 +73,7 @@ const normalizeType = (raw: string) => {
     if (t === 'qlik_sense' || t === 'qlik_sense_onprem') t = 'qlik'
     if (t === 'hana' || t === 'saphana') t = 'sap_hana'
     if (t === 'datasphere') t = 'sap_datasphere'
+    if (t === 'sccm' || t === 'configmgr' || t === 'memcm') t = 'mecm'
     // SAP BusinessObjects and BW reuse the generic SAP logo (sap_datasphere.png).
     if (t === 'businessobjects' || t === 'business_objects' || t === 'bobj' || t === 'sap_bo') t = 'sap_datasphere'
     if (t === 'sap_bw' || t === 'bw' || t === 'sap_bw_xmla' || t === 'bw4hana') t = 'sap_datasphere'
@@ -70,15 +85,19 @@ const normalizeType = (raw: string) => {
 // assets live under /data_sources_icons with mixed extensions, and the catalog
 // key isn't always the filename (e.g. atlassian → jira).
 const CONNECTOR_ICON_FILE: Record<string, string> = {
+    netapp_ontap: 'netapp_ontap.png',
     monday: 'monday.svg',
     notion: 'notion.png',
     atlassian: 'jira.png',
     linear: 'linear.png',
     sentry: 'sentry.png',
     github: 'github.svg',
+    gitlab: 'gitlab.svg',
+    bitbucket: 'bitbucket.svg',
     gmail: 'gmail.png',
     google_drive: 'google_drive.png',
     x: 'x.svg',
+    hubspot: 'hubspot.png',
 };
 
 // Computed property to generate the icon path
@@ -97,11 +116,19 @@ const iconPath = computed(() => {
     // Explicit brand icons for data-source types whose asset is an SVG (the
     // default resolver below only tries `<type>.png`).
     const TYPE_ICON_FILE: Record<string, string> = {
+        brocade: 'brocade.png',
         csv: 'csv.png',
         gmail_mail: 'gmail.png',
         outlook_mail: 'outlook_mail.svg',
+        intune: 'intune.png',
         elasticsearch: 'elasticsearch.svg',
         s3: 's3.svg',
+        azure_cost: 'azure_cost.svg',
+        vcenter: 'vcenter.svg',
+        // Code connections reuse the provider brand assets.
+        github_repo: 'github.svg',
+        gitlab_repo: 'gitlab.svg',
+        bitbucket_repo: 'bitbucket.svg',
         // Same brand asset as the monday MCP preset (CONNECTOR_ICON_FILE above).
         monday: 'monday.svg',
     };

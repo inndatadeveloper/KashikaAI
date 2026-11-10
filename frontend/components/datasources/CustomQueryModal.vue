@@ -5,7 +5,7 @@
       <div class="flex items-start justify-between mb-3">
         <div>
           <h2 class="text-lg font-semibold dark:text-white">
-            {{ editing ? 'Edit custom query' : 'New custom query' }}
+            {{ editing ? 'Edit custom table' : 'New custom table' }}
           </h2>
           <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
             Runs on a schedule and is stored locally, so agents answer from a
@@ -13,7 +13,7 @@
             <span class="font-medium">{{ activeConnectionName }}</span> every time.
           </p>
         </div>
-        <button class="text-gray-400 hover:text-gray-600" @click="close">
+        <button class="text-ink-muted hover:text-gray-600" @click="close">
           <UIcon name="heroicons-x-mark" class="w-5 h-5" />
         </button>
       </div>
@@ -46,20 +46,21 @@
                is that a row policy filters on the query's result columns and
                those are only known once it has been saved. -->
           <span v-if="t.disabled && t.hint"
-                class="ms-1 text-[9px] px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-400">{{ t.hint }}</span>
+                class="ms-1 text-2xs px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-ink-muted">{{ t.hint }}</span>
         </button>
       </div>
 
       <!-- ============ QUERY ============ -->
       <div v-show="tab === 'query'">
         <!-- Connection picker. An agent can have several; the query runs against
-             exactly one, and the SQL below is written in that source's dialect. -->
+             exactly one, and the query below is written in that source's dialect
+             (SQL, or DAX on Power BI). -->
         <div class="mb-3">
           <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Connection</label>
           <div v-if="editing" class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
             <DataSourceIcon :type="activeConnectionType" class="h-3.5" />
             <span class="font-medium">{{ activeConnectionName }}</span>
-            <span class="text-[11px] text-gray-400">
+            <span class="text-2xs text-ink-muted">
               — fixed after creation; create a new query to use a different connection
             </span>
           </div>
@@ -75,19 +76,47 @@
               <span class="flex items-center gap-2 min-w-0">
                 <DataSourceIcon :type="activeConnectionType" class="h-3.5 flex-shrink-0" />
                 <span class="truncate">{{ activeConnectionName }}</span>
-                <span v-if="activeConnectionType" class="text-[11px] text-gray-400">{{ activeConnectionType }}</span>
+                <span v-if="activeConnectionType" class="text-2xs text-ink-muted">{{ activeConnectionType }}</span>
               </span>
             </template>
             <template #option="{ option }">
               <span class="flex items-center gap-2 min-w-0">
                 <DataSourceIcon :type="option.type" class="h-3.5 flex-shrink-0" />
                 <span class="truncate">{{ option.name }}</span>
-                <span class="text-[11px] text-gray-400">{{ option.type }}</span>
+                <span class="text-2xs text-ink-muted">{{ option.type }}</span>
               </span>
             </template>
           </USelectMenu>
-          <p v-if="!editing && availableConnections.length > 1" class="text-[10px] text-gray-400 mt-1">
-            Switching connections clears the preview — the SQL is dialect- and schema-specific.
+          <p v-if="!editing && availableConnections.length > 1" class="text-2xs text-ink-muted mt-1">
+            Switching connections clears the preview — the query is dialect- and schema-specific.
+          </p>
+        </div>
+
+        <!-- Power BI is addressed per semantic model, and a DAX text only names
+             tables. Detection from those names is the default; the picker is
+             for the case where the same table name lives in two models, or the
+             catalog has not been indexed yet. -->
+        <div v-if="isDax" class="mb-3" data-testid="cq-target-row">
+          <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Semantic model</label>
+          <select
+            v-model="targetDatasetId" data-testid="cq-target"
+            class="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md px-2.5 py-1.5 dark:bg-gray-900 dark:text-white"
+          >
+            <option value="">Detect from the tables the DAX references</option>
+            <option v-for="t in targets" :key="t.datasetId" :value="t.datasetId">
+              {{ t.datasetName }}{{ t.workspaceName ? ` (${t.workspaceName})` : '' }} — {{ t.tables.length }} table{{ t.tables.length === 1 ? '' : 's' }}
+            </option>
+          </select>
+          <p class="text-2xs text-ink-muted mt-1">
+            <template v-if="currentTarget">
+              Tables in this model: {{ currentTarget.tables.slice(0, 12).join(', ') }}{{ currentTarget.tables.length > 12 ? ', …' : '' }}
+            </template>
+            <template v-else-if="targets.length">
+              Table names in the DAX must match the model's; quote names with spaces, e.g. 'Order Details'.
+            </template>
+            <template v-else>
+              No semantic models in the catalog yet — index the connection first, or the DAX cannot be routed to a model.
+            </template>
           </p>
         </div>
 
@@ -99,10 +128,10 @@
               placeholder="revenue_summary"
               class="w-full text-sm border border-gray-300 dark:border-gray-700 rounded-md px-2.5 py-1.5 dark:bg-gray-900 dark:text-white font-mono"
             />
-            <p class="text-[10px] text-gray-400 mt-1">Agents query this as a table name.</p>
+            <p class="text-2xs text-ink-muted mt-1">Agents query this as a table name.</p>
           </div>
           <div class="col-span-2">
-            <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Description <span class="text-gray-400">(optional)</span></label>
+            <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Description <span class="text-ink-muted">(optional)</span></label>
             <input
               v-model="form.description" data-testid="cq-description"
               placeholder="What this data represents — shown to the agent"
@@ -112,12 +141,17 @@
         </div>
 
         <label class="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
-          SQL <span class="text-gray-400">— in {{ activeConnectionType }} dialect</span>
+          <template v-if="isDax">DAX <span class="text-ink-muted">— one EVALUATE against a Power BI semantic model</span></template>
+          <template v-else>SQL <span class="text-ink-muted">— in {{ activeConnectionType }} dialect</span></template>
         </label>
-        <textarea
-          v-model="form.definition_sql" data-testid="cq-sql" rows="8" spellcheck="false"
-          placeholder="SELECT ..."
-          class="w-full text-xs font-mono border border-gray-300 dark:border-gray-700 rounded-md px-2.5 py-2 dark:bg-gray-900 dark:text-white"
+        <SqlEditor
+          v-model="form.definition_sql"
+          :language="isDax ? 'dax' : (String(activeConnectionType).toLowerCase() === 'posthog' ? 'hogql' : 'sql')"
+          :connection-id="activeConnection?.id"
+          :min-height="120"
+          :max-height="360"
+          testid="cq-sql"
+          @run="runPreview"
         />
 
         <div class="flex items-center gap-2 mt-2">
@@ -131,7 +165,7 @@
             <UIcon v-else name="heroicons-play" class="w-3.5 h-3.5" />
             Run preview
           </button>
-          <span class="text-[11px] text-gray-400">Preview is limited to {{ ROW_LIMIT }} rows.</span>
+          <span class="text-2xs text-ink-muted">Preview is limited to {{ ROW_LIMIT }} rows.</span>
         </div>
 
         <!-- preview error -->
@@ -148,7 +182,7 @@
 
         <!-- preview result -->
         <div v-if="preview && preview.columns.length" class="mt-3">
-          <div class="flex items-center flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-600 dark:text-gray-400 mb-1.5">
+          <div class="flex items-center flex-wrap gap-x-4 gap-y-1 text-2xs text-gray-600 dark:text-gray-400 mb-1.5">
             <span data-testid="cq-preview-count">
               Showing <b>{{ preview.rows.length }}</b> of
               <b>{{ preview.estimated_rows != null ? approx(preview.estimated_rows) : 'unknown' }}</b> rows
@@ -165,7 +199,7 @@
             </span>
           </div>
           <div class="border border-gray-200 dark:border-gray-800 rounded-md overflow-auto" style="max-height: 260px">
-            <table class="min-w-full text-[11px]">
+            <table class="min-w-full text-2xs">
               <thead class="bg-gray-50 dark:bg-gray-900 sticky top-0">
                 <tr>
                   <th v-for="c in preview.columns" :key="c.name"
@@ -220,11 +254,11 @@
             :disabled="form.refresh_schedule_mode !== 'time'"
             class="text-sm border border-gray-300 dark:border-gray-700 rounded-md px-2 py-1.5 dark:bg-gray-900 dark:text-white disabled:opacity-40"
           />
-          <span class="text-[11px] text-gray-400">{{ localTimezoneLabel }}</span>
+          <span class="text-2xs text-ink-muted">{{ localTimezoneLabel }}</span>
         </div>
 
         <p v-if="preview?.scan_bytes" data-testid="cq-scan-projection"
-           class="mt-3 text-[11px] text-amber-700 dark:text-amber-400">
+           class="mt-3 text-2xs text-amber-700 dark:text-amber-400">
           At this schedule this query reads
           <b>{{ humanBytes(preview.scan_bytes * refreshesPerDay) }}</b> from the
           source per day ({{ humanBytes(preview.scan_bytes) }} × {{ refreshesPerDay }}).
@@ -254,7 +288,7 @@
           >
             <Spinner v-if="deleting" class="w-3.5 h-3.5" />
             <UIcon v-else name="heroicons-trash" class="w-3.5 h-3.5" />
-            Delete custom query
+            Delete custom table
           </button>
         </div>
       </div>
@@ -284,7 +318,7 @@
               <input data-testid="cq-rls-enabled" type="checkbox" v-model="rls.enabled" class="mt-0.5" />
               <span>
                 <span class="text-xs font-medium text-gray-700 dark:text-gray-200">Filter rows per user</span>
-                <span class="block text-[11px] text-gray-500 dark:text-gray-400">
+                <span class="block text-2xs text-gray-500 dark:text-gray-400">
                   The cached copy holds every row. With this on, each person sees
                   only the rows their identity allows.
                 </span>
@@ -293,7 +327,7 @@
 
             <template v-if="rls.enabled">
               <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">Filter on column</label>
+                <label class="block text-2xs text-gray-500 dark:text-gray-400 mb-1">Filter on column</label>
                 <select data-testid="cq-rls-column" v-model="rls.column"
                         class="w-full border border-gray-200 dark:border-gray-700 rounded-md px-2 py-1.5 text-xs bg-white dark:bg-gray-900">
                   <option value="">Choose a column…</option>
@@ -302,7 +336,7 @@
               </div>
 
               <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">Match against</label>
+                <label class="block text-2xs text-gray-500 dark:text-gray-400 mb-1">Match against</label>
                 <select data-testid="cq-rls-source" v-model="rls.source"
                         class="w-full border border-gray-200 dark:border-gray-700 rounded-md px-2 py-1.5 text-xs bg-white dark:bg-gray-900">
                   <option value="">Nothing — use grants only</option>
@@ -313,36 +347,36 @@
                   <option value="groups">Their groups</option>
                   <option value="roles">Their roles</option>
                 </select>
-                <p v-if="!rlsOptions.attribute_keys.length" class="text-[10px] text-gray-400 mt-1">
+                <p v-if="!rlsOptions.attribute_keys.length" class="text-2xs text-ink-muted mt-1">
                   No profile attributes have synced for this org yet.
                 </p>
               </div>
 
               <div>
                 <div class="flex items-center justify-between mb-1">
-                  <label class="text-[11px] text-gray-500 dark:text-gray-400">Grants</label>
-                  <button data-testid="cq-rls-add-grant" class="text-[11px] text-blue-600 hover:underline" @click="addGrant">
+                  <label class="text-2xs text-gray-500 dark:text-gray-400">Grants</label>
+                  <button data-testid="cq-rls-add-grant" class="text-2xs text-blue-600 hover:underline" @click="addGrant">
                     + Add grant
                   </button>
                 </div>
-                <p class="text-[10px] text-gray-400 mb-1.5">
+                <p class="text-2xs text-ink-muted mb-1.5">
                   Give a group or role extra values, or <code>*</code> to see everything.
                 </p>
                 <div v-for="(g, i) in rls.grants" :key="i" class="flex items-center gap-1.5 mb-1.5">
                   <select :data-testid="`cq-rls-grant-type-${i}`" v-model="g.principal_type"
-                          class="border border-gray-200 dark:border-gray-700 rounded-md px-1.5 py-1 text-[11px] bg-white dark:bg-gray-900">
+                          class="border border-gray-200 dark:border-gray-700 rounded-md px-1.5 py-1 text-2xs bg-white dark:bg-gray-900">
                     <option value="group">Group</option>
                     <option value="role">Role</option>
                     <option value="user">User</option>
                   </select>
                   <select :data-testid="`cq-rls-grant-principal-${i}`" v-model="g.principal_id"
-                          class="flex-1 min-w-0 border border-gray-200 dark:border-gray-700 rounded-md px-1.5 py-1 text-[11px] bg-white dark:bg-gray-900">
+                          class="flex-1 min-w-0 border border-gray-200 dark:border-gray-700 rounded-md px-1.5 py-1 text-2xs bg-white dark:bg-gray-900">
                     <option value="">Choose…</option>
                     <option v-for="p in principalsFor(g.principal_type)" :key="p.id" :value="p.id">{{ p.name }}</option>
                   </select>
                   <input :data-testid="`cq-rls-grant-values-${i}`" v-model="g.valuesText" placeholder="EMEA, APAC or *"
-                         class="flex-1 min-w-0 border border-gray-200 dark:border-gray-700 rounded-md px-1.5 py-1 text-[11px] bg-white dark:bg-gray-900" />
-                  <button :data-testid="`cq-rls-grant-remove-${i}`" class="text-gray-400 hover:text-red-600" @click="rls.grants.splice(i, 1)">
+                         class="flex-1 min-w-0 border border-gray-200 dark:border-gray-700 rounded-md px-1.5 py-1 text-2xs bg-white dark:bg-gray-900" />
+                  <button :data-testid="`cq-rls-grant-remove-${i}`" class="text-ink-muted hover:text-red-600" @click="rls.grants.splice(i, 1)">
                     <UIcon name="heroicons-x-mark" class="w-3.5 h-3.5" />
                   </button>
                 </div>
@@ -350,9 +384,9 @@
 
               <label class="flex items-start gap-2 cursor-pointer">
                 <input data-testid="cq-rls-default-deny" type="checkbox" v-model="rls.default_deny" class="mt-0.5" />
-                <span class="text-[11px] text-gray-600 dark:text-gray-300">
+                <span class="text-2xs text-gray-600 dark:text-gray-300">
                   Show no rows when the value can't be resolved
-                  <span class="block text-gray-400">
+                  <span class="block text-ink-muted">
                     Recommended. Turning this off shows <b>every</b> row to anyone the
                     policy can't place.
                   </span>
@@ -360,7 +394,7 @@
               </label>
             </template>
 
-            <p v-if="rlsError" data-testid="cq-rls-error" class="text-[11px] text-red-600">{{ rlsError }}</p>
+            <p v-if="rlsError" data-testid="cq-rls-error" class="text-2xs text-red-600">{{ rlsError }}</p>
             <button
               data-testid="cq-rls-save"
               class="border border-gray-300 dark:border-gray-700 rounded-md px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-800/50 disabled:opacity-50"
@@ -372,7 +406,7 @@
 
           <!-- Right: preview as a specific person -->
           <div class="w-1/2 border-l border-gray-100 dark:border-gray-800 pl-5">
-            <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">
+            <label class="block text-2xs text-gray-500 dark:text-gray-400 mb-1">
               Preview as
             </label>
             <div class="flex items-center gap-1.5">
@@ -389,15 +423,15 @@
                 Run
               </button>
             </div>
-            <p class="text-[10px] text-gray-400 mt-1">
+            <p class="text-2xs text-ink-muted mt-1">
               Uses the rule above, saved or not.
             </p>
 
-            <p v-if="rlsPreviewError" class="text-[11px] text-red-600 mt-2">{{ rlsPreviewError }}</p>
+            <p v-if="rlsPreviewError" class="text-2xs text-red-600 mt-2">{{ rlsPreviewError }}</p>
 
             <div v-if="rlsPreview" class="mt-3">
               <div data-testid="cq-rls-verdict"
-                   class="text-[11px] rounded-md px-2 py-1.5 mb-2"
+                   class="text-2xs rounded-md px-2 py-1.5 mb-2"
                    :class="rlsPreview.denied
                      ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300'
                      : rlsPreview.filtered
@@ -415,7 +449,7 @@
                 </template>
               </div>
               <div class="overflow-auto max-h-64 border border-gray-100 dark:border-gray-800 rounded-md">
-                <table class="min-w-full text-[11px]">
+                <table class="min-w-full text-2xs">
                   <thead class="bg-gray-50 dark:bg-gray-800/50 sticky top-0">
                     <tr>
                       <th v-for="c in rlsPreview.columns" :key="c.name"
@@ -428,7 +462,7 @@
                     </tr>
                     <tr v-if="!rlsPreview.rows.length">
                       <td :colspan="Math.max(rlsPreview.columns.length, 1)"
-                          class="px-2 py-3 text-center text-gray-400">No rows.</td>
+                          class="px-2 py-3 text-center text-ink-muted">No rows.</td>
                     </tr>
                   </tbody>
                 </table>
@@ -440,7 +474,7 @@
 
       <!-- Footer -->
       <div class="flex items-center justify-between mt-5 pt-4 border-t border-gray-100 dark:border-gray-800">
-        <div class="text-[11px] text-gray-400">
+        <div class="text-2xs text-ink-muted">
           <span v-if="!canSave && tab === 'query'">Run a preview before saving.</span>
         </div>
         <div class="flex items-center gap-2">
@@ -487,6 +521,10 @@ const props = defineProps<{
   connections?: Array<{ id: string; name: string; type?: string }>
   cq?: any | null
   activateForDatasourceId?: string
+  // Prefill for a NEW custom table, e.g. from a table's data preview. Ignored
+  // when editing (`cq` set).
+  initialSql?: string
+  initialName?: string
 }>()
 
 const emit = defineEmits<{
@@ -522,14 +560,39 @@ const activeConnectionType = computed(() => activeConnection.value?.type || prop
 const connectionOptions = computed(() =>
   availableConnections.value.map((c) => ({ id: c.id, name: c.name, type: c.type })))
 
-// The SQL is written in the source's dialect against its schema, so a preview
+// The query is written in the source's dialect against its schema, so a preview
 // taken on one connection says nothing about another — drop it on switch
 // rather than letting a stale result satisfy the save gate.
 watch(selectedConnectionId, (next, prev) => {
   if (!prev || next === prev) return
   preview.value = null
   previewError.value = ''
+  targetDatasetId.value = ''
+  loadTargets()
 })
+
+// ---------------------------------------------------------------------------
+// Targets (Power BI semantic models)
+// ---------------------------------------------------------------------------
+// A DAX custom table runs against one semantic model. The backend resolves it
+// from the tables the DAX references; this picker is the explicit override,
+// sent along with preview and save so both address the same model.
+const isDax = computed(() => (activeConnectionType.value || '').toLowerCase() === 'powerbi')
+const targets = ref<any[]>([])
+const targetDatasetId = ref('')
+const currentTarget = computed(() => targets.value.find((t) => t.datasetId === targetDatasetId.value) || null)
+function targetPayload() {
+  const t = currentTarget.value
+  return t ? { datasetId: t.datasetId, workspaceId: t.workspaceId, datasetName: t.datasetName } : null
+}
+async function loadTargets() {
+  targets.value = []
+  if (!isDax.value || !activeConnection.value?.id) return
+  try {
+    const { data, error } = await useMyFetch(`/connections/${activeConnection.value.id}/custom-queries/targets`, { method: 'GET' })
+    if (!error.value) targets.value = (data.value as any[]) || []
+  } catch { /* the picker simply stays empty; detection still works */ }
+}
 
 const tabs = computed(() => [
   { key: 'query', label: 'Query', disabled: false },
@@ -576,6 +639,8 @@ watch(() => props.modelValue, (open) => {
   rlsPreviewUserId.value = ''
   loadRlsFromCq()
   selectedConnectionId.value = props.cq?.connection_id || props.connectionId || (availableConnections.value[0]?.id || '')
+  targetDatasetId.value = props.cq?.target?.datasetId || ''
+  loadTargets()
   if (props.cq) {
     form.name = props.cq.name || ''
     form.description = props.cq.description || ''
@@ -587,9 +652,9 @@ watch(() => props.modelValue, (open) => {
     // preview gate does not apply until the SQL is changed.
     preview.value = { columns: props.cq.columns || [], rows: [], budget_error: null, estimated_rows: props.cq.no_rows }
   } else {
-    form.name = ''
+    form.name = props.initialName || ''
     form.description = ''
-    form.definition_sql = ''
+    form.definition_sql = props.initialSql || ''
     form.refresh_schedule_mode = 'interval'
     form.refresh_interval_minutes = 60
     form.refresh_at_time = '03:00'
@@ -761,13 +826,16 @@ function humanBytes(b: number) {
 }
 
 async function runPreview() {
+  // Also reached by the editor's Ctrl/⌘ + Enter, which the button's own
+  // disabled state does not guard.
+  if (previewing.value || !form.definition_sql.trim()) return
   previewing.value = true
   previewError.value = ''
   preview.value = null
   try {
     const { data, error } = await useMyFetch(
       `/connections/${activeConnection.value.id}/custom-queries/preview`,
-      { method: 'POST', body: { definition_sql: form.definition_sql } },
+      { method: 'POST', body: { definition_sql: form.definition_sql, target: targetPayload() } },
     )
     if (error.value) {
       previewError.value = error.value?.data?.detail || 'Query failed'
@@ -792,6 +860,11 @@ async function onSave() {
       refresh_interval_minutes: form.refresh_interval_minutes,
       refresh_at_time: form.refresh_schedule_mode === 'time' ? form.refresh_at_time : null,
     }
+    if (isDax.value) {
+      // Always sent on a DAX table: an empty object clears a previous pin
+      // (the update route treats an omitted field as "keep").
+      body.target = targetPayload() || {}
+    }
     if (!editing.value && props.activateForDatasourceId) {
       // Enabled on the agent it was created from; every other agent on the
       // connection gets it inactive, same as a regular table.
@@ -807,7 +880,7 @@ async function onSave() {
     }
     const saved: any = data.value
     toast.add({
-      title: editing.value ? 'Custom query updated' : 'Custom query cached',
+      title: editing.value ? 'Custom table updated' : 'Custom table cached',
       description: `${saved.name} — ${(saved.no_rows || 0).toLocaleString()} rows cached locally`,
       color: 'green',
     })
@@ -848,7 +921,7 @@ async function onDelete() {
       toast.add({ title: 'Delete failed', description: error.value?.data?.detail || 'Failed', color: 'red' })
       return
     }
-    toast.add({ title: 'Custom query deleted', color: 'green' })
+    toast.add({ title: 'Custom table deleted', color: 'green' })
     emit('deleted')
     close()
   } finally {

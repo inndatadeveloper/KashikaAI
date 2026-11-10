@@ -1,6 +1,7 @@
 """
 ContextHub - Main orchestrator for all agent context.
 """
+import asyncio
 import json
 import logging
 import time
@@ -65,7 +66,7 @@ from .builders.files_context_builder import FilesContextBuilder
 from .builders.message_context_builder import MessageContextBuilder
 from .builders.widget_context_builder import WidgetContextBuilder
 from .builders.query_context_builder import QueryContextBuilder
-from .builders.instruction_context_builder import InstructionContextBuilder
+from .builders.instruction_context_builder import InstructionContextBuilder, smart_instructions_on_demand
 from .builders.code_context_builder import CodeContextBuilder
 from .builders.resource_context_builder import ResourceContextBuilder
 from .builders.observation_context_builder import ObservationContextBuilder
@@ -286,19 +287,43 @@ class ContextHub:
         head_completion=None,
         widget=None,
         organization_settings=None,
-        build_id: Optional[str] = None
+        build_id: Optional[str] = None,
+        mode: Optional[str] = None,
     ):
         self.db = db
+        # Guards `self.db` across the context builders. Every builder here is
+        # constructed with this one AsyncSession, and an AsyncSession is not
+        # safe for concurrent use — see `_run_builders`.
+        self._db_lock = asyncio.Lock()
         self.organization = organization
         self.organization_settings = organization_settings
         self.data_sources = data_sources
         self.report = report
+        self.mode = mode if mode is not None else getattr(report, "mode", None)
+        # The connected application this conversation came through: the
+        # report's stamp (so follow-ups and background runs keep it), else the
+        # app the current request came through (MCP tools without a report).
+        self.application_id = getattr(report, "origin_app_id", None) if report is not None else None
+        if not self.application_id:
+            from app.core.request_origin import current as _request_origin
+            _origin = _request_origin()
+            self.application_id = _origin[1] if _origin else None
         self.user = user
         self.head_completion = head_completion
         self.widget = widget
         self.prompt_content = head_completion.prompt if head_completion else ""
         # Build system: specific instruction build to use (None = main build)
         self.build_id = build_id
+        # Query the last prime_static() matched instructions against.
+        self.last_instruction_query = None
+        # Smart instructions the agent read (read_instruction) in this report,
+        # by id. Handed to tool-less consumers via InstructionsSection.read_items.
+        self.read_instruction_items = {}
+        self._prior_reads_loaded = False
+        # Whether the org runs smart instructions on demand (set from the built
+        # instructions section in prime_static). The read hand-off only runs
+        # when it's on; off keeps the previous behavior unchanged.
+        self.smart_on_demand = False
         
         # Initialize metadata
         self.metadata = ContextMetadata(
@@ -326,9 +351,10 @@ class ContextHub:
         # channel so per-instruction applicable_modes / applicable_channels
         # scoping can be honored. A null external_platform is the in-app web
         # chat, which we represent as the 'app' channel.
-        _mode = getattr(self.report, 'mode', None) if self.report else None
+        _mode = self.mode
         _external_platform = getattr(self.head_completion, 'external_platform', None) if self.head_completion else None
         _channel = _external_platform or 'app'
+        self.instruction_channel = _channel
         self.instruction_builder = InstructionContextBuilder(
             self.db,
             self.organization,
@@ -340,17 +366,18 @@ class ContextHub:
             data_source_ids=[str(ds.id) for ds in self.data_sources] if self.data_sources else None,
             mode=_mode,
             channel=_channel,
+            application_id=self.application_id,
         )
         self.code_builder = CodeContextBuilder(self.db, self.organization)
         self.resource_builder = ResourceContextBuilder(self.db, self.data_sources, self.organization, self.prompt_content)
-        self.files_builder = FilesContextBuilder(self.db, self.organization, self.report, head_completion=self.head_completion)
+        self.files_builder = FilesContextBuilder(self.db, self.organization, self.report, head_completion=self.head_completion, data_sources=self.data_sources)
         
         # New builders (port from agent.py)
-        self.schema_builder = SchemaContextBuilder(self.db, self.data_sources, self.organization, self.report, user=self.user, organization_settings=self.organization_settings)
+        self.schema_builder = SchemaContextBuilder(self.db, self.data_sources, self.organization, self.report, user=self.user, organization_settings=self.organization_settings, mode=self.mode)
         self.message_builder = MessageContextBuilder(self.db, self.organization, self.report, self.user)
         self.widget_builder = WidgetContextBuilder(self.db, self.organization, self.report)
         self.query_builder = QueryContextBuilder(self.db, self.organization, self.report)
-        self.mention_builder = MentionContextBuilder(self.db, self.organization, self.report, self.head_completion, user=self.user)
+        self.mention_builder = MentionContextBuilder(self.db, self.organization, self.report, self.head_completion, user=self.user, data_sources=self.data_sources)
         self.entity_builder = EntityContextBuilder(self.db, self.organization, self.report, user=self.user)
         
         # Observation context builder (tracks tool execution results)
@@ -634,6 +661,7 @@ class ContextHub:
         )
         # Cache
         self._static_cache["schemas"] = schemas_obj or self._static_cache.get("schemas")
+        self._apply_mcp_catalog()
         self._static_cache["files"] = files_obj or self._static_cache.get("files")
         return snapshot
 
@@ -686,10 +714,108 @@ class ContextHub:
             ids = []
         return ids or None
 
+    def set_mcp_catalog(self, available, *, gateway: bool = False) -> bool:
+        """Make <mcp_tools> show exactly the MCP tools the run registered.
+
+        ``available``: {(connection_id, tool_name): {"deferred", "policy"}}
+        from the run's tool catalog. Tools not in it are dropped (disabled or
+        denied under the strictest setting, or MCP not offered at all), and
+        the rest take its deferred flag and policy, so the prompt never
+        lists a tool the run cannot call. ``None`` leaves the tools as built.
+        ``gateway``: the catalog could not be built and the run calls MCP
+        tools through execute_mcp, so the block says so and inlines schemas.
+        Re-applied whenever schemas are rebuilt. Returns True when the
+        rendered block changes.
+        """
+        before = self._mcp_render_state()
+        self._mcp_available = available
+        self._mcp_gateway = bool(gateway)
+        self._apply_mcp_catalog()
+        return self._mcp_render_state() != before
+
+    def _mcp_sections(self):
+        schemas = self._static_cache.get("schemas")
+        return [ds for ds in (getattr(schemas, "data_sources", None) or []) if hasattr(ds, "mcp_tools")]
+
+    def _mcp_render_state(self):
+        return [
+            (getattr(ds, "native_mcp", True),
+             [(str(t.connection_id), str(t.name), bool(getattr(t, "deferred", False)), getattr(t, "policy", None))
+              for t in (ds.mcp_tools or [])])
+            for ds in self._mcp_sections()
+        ]
+
+    def _apply_mcp_catalog(self) -> None:
+        available = getattr(self, "_mcp_available", None)
+        gateway = getattr(self, "_mcp_gateway", False)
+        for ds in self._mcp_sections():
+            try:
+                ds.native_mcp = not gateway
+                if available is None:
+                    continue
+                kept = []
+                for t in (ds.mcp_tools or []):
+                    entry = available.get((str(t.connection_id), str(t.name)))
+                    if entry is None:
+                        continue
+                    t.deferred = bool(entry.get("deferred"))
+                    t.policy = entry.get("policy") or t.policy
+                    kept.append(t)
+                ds.mcp_tools = kept
+            except Exception:
+                pass
+
+    async def prime_entities(
+        self,
+        *,
+        user_text: str | None = None,
+        data_source_ids: Optional[List[str]] = None,
+        top_k: int = 5,
+    ) -> None:
+        """Build the saved-queries (entities) section on its own.
+
+        ``refresh_warm`` builds entities as part of the agent's per-turn
+        refresh. One-shot consumers that never run that loop — the MCP tools,
+        which prime static context and generate code once — need the section
+        too: without it the coder writes a definition for a term the org has
+        already saved. Stores into the same warm slot, so ``get_view()`` and
+        ``build_codegen_context`` pick it up unchanged.
+        """
+        allow_llm_see_data = True
+        try:
+            org_settings = await self.organization.get_settings(self.db)
+            cfg = org_settings.get_config("allow_llm_see_data") if org_settings else None
+            allow_llm_see_data = bool(cfg.value) if cfg is not None else True
+        except Exception:
+            allow_llm_see_data = True
+
+        async with self._db_lock:
+            try:
+                section = await self.entity_builder.build_for_turn(
+                    top_k=top_k,
+                    require_source_assoc=True,
+                    user_text=user_text or "",
+                    allow_llm_see_data=allow_llm_see_data,
+                    data_source_ids=data_source_ids or self._run_agent_ids(),
+                )
+            except Exception:
+                _hub_logger.exception("[context_hub:prime_entities] build failed")
+                return
+        if section is None:
+            return
+        self._warm_cache["entities"] = section
+        try:
+            self.metadata.entities_count = len(getattr(section, "items", []) or [])
+        except Exception:
+            pass
+
     async def prime_static(self, query: str | None = None) -> None:
         """Build and cache static sections once (schemas, instructions, code, resources).
 
-        Runs all builders in parallel for faster startup.
+        Holds ``self._db_lock`` for its whole body — see ``_run_builders``.
+        ``agent_v2`` gathers this with ``refresh_warm()`` on the same hub and the
+        same session at startup, so every touch of ``self.db`` here, including
+        ``_instruction_query()``, has to be inside the guard.
 
         Parameters
         ----------
@@ -697,7 +823,11 @@ class ContextHub:
             The user's query/prompt. If provided, enables intelligent instruction
             search to find relevant instructions beyond just 'always' load mode.
         """
-        import asyncio
+        async with self._db_lock:
+            await self._prime_static_locked(query)
+
+    async def _prime_static_locked(self, query: str | None = None) -> None:
+        """Body of ``prime_static``; runs with ``self._db_lock`` held."""
         _t0 = time.monotonic()
 
         async def _timed(name, coro):
@@ -722,6 +852,9 @@ class ContextHub:
             ds_ids,
             str(self.build_id) if self.build_id else None,
             self._schema_identity_key(),
+            # A request that disabled execute_mcp builds its sections without
+            # MCP tools; it must neither be served nor seed the shared entry.
+            self.schema_builder.hide_mcp_tools,
         )
         now = time.monotonic()
         cached = _SCHEMA_CACHE.get(cache_key)
@@ -744,6 +877,8 @@ class ContextHub:
         # report so follow-ups ("now break it down by month") keep matching the
         # instructions the opening message matched.
         instr_query = await self._instruction_query(query)
+        # Kept so mid-run instruction rebuilds match the same query.
+        self.last_instruction_query = instr_query
 
         # Same identity component as the schema cache: instructions are filtered
         # by per-user table accessibility, so they must not cross users either.
@@ -758,6 +893,15 @@ class ContextHub:
             str(instr_query or ""),
             self._schema_identity_key(),
             tuple(sorted(instr_scope)) if instr_scope is not None else None,
+            # Flipping the on-demand setting must apply on the next turn, not
+            # after the cache entry expires.
+            smart_instructions_on_demand(self.organization_settings),
+            # Instructions are scoped by mode, channel and connected app, so
+            # an in-app turn and a Slack or embedded-app turn with the same
+            # prompt must not share an entry.
+            getattr(self.instruction_builder, "mode", None),
+            getattr(self.instruction_builder, "channel", None),
+            getattr(self.instruction_builder, "application_id", None),
         )
         instr_cached = _INSTRUCTIONS_CACHE.get(instr_key)
 
@@ -775,30 +919,184 @@ class ContextHub:
             _INSTRUCTIONS_CACHE[instr_key] = (time.monotonic(), built)
             return built
 
-        # Run static builders in parallel; schemas/instructions come from
-        # the cache when warm.
-        schemas, instructions, resources, files = await asyncio.gather(
-            _build_or_get_schemas(),
-            _build_or_get_instructions(),
-            _timed("resources", self.resource_builder.build()),
-            _timed("files", self.files_builder.build()),
-            return_exceptions=True,
-        )
+        # Static builders share self.db too, so they run serially for the same
+        # reason as the warm ones — see _run_builders. The stakes are higher
+        # here: a lost section is the schema or the instructions, and the agent
+        # would go on to plan against a connection it thinks has no tables.
+        schemas, instructions, resources, files = await self._run_builders("prime_static", [
+            ("schemas", _build_or_get_schemas),
+            ("instructions", _build_or_get_instructions),
+            ("resources", lambda: _timed("resources", self.resource_builder.build())),
+            ("files", lambda: _timed("files", self.files_builder.build())),
+        ])
         _hub_logger.info(f"[context_hub:prime_static] all_done +{(time.monotonic()-_t0)*1000:.0f}ms")
 
         # Store results (handle exceptions gracefully)
         self._static_cache["schemas"] = schemas if not isinstance(schemas, Exception) else None
-        self._static_cache["instructions"] = instructions if not isinstance(instructions, Exception) else None
+        self._apply_mcp_catalog()
+        # A per-hub copy: the built section may be shared through
+        # _INSTRUCTIONS_CACHE, and read_items belong to this run's report only.
+        self._static_cache["instructions"] = (
+            instructions.model_copy(update={"read_items": []})
+            if instructions is not None and not isinstance(instructions, Exception)
+            else None
+        )
+        section = self._static_cache["instructions"]
+        self.smart_on_demand = bool(getattr(section, "on_demand", False))
+        if self.smart_on_demand:
+            await self._load_prior_instruction_reads()
+            self._attach_read_instructions()
         self._static_cache["code"] = None
         self._static_cache["resources"] = resources if not isinstance(resources, Exception) else None
         self._static_cache["files"] = files if not isinstance(files, Exception) else None
 
+    # Max earlier reads (this report) handed to tool-less consumers.
+    PRIOR_READS_LIMIT = 10
+
+    def record_instruction_read(self, item) -> None:
+        """Remember a smart instruction the agent read via read_instruction, so
+        tool-less consumers (coder, chart step) get its full text."""
+        if not self.smart_on_demand or item is None or not getattr(item, "id", None):
+            return
+        self.read_instruction_items[str(item.id)] = item
+        self._attach_read_instructions()
+
+    def add_instructions_for_coder(self, items) -> None:
+        """Hand instructions to the tool-less consumers (coder, chart step) in
+        full, whatever the smart-instructions setting. The MCP data tools use it
+        for the ids the external client read and passed in; the in-app planner
+        goes through record_instruction_read instead."""
+        for item in items or []:
+            if getattr(item, "id", None):
+                self.read_instruction_items[str(item.id)] = item
+        self._attach_read_instructions()
+
+    def _attach_read_instructions(self) -> None:
+        section = self._static_cache.get("instructions")
+        if section is not None:
+            section.read_items = list(self.read_instruction_items.values())
+
+    async def _load_prior_instruction_reads(self) -> None:
+        """Seed read_instruction_items with smart instructions read earlier in
+        this report, so a follow-up turn's coder still gets them even when the
+        planner doesn't re-read. Caller holds ``self._db_lock``. Best-effort."""
+        if self._prior_reads_loaded or not self.report:
+            return
+        self._prior_reads_loaded = True
+        try:
+            from sqlalchemy import select, func
+            from app.models.instruction_usage_event import InstructionUsageEvent
+            from app.models.instruction import Instruction
+
+            res = await self.db.execute(
+                select(InstructionUsageEvent.instruction_id, func.max(InstructionUsageEvent.used_at).label("last"))
+                .join(Instruction, Instruction.id == InstructionUsageEvent.instruction_id)
+                .where(
+                    InstructionUsageEvent.org_id == str(self.organization.id),
+                    InstructionUsageEvent.report_id == str(self.report.id),
+                    InstructionUsageEvent.load_reason == "on_demand",
+                    # Skills are procedures for the planner, not rules for the coder.
+                    (Instruction.kind.is_(None)) | (Instruction.kind != "skill"),
+                )
+                .group_by(InstructionUsageEvent.instruction_id)
+                .order_by(func.max(InstructionUsageEvent.used_at).desc())
+                .limit(self.PRIOR_READS_LIMIT)
+            )
+            ids = [str(r[0]) for r in res.all()]
+            if not ids:
+                return
+            # Scope, status and per-user table access are applied by the builder.
+            items = await self.instruction_builder.load_instructions_by_ids(ids, load_mode_filter="intelligent")
+            for it in items:
+                self.read_instruction_items.setdefault(str(it.id), it)
+        except Exception:
+            _hub_logger.warning("[context_hub] loading prior instruction reads failed", exc_info=True)
+
+    async def _run_builders(self, phase: str, builders):
+        """Run context builders that share ``self.db``, one at a time.
+
+        **The caller must already hold ``self._db_lock``.** The lock lives at the
+        public entry points (``prime_static`` / ``refresh_warm``) rather than
+        here, because those methods touch the session outside the builder list
+        too — ``_instruction_query()``, the org-settings read, the scheduled-tasks
+        read — and ``agent_v2`` gathers both methods concurrently on one hub at
+        startup. Guarding only this loop left those reads racing, which is the
+        same failure one layer up.
+
+        These used to go through ``asyncio.gather(..., return_exceptions=True)``,
+        which was wrong twice over.
+
+        It was never parallel. Every builder is constructed with the *same*
+        AsyncSession, which owns exactly one DBAPI connection, so their queries
+        could not have overlapped on the wire even in principle. What overlapped
+        was the bookkeeping around them — and an AsyncSession rejects that:
+        whichever builder called ``execute()`` while another was still
+        provisioning the connection got ``This session is provisioning a new
+        connection; concurrent operations are not permitted``. The window is
+        widest when the session holds no connection yet, which is precisely the
+        state ``agent_v2._release_db_between_steps()`` leaves it in before each
+        loop iteration's refresh — so this fired on ordinary turns, not just
+        under load. Measured against Postgres: every one of 20 refreshes
+        following a commit lost at least one section, and a 10-agent concurrent
+        run logged 26 swallowed occurrences across 98 refreshes.
+
+        And the damage was silent. Each builder catches its own failure and
+        returns an empty section, so the planner was handed
+        ``<queries>``-with-no-items — the agent's record of what it had already
+        queried — as though the report genuinely had none. A user refining a
+        previous answer ("now break that down by month") got an agent that had
+        forgotten the thing it was refining.
+
+        Serializing costs nothing because there was no parallelism to lose:
+        benchmarked over three interleaved repetitions of 40 refreshes on a warm
+        session, p50 was 14.34 ms gathered versus 14.19 ms serialized. (On a
+        session that has just committed, the gathered version *is* a few ms
+        faster — because a builder that loses the race returns an empty section
+        without running its query at all.)
+
+        Anything that still fails is logged at WARNING with the section named
+        instead of vanishing into a ``return_exceptions`` tuple. Returns results
+        positionally, exceptions included, so callers keep their existing shape.
+
+        ``builders`` is a list of ``(name, factory)`` where ``factory`` is a
+        zero-argument callable returning the coroutine. Building each coroutine
+        only when its turn comes means a cancellation part-way through leaves no
+        never-awaited coroutine objects behind to surface as ``RuntimeWarning``
+        during loop teardown.
+        """
+        if not self._db_lock.locked():
+            raise RuntimeError(
+                "_run_builders requires self._db_lock to be held by the caller "
+                "(see its docstring — the lock must span the whole of "
+                "prime_static/refresh_warm, not just the builder list)"
+            )
+        results = []
+        for name, factory in builders:
+            try:
+                results.append(await factory())
+            except Exception as exc:
+                _hub_logger.warning(
+                    "[context_hub:%s] %s builder failed — that section will be "
+                    "missing from the planner's context: %r",
+                    phase, name, exc, exc_info=True,
+                )
+                results.append(exc)
+        return results
+
     async def refresh_warm(self) -> None:
         """Rebuild warm sections each loop (messages, queries, observations, entities).
 
-        Runs builders in parallel where possible for faster refresh.
+        Builders run one at a time — see `_run_builders` for why gathering them
+        was never actually parallel. The lock spans the whole body, not just the
+        builder list: the org-settings read below and the scheduled-tasks read at
+        the end touch the same session, and ``agent_v2`` gathers this with
+        ``prime_static()`` at startup.
         """
-        import asyncio
+        async with self._db_lock:
+            await self._refresh_warm_locked()
+
+    async def _refresh_warm_locked(self) -> None:
+        """Body of ``refresh_warm``; runs with ``self._db_lock`` held."""
         _t0 = time.monotonic()
 
         async def _timed(name, coro):
@@ -826,20 +1124,20 @@ class ContextHub:
         except Exception:
             user_text = ""
 
-        # Run all warm builders in parallel
-        messages, queries, mentions, entities = await asyncio.gather(
-            _timed("messages", self.message_builder.build(max_messages=DEFAULT_CONTEXT_LIMITS["messages_max"])),
-            _timed("queries", self.query_builder.build(max_queries=5, include_data_preview=allow_llm_see_data)),
-            _timed("mentions", self.mention_builder.build()),
-            _timed("entities", self.entity_builder.build_for_turn(
+        # Warm builders all share self.db, so they run serially — see
+        # _run_builders.
+        messages, queries, mentions, entities = await self._run_builders("refresh_warm", [
+            ("messages", lambda: _timed("messages", self.message_builder.build(max_messages=DEFAULT_CONTEXT_LIMITS["messages_max"]))),
+            ("queries", lambda: _timed("queries", self.query_builder.build(max_queries=5, include_data_preview=allow_llm_see_data))),
+            ("mentions", lambda: _timed("mentions", self.mention_builder.build())),
+            ("entities", lambda: _timed("entities", self.entity_builder.build_for_turn(
                 top_k=5,
                 require_source_assoc=True,
                 user_text=user_text,
                 allow_llm_see_data=allow_llm_see_data,
                 data_source_ids=self._run_agent_ids(),
-            )),
-            return_exceptions=True,
-        )
+            ))),
+        ])
         _hub_logger.info(f"[context_hub:refresh_warm] all_done +{(time.monotonic()-_t0)*1000:.0f}ms")
         
         # Build observations synchronously (it's fast, no DB calls)
@@ -853,6 +1151,15 @@ class ContextHub:
             _hub_logger.warning(f"[context_hub:refresh_warm] scheduled_tasks failed: {e}")
             scheduled_tasks = None
 
+        # App activity: computed once per turn (the first loop marks the
+        # events as seen by this completion; later loops keep the same text).
+        if "app_activity" not in self._warm_cache:
+            try:
+                self._warm_cache["app_activity"] = await self._build_app_activity_section()
+            except Exception as e:
+                _hub_logger.warning(f"[context_hub:refresh_warm] app_activity failed: {e}")
+                self._warm_cache["app_activity"] = None
+
         self._warm_cache.update({
             "messages": messages if not isinstance(messages, Exception) else None,
             "widgets": None,  # Deprecated
@@ -862,6 +1169,17 @@ class ContextHub:
             "entities": entities if not isinstance(entities, Exception) else None,
             "scheduled_tasks": scheduled_tasks,
         })
+
+    async def _build_app_activity_section(self):
+        """Failures in this conversation's apps the agent has not seen yet."""
+        from app.ai.context.sections.app_activity_section import AppActivitySection
+        from app.services import artifact_activity
+
+        if not self.report or not self.head_completion:
+            return None
+        text = await artifact_activity.context_section(
+            self.db, report_id=str(self.report.id), completion_id=str(self.head_completion.id))
+        return AppActivitySection(text=text) if text else None
 
     async def _build_scheduled_tasks_section(self):
         """Build the <scheduled_tasks> section for the current report.
@@ -876,8 +1194,8 @@ class ContextHub:
         if not self.report:
             return ScheduledTasksSection(items=[])
 
-        from sqlalchemy import select
-        from app.models.scheduled_prompt import ScheduledPrompt
+        from sqlalchemy import select, or_
+        from app.models.scheduled_prompt import ScheduledPrompt, describe_schedule
 
         cron_labels = {
             "0 * * * *": "Hourly",
@@ -891,7 +1209,12 @@ class ContextHub:
 
         result = await self.db.execute(
             select(ScheduledPrompt)
-            .filter(ScheduledPrompt.report_id == self.report.id)
+            # The report's own schedules, plus — in a report-per-run report —
+            # the schedule that spawned it, so the owner can edit/cancel it here.
+            .filter(or_(
+                ScheduledPrompt.report_id == self.report.id,
+                ScheduledPrompt.id == (getattr(self.report, "scheduled_prompt_id", None) or "__none__"),
+            ))
             .filter(ScheduledPrompt.is_active == True)  # noqa: E712
             .filter(ScheduledPrompt.deleted_at == None)  # noqa: E711
             .order_by(ScheduledPrompt.created_at.asc())
@@ -912,7 +1235,10 @@ class ContextHub:
                 id=str(sp.id),
                 title=sp.title,
                 cron_schedule=sp.cron_schedule,
-                cron_label=cron_labels.get(sp.cron_schedule),
+                cron_label=(
+                    describe_schedule(sp.cron_schedule, sp.run_once_at) if sp.run_once_at
+                    else cron_labels.get(sp.cron_schedule)
+                ),
                 prompt_snippet=snippet or None,
                 last_run_at=sp.last_run_at.isoformat() if sp.last_run_at else None,
             ))
@@ -935,6 +1261,7 @@ class ContextHub:
             mentions=self._warm_cache.get("mentions", None),
             entities=self._warm_cache.get("entities", None),
             scheduled_tasks=self._warm_cache.get("scheduled_tasks", None),
+            app_activity=self._warm_cache.get("app_activity", None),
         )
         meta = self.metadata.model_dump()
         return ContextView(static=static, warm=warm, meta=meta)

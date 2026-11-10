@@ -1,12 +1,9 @@
 <template>
   <div class="min-h-screen flex items-center justify-center px-6 py-24" v-if="pageLoaded">
     <div class="w-full max-w-[360px]">
-      <h1 class="text-2xl leading-tight font-semibold tracking-tight text-center text-gray-900 dark:text-white">
-        {{ $t('auth.welcomeTitle') }}
-      </h1>
-      <p class="mt-1.5 text-sm text-center text-gray-500 dark:text-gray-400">
-        {{ $t('auth.signInSubtitle') }}
-      </p>
+      <div class="flex justify-center">
+        <img src="/assets/logo-128.png" alt="Kashika AI" class="h-12 w-auto max-w-[240px] object-contain" />
+      </div>
 
       <p v-if="error_message"
          class="mt-5 text-sm text-red-500 text-center whitespace-pre-line">{{ error_message }}</p>

@@ -5,8 +5,8 @@ services:
     environment:
       LDAP_ORGANISATION: "Kashika AI"
       LDAP_DOMAIN: "kashika-ai.local"
-      LDAP_ADMIN_PASSWORD: "uxAH6JoeOrzk8XcE"
-      LDAP_CONFIG_PASSWORD: "uxAH6JoeOrzk8XcE"
+      LDAP_ADMIN_PASSWORD: "${LDAP_ADMIN_PASSWORD:?Set LDAP_ADMIN_PASSWORD in .env}"
+      LDAP_CONFIG_PASSWORD: "${LDAP_CONFIG_PASSWORD:?Set LDAP_CONFIG_PASSWORD in .env}"
       LDAP_READONLY_USER: "false"
       LDAP_TLS: "false"
     volumes:
@@ -38,7 +38,7 @@ services:
     environment:
       POSTGRES_DB: keycloak
       POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: keycloak
+      POSTGRES_PASSWORD: "${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD in .env}"
     volumes:
       - postgres_keycloak_data:/var/lib/postgresql/data
     networks:
@@ -53,44 +53,36 @@ services:
   keycloak:
     image: quay.io/keycloak/keycloak:25.0.6
     container_name: kashika-ai-keycloak
-
-    # ✅ IMPORTANT: import realm automatically
     command: start-dev --import-realm
-
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres-keycloak:5432/keycloak
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak
+      KC_DB_PASSWORD: "${KEYCLOAK_DB_PASSWORD:?Set KEYCLOAK_DB_PASSWORD in .env}"
 
       KEYCLOAK_ADMIN: "admin"
-      KEYCLOAK_ADMIN_PASSWORD: "36i5gKbBwfHf3zWZ"
+      KEYCLOAK_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:?Set KEYCLOAK_ADMIN_PASSWORD in .env}"
 
       KC_HTTP_ENABLED: "true"
       KC_PROXY: "edge"
+      KC_HOSTNAME: "http://localhost:8090"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
       KC_HOSTNAME_STRICT: "false"
 
       KC_HEALTH_ENABLED: "true"
       KC_METRICS_ENABLED: "true"
-
       JAVA_OPTS_APPEND: "-Dkeycloak.profile.feature.upload_scripts=enabled"
-
     ports:
       - "8090:8080"
-
     volumes:
-      # ✅ persistent realm config
       - ./keycloak-config:/opt/keycloak/data/import
-
     depends_on:
       postgres-keycloak:
         condition: service_healthy
       openldap:
         condition: service_started
-
     networks:
       - kashika-network
-
     restart: unless-stopped
 
   postgres:
@@ -99,7 +91,7 @@ services:
     environment:
       POSTGRES_DB: kashika
       POSTGRES_USER: kashika
-      POSTGRES_PASSWORD: kashika
+      POSTGRES_PASSWORD: "${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -107,36 +99,31 @@ services:
     restart: unless-stopped
 
   kashika:
-    image: kashika-ai:v.0.538
+    image: kashika-ai:latest
     container_name: kashika-ai-app
     extra_hosts:
       - "localhost:host-gateway"
     environment:
-      BOW_DATABASE_URL: "postgresql://kashika:kashika@postgres:5432/kashika"
+      BOW_DATABASE_URL: "postgresql://kashika:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD in .env}@postgres:5432/kashika"
       BOW_HOST: "0.0.0.0"
       BOW_PORT: "3000"
 
       BOW_AUTH_PROVIDER: "keycloak"
-      BOW_KEYCLOAK_URL: "http://192.168.10.125:8090/realms/kashika-ai"
+      BOW_KEYCLOAK_URL: "http://keycloak:8080/realms/kashika-ai"
       BOW_CLIENT_ID: "kashika-ai"
-      BOW_CLIENT_SECRET: "TSqqIF9kUNyGLj67YWDzZGUuejDNd2MF"
+      BOW_CLIENT_SECRET: "${BOW_CLIENT_SECRET:?Set BOW_CLIENT_SECRET in .env}"
 
-      SESSION_SECRET: "eD!mXug29tWy5QqSLrCmPK3lxRvVbFAq"
-      BOW_ENCRYPTION_KEY: "-An3F65pIc9MieG6LMNZiIPNNPmzalR2zzDrtqxD0S4="
-
+      SESSION_SECRET: "${SESSION_SECRET:?Set SESSION_SECRET in .env}"
+      BOW_ENCRYPTION_KEY: "${BOW_ENCRYPTION_KEY:?Set BOW_ENCRYPTION_KEY in .env}"
     volumes:
       - ./bow-config.yaml:/app/bow-config.yaml:ro
-
     ports:
       - "3000:3000"
-
     depends_on:
       - postgres
       - keycloak
-
     networks:
       - kashika-network
-
     restart: unless-stopped
 
 volumes:

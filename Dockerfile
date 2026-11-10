@@ -1,8 +1,10 @@
 FROM ubuntu:24.04 AS backend-builder
+COPY --from=rust:1-slim-bookworm /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && \
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -68,11 +70,13 @@ RUN cargo build --release --locked && \
     strip target/release/qvd2parquet
 
 FROM ubuntu:24.04 AS frontend-builder
+COPY --from=rust:1-slim-bookworm /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Node.js 22 and prepare environment
-RUN apt-get update && \
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg && \
     mkdir -p /etc/apt/keyrings && \
@@ -108,9 +112,10 @@ RUN bash /app/scripts/download-vendor-libs.sh /app/frontend/public/libs
 # `nuxt generate` produces a fully static SPA under .output/public, which
 # FastAPI serves directly in production (see backend/app/core/spa.py).
 # This replaces the previous `yarn build` + Node runtime pattern.
-RUN NODE_OPTIONS="--max-old-space-size=3072" yarn generate
+RUN NODE_OPTIONS="--max-old-space-size=6144" yarn generate
 
 FROM ubuntu:24.04
+COPY --from=rust:1-slim-bookworm /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -126,6 +131,7 @@ ENV PIP_NO_CACHE_DIR=1 \
 # build cache when Trivy flags an OS package that already has a fix.
 ARG APT_REFRESH=2026-11-08
 RUN echo "apt refresh: ${APT_REFRESH}" && \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg git openssh-client tini libpq5 vim-tiny && \
@@ -136,12 +142,14 @@ RUN echo "apt refresh: ${APT_REFRESH}" && \
     curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
     ARCH="$(dpkg --print-architecture)" && \
     echo "deb [arch=${ARCH} signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" > /etc/apt/sources.list.d/microsoft-prod-24.04.list && \
+    sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update && \
     ACCEPT_EULA=Y apt-get install -y --no-install-recommends unixodbc tdsodbc freetds-dev && \
     (ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 || echo "WARN: msodbcsql18 not available for ${ARCH}") && \
     if [ "${ARCH}" = "amd64" ]; then \
       echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" > /etc/apt/sources.list.d/microsoft-prod-22.04.list && \
       printf 'Package: *\nPin: origin packages.microsoft.com\nPin: release n=jammy\nPin-Priority: 100\n\nPackage: msodbcsql17\nPin: origin packages.microsoft.com\nPin: release n=jammy\nPin-Priority: 900\n' > /etc/apt/preferences.d/microsoft-odbc && \
+      sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
       apt-get update && \
       (ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 || echo "WARN: msodbcsql17 install failed"); \
     fi && \
@@ -173,6 +181,7 @@ RUN ARCH="$(dpkg --print-architecture)" && \
       *) IC_ARCH="" ;; \
     esac && \
     if [ -n "${IC_ARCH}" ]; then \
+      sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
       apt-get update && \
       apt-get install -y --no-install-recommends libaio1t64 unzip && \
       ln -sf "/usr/lib/${GNU_TRIPLET}/libaio.so.1t64" "/usr/lib/${GNU_TRIPLET}/libaio.so.1" && \

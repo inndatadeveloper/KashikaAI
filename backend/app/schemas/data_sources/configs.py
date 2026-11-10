@@ -4676,7 +4676,6 @@ class CustomAPIOAuthAppCredentials(MCPOAuthAppCredentials):
     pass
 
 
-<<<<<<< HEAD
 # Tally
 class TallyConfig(BaseModel):
     host: str = Field("localhost", title="Host", description="Tally server hostname or IP", json_schema_extra={"ui:type": "string"})
@@ -4698,7 +4697,6 @@ class ZohoBooksConfig(BaseModel):
     region: str = Field("com", title="Region", description="Zoho region: com, eu, in, com.au, jp", json_schema_extra={"ui:type": "string"})
 class ZohoBooksCredentials(BaseModel):
     access_token: str = Field(..., title="Access Token", description="Zoho OAuth2 access token", json_schema_extra={"ui:type": "password"})
-=======
 class NetAppOntapCredentials(BaseModel):
     username: str = Field(..., title="Username", description="ONTAP account with HTTP application access and read-only diagnostic permissions.")
     password: str = Field(..., title="Password", json_schema_extra={"ui:type": "password"})
@@ -4867,7 +4865,6 @@ class GitPublicCredentials(BaseModel):
         extra = "allow"
 
 
->>>>>>> v0.0.613
 __all__ = [
     "GitRepoConfig",
     "GitTokenCredentials",
